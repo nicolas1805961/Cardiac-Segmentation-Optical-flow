@@ -18,6 +18,9 @@ from nnunet.paths import network_training_output_dir, preprocessing_output_dir, 
 from batchgenerators.utilities.file_and_folder_operations import *
 from nnunet.experiment_planning.summarize_plans import summarize_plans
 from nnunet.training.model_restore import recursive_find_python_class
+from ..lib.training_utils import read_config
+from pathlib import Path
+import numpy as np
 
 
 def get_configuration_from_output_folder(folder):
@@ -37,6 +40,8 @@ def get_default_configuration(network, task, network_trainer, plans_identifier=d
     assert network in ['2d', '3d_lowres', '3d_fullres', '3d_cascade_fullres'], \
         "network can only be one of the following: \'2d\', \'3d_lowres\', \'3d_fullres\', \'3d_cascade_fullres\'"
 
+    config = read_config(os.path.join(Path.cwd(), 'adversarial_acdc.yaml'))
+
     dataset_directory = join(preprocessing_output_dir, task)
 
     if network == '2d':
@@ -46,6 +51,14 @@ def get_default_configuration(network, task, network_trainer, plans_identifier=d
 
     plans = load_pickle(plans_file)
     possible_stages = list(plans['plans_per_stage'].keys())
+
+    plans['plans_per_stage'][possible_stages[-1]]['batch_size'] = config['batch_size']
+    plans['plans_per_stage'][possible_stages[-1]]['patch_size'] = np.array([config['image_size'], config['image_size']])
+    plans['plans_per_stage'][possible_stages[-1]]['num_pool_per_axis'] = [len(config['in_encoder_dims']), len(config['in_encoder_dims'])]
+    plans['plans_per_stage'][possible_stages[-1]]['pool_op_kernel_sizes'] = [[2, 2], [2, 2], [2, 2]]
+    pickle_file = open(plans_file,'wb')
+    pickle.dump(plans, pickle_file)
+    pickle_file.close()
 
     if (network == '3d_cascade_fullres' or network == "3d_lowres") and len(possible_stages) == 1:
         raise RuntimeError("3d_lowres/3d_cascade_fullres only applies if there is more than one stage. This task does "

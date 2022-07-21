@@ -447,7 +447,7 @@ class NetworkTrainer(object):
                     for b in tbar:
                         tbar.set_description("Epoch {}/{}".format(self.epoch+1, self.max_num_epochs))
 
-                        l = self.run_iteration(self.tr_gen, True)
+                        l = self.run_iteration(self.tr_gen, True) # --> add iter_nb arg
 
                         tbar.set_postfix(loss=l)
                         train_losses_epoch.append(l)

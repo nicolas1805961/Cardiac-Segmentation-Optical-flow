@@ -33,9 +33,9 @@ def convert_to_submission(source_dir, target_dir):
 
 
 if __name__ == "__main__":
-    folder = "/media/fabian/My Book/datasets/ACDC/training"
+    folder = "ACDC_training"
     folder_test = "/media/fabian/My Book/datasets/ACDC/testing/testing"
-    out_folder = "/media/fabian/My Book/MedicalDecathlon/MedicalDecathlon_raw_splitted/Task027_ACDC"
+    out_folder = "out\\nnUNet_raw_data_base\\nnUNet_raw_data\Task027_ACDC"
 
     maybe_mkdir_p(join(out_folder, "imagesTr"))
     maybe_mkdir_p(join(out_folder, "imagesTs"))
@@ -49,21 +49,21 @@ if __name__ == "__main__":
         data_files_train = [i for i in subfiles(current_dir, suffix=".nii.gz") if i.find("_gt") == -1 and i.find("_4d") == -1]
         corresponding_seg_files = [i[:-7] + "_gt.nii.gz" for i in data_files_train]
         for d, s in zip(data_files_train, corresponding_seg_files):
-            patient_identifier = d.split("/")[-1][:-7]
+            patient_identifier = d.split("\\")[-1][:-7]
             all_train_files.append(patient_identifier + "_0000.nii.gz")
             shutil.copy(d, join(out_folder, "imagesTr", patient_identifier + "_0000.nii.gz"))
             shutil.copy(s, join(out_folder, "labelsTr", patient_identifier + ".nii.gz"))
 
     # test
     all_test_files = []
-    patient_dirs_test = subfolders(folder_test, prefix="patient")
-    for p in patient_dirs_test:
-        current_dir = p
-        data_files_test = [i for i in subfiles(current_dir, suffix=".nii.gz") if i.find("_gt") == -1 and i.find("_4d") == -1]
-        for d in data_files_test:
-            patient_identifier = d.split("/")[-1][:-7]
-            all_test_files.append(patient_identifier + "_0000.nii.gz")
-            shutil.copy(d, join(out_folder, "imagesTs", patient_identifier + "_0000.nii.gz"))
+    #patient_dirs_test = subfolders(folder_test, prefix="patient")
+    #for p in patient_dirs_test:
+    #    current_dir = p
+    #    data_files_test = [i for i in subfiles(current_dir, suffix=".nii.gz") if i.find("_gt") == -1 and i.find("_4d") == -1]
+    #    for d in data_files_test:
+    #        patient_identifier = d.split("/")[-1][:-7]
+    #        all_test_files.append(patient_identifier + "_0000.nii.gz")
+    #        shutil.copy(d, join(out_folder, "imagesTs", patient_identifier + "_0000.nii.gz"))
 
 
     json_dict = OrderedDict()
@@ -95,7 +95,7 @@ if __name__ == "__main__":
     patients = np.unique([i[:10] for i in all_train_files])
     patientids = [i[:-12] for i in all_train_files]
 
-    kf = KFold(5, True, 12345)
+    kf = KFold(n_splits=5, shuffle=True, random_state=12345)
     for tr, val in kf.split(patients):
         splits.append(OrderedDict())
         tr_patients = patients[tr]
@@ -103,4 +103,4 @@ if __name__ == "__main__":
         val_patients = patients[val]
         splits[-1]['val'] = [i[:-12] for i in all_train_files if i[:10] in val_patients]
 
-    save_pickle(splits, "/media/fabian/nnunet/Task027_ACDC/splits_final.pkl")
+    save_pickle(splits, "out\\nnUNet_raw_data_base\\nnUNet_raw_data\Task027_ACDC\splits_final.pkl")

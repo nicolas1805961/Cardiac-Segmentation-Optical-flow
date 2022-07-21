@@ -29,6 +29,7 @@ class MultipleOutputLoss2(nn.Module):
         self.loss = loss
 
     def forward(self, x, y):
+        print(self.weight_factors)
         assert isinstance(x, (tuple, list)), "x must be either tuple or list"
         assert isinstance(y, (tuple, list)), "y must be either tuple or list"
         if self.weight_factors is None:
