@@ -19,6 +19,8 @@ from batchgenerators.transforms.abstract_transforms import AbstractTransform
 from torch.nn.functional import avg_pool2d, avg_pool3d
 import numpy as np
 
+from skimage.transform import resize
+
 
 class DownsampleSegForDSTransform3(AbstractTransform):
     '''
@@ -101,4 +103,51 @@ def downsample_seg_for_ds_transform2(seg, ds_scales=((1, 1, 1), (0.5, 0.5, 0.5),
                 for c in range(seg.shape[1]):
                     out_seg[b, c] = resize_segmentation(seg[b, c], new_shape[2:], order)
             output.append(out_seg)
+    return output
+
+
+
+class DownsampleX(AbstractTransform):
+    '''
+    data_dict['output_key'] will be a list of segmentations scaled according to ds_scales
+    '''
+    def __init__(self, ds_scales, input_key="data", output_key="data", order=3):
+        self.output_key = output_key
+        self.input_key = input_key
+        self.ds_scales = ds_scales
+        self.order = order
+
+    def __call__(self, **data_dict):
+        #x_list = []
+        #for i in range(len(self.ds_scales)):
+        #    scales = self.ds_scales[i]
+        #    if torch.all(scales == 1):
+        #        x_list.append(data_dict[self.input_key])
+        #    else:
+        #        x_down = torch.nn.functional.interpolate(data_dict[self.input_key], scale_factor=scales, mode='bicubic', align_corners=False, antialias=True)
+        #        x_list.append(x_down)
+
+        #data_dict[self.output_key] = x_list
+        data_dict[self.output_key] = downsample_x_for_ds_transform2(data_dict[self.input_key], self.ds_scales, self.order)
+        return data_dict
+
+
+def downsample_x_for_ds_transform2(x, ds_scales=((1, 1, 1), (0.5, 0.5, 0.5), (0.25, 0.25, 0.25)), order=3, axes=None):
+    if axes is None:
+        axes = list(range(2, len(x.shape)))
+    output = []
+    tpe = x.dtype
+    for s in ds_scales:
+        if all([i == 1 for i in s]):
+            output.append(x)
+        else:
+            new_shape = np.array(x.shape).astype(float)
+            for i, a in enumerate(axes):
+                new_shape[a] *= s[i]
+            new_shape = np.round(new_shape).astype(int)
+            out_x = np.zeros(new_shape, dtype=tpe)
+            for b in range(x.shape[0]):
+                for c in range(x.shape[1]):
+                    out_x[b, c] = resize(x[b, c].astype(float), new_shape[2:], order, clip=True, anti_aliasing=True).astype(tpe)
+            output.append(out_x)
     return output

@@ -224,6 +224,7 @@ def determine_postprocessing(base, gt_labels_folder, raw_subfolder_name="validat
 
     _ = [i.get() for i in results]
 
+
     # evaluate postprocessed predictions
     _ = aggregate_scores(pred_gt_tuples, labels=classes,
                          json_output_file=join(folder_all_classes_as_fg, "summary.json"),

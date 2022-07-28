@@ -83,10 +83,10 @@ def get_default_configuration(network, task, network_trainer, plans_identifier=d
 
     if (network == '2d' or len(possible_stages) > 1) and not network == '3d_lowres':
         batch_dice = True
-        print("I am using batch dice + CE loss")
+        #print("I am using batch dice + CE loss")
     else:
         batch_dice = False
-        print("I am using sample dice + CE loss")
+        #print("I am using sample dice + CE loss")
 
     print("\nI am using data from this folder: ", join(dataset_directory, plans['data_identifier']))
     print("###############################################")

@@ -632,6 +632,7 @@ class SegmentationNetwork(NeuralNetwork):
         data, slicer = pad_nd_image(x, patch_size, pad_border_mode, pad_kwargs, True, None)
         data_shape = data.shape  # still c, x, y
 
+
         # compute the steps for sliding window
         steps = self._compute_steps_for_sliding_window(patch_size, data_shape[1:], step_size)
         num_tiles = len(steps[0]) * len(steps[1])

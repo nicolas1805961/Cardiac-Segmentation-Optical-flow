@@ -35,7 +35,8 @@ def convert_to_submission(source_dir, target_dir):
 if __name__ == "__main__":
     folder = "ACDC_training"
     folder_test = "/media/fabian/My Book/datasets/ACDC/testing/testing"
-    out_folder = "out\\nnUNet_raw_data_base\\nnUNet_raw_data\Task027_ACDC"
+    out_folder = os.path.join('out', 'nnUNet_raw_data_base', 'nnUNet_raw_data', 'Task027_ACDC')
+    #out_folder = "out\\nnUNet_raw_data_base\\nnUNet_raw_data\Task027_ACDC"
 
     maybe_mkdir_p(join(out_folder, "imagesTr"))
     maybe_mkdir_p(join(out_folder, "imagesTs"))
@@ -49,7 +50,7 @@ if __name__ == "__main__":
         data_files_train = [i for i in subfiles(current_dir, suffix=".nii.gz") if i.find("_gt") == -1 and i.find("_4d") == -1]
         corresponding_seg_files = [i[:-7] + "_gt.nii.gz" for i in data_files_train]
         for d, s in zip(data_files_train, corresponding_seg_files):
-            patient_identifier = d.split("\\")[-1][:-7]
+            patient_identifier = d.split(os.sep)[-1][:-7]
             all_train_files.append(patient_identifier + "_0000.nii.gz")
             shutil.copy(d, join(out_folder, "imagesTr", patient_identifier + "_0000.nii.gz"))
             shutil.copy(s, join(out_folder, "labelsTr", patient_identifier + ".nii.gz"))
@@ -103,4 +104,5 @@ if __name__ == "__main__":
         val_patients = patients[val]
         splits[-1]['val'] = [i[:-12] for i in all_train_files if i[:10] in val_patients]
 
-    save_pickle(splits, "out\\nnUNet_raw_data_base\\nnUNet_raw_data\Task027_ACDC\splits_final.pkl")
+    
+    save_pickle(splits, os.path.join('out', 'nnUNet_raw_data_base', 'nnUNet_raw_data', 'Task027_ACDC', 'splits_final.pkl'))

@@ -242,7 +242,7 @@ class NetworkTrainer(object):
         ctr = 0
         while not successful and ctr < max_attempts:
             try:
-                with open(self.log_file, 'a+') as f:
+                with open(self.log_file, 'a+', encoding='utf-8') as f:
                     for a in args:
                         f.write(str(a))
                         f.write(" ")
@@ -447,7 +447,7 @@ class NetworkTrainer(object):
                     for b in tbar:
                         tbar.set_description("Epoch {}/{}".format(self.epoch+1, self.max_num_epochs))
 
-                        l = self.run_iteration(self.tr_gen, True) # --> add iter_nb arg
+                        l = self.run_iteration(self.tr_gen, do_backprop=True)
 
                         tbar.set_postfix(loss=l)
                         train_losses_epoch.append(l)
@@ -464,7 +464,7 @@ class NetworkTrainer(object):
                 self.network.eval()
                 val_losses = []
                 for b in range(self.num_val_batches_per_epoch):
-                    l = self.run_iteration(self.val_gen, False, True)
+                    l = self.run_iteration(self.val_gen, do_backprop=False, run_online_evaluation=True)
                     val_losses.append(l)
                 self.all_val_losses.append(np.mean(val_losses))
                 self.print_to_log_file("validation loss: %.4f" % self.all_val_losses[-1])
@@ -474,7 +474,7 @@ class NetworkTrainer(object):
                     # validation with train=True
                     val_losses = []
                     for b in range(self.num_val_batches_per_epoch):
-                        l = self.run_iteration(self.val_gen, False)
+                        l = self.run_iteration(self.val_gen, do_backprop=False)
                         val_losses.append(l)
                     self.all_val_losses_tr_mode.append(np.mean(val_losses))
                     self.print_to_log_file("validation loss (train=True): %.4f" % self.all_val_losses_tr_mode[-1])
