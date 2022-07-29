@@ -9,13 +9,15 @@ logging_loss_iteration_number: 1000000000
 val_stride: 1
 scheduler: 'cosine'
 optimizer: 'sgd'
+middle: True
+start_reconstruction_dim: 16
 min_max_normalization: False
-initial_lr: 0.0001
-weight_decay: 0.0005
+initial_lr: 0.00001
+weight_decay: 0.0001
 spatial_transformer_learning_rate: 0.0001
 warmup_percent: 0.1
 smoothing: 0.0
-max_num_epochs: 1000
+max_num_epochs: 250
 swin_bottleneck: True
 window_size: 7
 image_size: 224
@@ -35,7 +37,7 @@ transformer_depth: [] #[2, 2, 2], [2]
 num_heads: [] #[3, 6, 12], [8] [12]
 spatial_cross_attention_num_heads: [2, 4, 8] #[2, 4, 6, 8, 12] [12, 8, 6, 4, 2] [bottom, ..., top] [3, 6, 12] [4, 4, 8, 8, 16]
 method: 'equal'
-batch_size: 14 #8
+batch_size: 6 #8
 bottleneck: 'swin' # ['vit', 'swin', 'factorized', 'vit_3d', 'swin_3d']
 patch_size: [4, 4] # must be a 3d list for 3d encoder decoder, a 2d list for 2d encoder decoder
 rpe_mode: 'bias' # ['contextual', 'bias', 'None']
@@ -157,7 +159,6 @@ loss_weights_binary: [0.0404778230051879, 0.959522176994812]
 small: False
 loss_weights_small: [0.02750239033581403, 0.6297990114118536, 0.1266837091920396, 0.21601488906029276]
 
-middle: False
 loss_weights_middle: [0.05000963460217274, 0.36757716696763776, 0.2957992694401253, 0.2866139289900642]
 
 big: False

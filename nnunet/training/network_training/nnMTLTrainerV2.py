@@ -36,6 +36,7 @@ from torchinfo import summary
 from nnunet.lib.ssim import ssim
 from nnunet.utilities.tensor_utilities import sum_tensor
 from nnunet.training.data_augmentation.data_augmentation_moreDA import get_moreDA_augmentation
+from nnunet.training.data_augmentation.data_augmentation_mtl import get_moreDA_augmentation_middle
 from nnunet.training.loss_functions.deep_supervision import MultipleOutputLoss2
 from nnunet.utilities.to_torch import maybe_to_torch, to_cuda
 from nnunet.network_architecture.generic_UNet import Generic_UNet
@@ -43,7 +44,7 @@ from nnunet.network_architecture.initialization import InitWeights_He
 from nnunet.network_architecture.neural_network import SegmentationNetwork
 from nnunet.training.data_augmentation.default_data_augmentation import default_2D_augmentation_params, \
     get_patch_size, default_3D_augmentation_params
-from nnunet.training.dataloading.dataset_loading import unpack_dataset
+from nnunet.training.dataloading.dataset_loading import DataLoader2D, unpack_dataset
 from nnunet.training.network_training.nnUNetTrainer import nnUNetTrainer
 from nnunet.utilities.nd_softmax import softmax_helper
 from sklearn.model_selection import KFold
@@ -60,6 +61,7 @@ from torch.utils.tensorboard import SummaryWriter
 from nnunet.lib.boundary_utils import simplex
 from nnunet.training.loss_functions.dice_loss import DC_and_CE_loss, DC_and_focal_loss, DC_and_topk_loss
 from nnunet.training.loss_functions.crossentropy import RobustCrossEntropyLoss
+from nnunet.training.dataloading.dataset_loading import DataLoader2DMiddle
 
 
 class nnMTLTrainerV2(nnUNetTrainer):
@@ -82,6 +84,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
 
         self.eval_images = self.initialize_image_data()
         self.iter_nb = 0
+        self.middle = self.config['middle']
 
         self.val_loss = []
         self.train_loss = []
@@ -278,17 +281,30 @@ class nnMTLTrainerV2(nnUNetTrainer):
                         "INFO: Not unpacking data! Training may be slow due to that. Pray you are not using 2d or you "
                         "will wait all winter for your model to finish!")
 
-                self.tr_gen, self.val_gen = get_moreDA_augmentation(
-                    self.dl_tr, self.dl_val,
-                    self.data_aug_params[
-                        'patch_size_for_spatialtransform'],
-                    directional_field=self.directional_field,
-                    params=self.data_aug_params,
-                    deep_supervision_scales=self.deep_supervision_scales,
-                    min_max_normalization=self.min_max_normalization,
-                    pin_memory=self.pin_memory,
-                    use_nondetMultiThreadedAugmenter=False
-                )
+                if not self.middle:
+                    self.tr_gen, self.val_gen = get_moreDA_augmentation(
+                        self.dl_tr, self.dl_val,
+                        self.data_aug_params[
+                            'patch_size_for_spatialtransform'],
+                        directional_field=self.directional_field,
+                        params=self.data_aug_params,
+                        deep_supervision_scales=self.deep_supervision_scales,
+                        min_max_normalization=self.min_max_normalization,
+                        pin_memory=self.pin_memory,
+                        use_nondetMultiThreadedAugmenter=False
+                    )
+                else:
+                    self.tr_gen, self.val_gen = get_moreDA_augmentation_middle(
+                        self.dl_tr, self.dl_val,
+                        self.data_aug_params[
+                            'patch_size_for_spatialtransform'],
+                        directional_field=self.directional_field,
+                        params=self.data_aug_params,
+                        deep_supervision_scales=self.deep_supervision_scales,
+                        min_max_normalization=self.min_max_normalization,
+                        pin_memory=self.pin_memory,
+                        use_nondetMultiThreadedAugmenter=False
+                    )
                 self.print_to_log_file("TRAINING KEYS:\n %s" % (str(self.dataset_tr.keys())),
                                        also_print_to_console=False)
                 self.print_to_log_file("VALIDATION KEYS:\n %s" % (str(self.dataset_val.keys())),
@@ -369,7 +385,8 @@ class nnMTLTrainerV2(nnUNetTrainer):
         self.network = build_2d_model(self.config, norm=getattr(torch.nn, self.config['norm']))
 
         models = {}
-        model_input_size = (self.config['batch_size'], 1, self.image_size, self.image_size)
+        nb_inputs = 2 if self.middle else 1
+        model_input_size = [(self.config['batch_size'], 1, self.image_size, self.image_size)] * nb_inputs
         models['model'] = (self.network, model_input_size)
         self.count_parameters(self.config, models)
 
@@ -801,6 +818,21 @@ class nnMTLTrainerV2(nnUNetTrainer):
         data = data_dict['data']
         target = data_dict['target']
 
+        if self.middle:
+            middle = data_dict['middle']
+            middle = maybe_to_torch(middle)
+            if torch.cuda.is_available():
+                middle = to_cuda(middle)
+        else:
+            middle = None
+
+        matplotlib.use('QtAgg')
+        fig, ax = plt.subplots(1, 3)
+        ax[0].imshow(data[0][0, 0], cmap='gray')
+        ax[1].imshow(data_dict['middle'][0, 0], cmap='gray')
+        ax[2].imshow(target[0][0, 0], cmap='gray')
+        plt.show()
+
         if self.directional_field:
             gt_df = data_dict['directional_field']
             gt_df = maybe_to_torch(gt_df)
@@ -831,7 +863,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
                 #plt.imshow(data[0][0, 0].detach().cpu(), cmap='gray')
                 #plt.show()
 
-                output = self.network(data[0])
+                output = self.network(data[0], middle=middle)
 
                 l = self.compute_losses(x=data, output=output, target=target, gt_df=gt_df, do_backprop=do_backprop)
 
@@ -850,7 +882,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
                 self.amp_grad_scaler.step(self.optimizer)
                 self.amp_grad_scaler.update()
         else:
-            output = self.network(data[0])
+            output = self.network(data[0], middle=middle)
             l = self.compute_losses(x=data, output=output, target=target, gt_df=gt_df, do_backprop=do_backprop)
 
             if not do_backprop:
@@ -1076,3 +1108,23 @@ class nnMTLTrainerV2(nnUNetTrainer):
         ret = super().run_training()
         self.network.do_ds = ds
         return ret
+    
+
+    def get_basic_generators(self):
+        self.load_dataset()
+        self.do_split()
+        if self.middle:
+            dl_tr = DataLoader2DMiddle(self.dataset_tr, self.basic_generator_patch_size, self.patch_size, self.batch_size,
+                                    oversample_foreground_percent=self.oversample_foreground_percent,
+                                    pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
+            dl_val = DataLoader2DMiddle(self.dataset_val, self.patch_size, self.patch_size, self.batch_size,
+                                    oversample_foreground_percent=self.oversample_foreground_percent,
+                                    pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
+        else:
+            dl_tr = DataLoader2D(self.dataset_tr, self.basic_generator_patch_size, self.patch_size, self.batch_size,
+                                oversample_foreground_percent=self.oversample_foreground_percent,
+                                pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
+            dl_val = DataLoader2D(self.dataset_val, self.patch_size, self.patch_size, self.batch_size,
+                                oversample_foreground_percent=self.oversample_foreground_percent,
+                                pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
+        return dl_tr, dl_val
