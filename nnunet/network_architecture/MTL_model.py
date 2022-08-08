@@ -5,6 +5,7 @@
 # Written by Ze Liu
 # --------------------------------------------------------
 
+import matplotlib
 import torch
 import sys
 import torch.nn as nn
@@ -20,6 +21,7 @@ from nnunet.utilities.to_torch import to_cuda, maybe_to_torch
 import numpy as np
 from typing import Union
 from ..lib import swin_cross_attention
+from ..lib.vq_vae import VectorQuantizer, VectorQuantizerEMA, VanillaVAE
 
 class WholeModel(nn.Module):
     def __init__(self, model1, model2=None):
@@ -78,6 +80,8 @@ class MTLmodel(SegmentationNetwork):
                 filter_skip_co_reconstruction,
                 filter_skip_co_segmentation,
                 bottleneck_heads, 
+                vae,
+                vq_vae,
                 norm,
                 transformer_type='swin',
                 bottleneck='swin',
@@ -105,6 +109,8 @@ class MTLmodel(SegmentationNetwork):
         self.do_ds = deep_supervision
         self.conv_op=nn.Conv2d
         self.middle = middle
+        self.vae = vae
+        self.vq_vae = vq_vae
         if uncertainty_weighting:
             self.logsigma = nn.Parameter(torch.FloatTensor([1.61, -0.7, -0.7]))
         else:
@@ -134,8 +140,23 @@ class MTLmodel(SegmentationNetwork):
 
             self.reconstruction = decoder_alt.ReconstructionDecoder(norm=norm, filter_skip_co_reconstruction=filter_skip_co_reconstruction, reconstruction=reconstruction, reconstruction_skip=reconstruction_skip, sm_computation=sm_computation, concat_spatial_cross_attention=concat_spatial_cross_attention, attention_type=reconstruction_attention_type, spatial_cross_attention_num_heads=spatial_cross_attention_num_heads[::-1], shortcut=shortcut, proj_qkv=proj, out_encoder_dims=out_encoder_dims[::-1], use_conv_mlp=use_conv_mlp, last_activation='identity', blur=blur, img_size=image_size, num_classes=1, blur_kernel=blur_kernel, device=device, swin_abs_pos=swin_abs_pos, in_encoder_dims=in_dims[::-1], merge=merge, conv_depth=conv_depth[::-1], transformer_depth=transformer_depth[::-1], dpr=dpr_decoder, rpe_mode=rpe_mode, rpe_contextual_tensor=rpe_contextual_tensor, num_heads=num_heads, window_size=window_size, drop_path_rate=drop_path_rate, deep_supervision=self.do_ds)
 
-        self.decoder = decoder_alt.SegmentationDecoder(norm=norm, similarity_down_scale=similarity_down_scale, filter_skip_co_segmentation=filter_skip_co_segmentation, shift_nb=shift_nb, start_reconstruction_dim=start_reconstruction_dim, directional_field=directional_field, attention_map=attention_map, reconstruction=reconstruction, reconstruction_skip=reconstruction_skip, sm_computation=sm_computation, concat_spatial_cross_attention=concat_spatial_cross_attention, attention_type=encoder_attention_type, spatial_cross_attention_num_heads=spatial_cross_attention_num_heads[::-1], shortcut=shortcut, proj_qkv=proj, out_encoder_dims=out_encoder_dims[::-1], use_conv_mlp=use_conv_mlp, last_activation='identity', blur=blur, img_size=image_size, num_classes=self.num_classes, blur_kernel=blur_kernel, device=device, swin_abs_pos=swin_abs_pos, in_encoder_dims=in_dims[::-1], merge=merge, conv_depth=conv_depth[::-1], transformer_depth=transformer_depth[::-1], dpr=dpr_decoder, rpe_mode=rpe_mode, rpe_contextual_tensor=rpe_contextual_tensor, num_heads=num_heads, window_size=window_size, drop_path_rate=drop_path_rate, deep_supervision=self.do_ds)
+        self.decoder = decoder_alt.SegmentationDecoder(norm=norm, similarity_down_scale=similarity_down_scale, filter_skip_co_segmentation=filter_skip_co_segmentation, shift_nb=shift_nb, start_reconstruction_dim=start_reconstruction_dim, directional_field=directional_field, attention_map=attention_map, reconstruction=reconstruction, reconstruction_skip=reconstruction_skip, concat_spatial_cross_attention=concat_spatial_cross_attention, attention_type=encoder_attention_type, spatial_cross_attention_num_heads=spatial_cross_attention_num_heads[::-1], shortcut=shortcut, proj_qkv=proj, out_encoder_dims=out_encoder_dims[::-1], use_conv_mlp=use_conv_mlp, last_activation='identity', blur=blur, img_size=image_size, num_classes=self.num_classes, blur_kernel=blur_kernel, device=device, swin_abs_pos=swin_abs_pos, in_encoder_dims=in_dims[::-1], merge=merge, conv_depth=conv_depth[::-1], transformer_depth=transformer_depth[::-1], dpr=dpr_decoder, rpe_mode=rpe_mode, rpe_contextual_tensor=rpe_contextual_tensor, num_heads=num_heads, window_size=window_size, drop_path_rate=drop_path_rate, deep_supervision=self.do_ds)
         
+        if self.vae:
+            H, W = (int(image_size / 2**(self.num_stages)), int(image_size / 2**(self.num_stages)))
+            vae_dim = self.d_model
+            vae_dim = 16
+            in_dim_linear = int(H * W * vae_dim)
+            self.pre_vae = ConvBlock(in_dim=self.d_model, out_dim=vae_dim, kernel_size=1, norm=norm)
+            self.post_vae = nn.Conv2d(in_channels=vae_dim, out_channels=self.d_model, kernel_size=1)
+            self.vae_block = VanillaVAE(flatten_dim=in_dim_linear, latent_dim=128)
+        elif self.vq_vae:
+            vae_dim = 64
+            self.pre_vae = nn.Conv2d(in_channels=self.d_model, out_channels=64, kernel_size=1)
+            self.post_vae = nn.Conv2d(in_channels=64, out_channels=self.d_model, kernel_size=1)
+            self.vq_vae_block = VectorQuantizer(num_embeddings=512, embedding_dim=vae_dim, beta=0.25)
+            #self.vq_vae = VectorQuantizerEMA(num_embeddings=512, embedding_dim=vae_dim, commitment_cost=0.25, decay=0.99)
+
         H, W = (int(image_size / 2**(self.num_stages)), int(image_size / 2**(self.num_stages)))
         if learn_transforms:  
             in_dim_linear = int(H * W * self.d_model)
@@ -145,28 +166,85 @@ class MTLmodel(SegmentationNetwork):
 
         if self.middle:
             self.middle_encoder = Encoder(norm=norm, attention_map=attention_map, out_dims=out_encoder_dims, shortcut=shortcut, proj=proj, use_conv_mlp=use_conv_mlp, blur=blur, img_size=image_size, blur_kernel=blur_kernel, device=device, swin_abs_pos=swin_abs_pos, in_dims=in_dims, conv_depth=conv_depth, transformer_depth=transformer_depth, transformer_type=transformer_type, bottleneck_type=self.bottleneck_name, dpr=dpr_encoder, rpe_mode=rpe_mode, rpe_contextual_tensor=rpe_contextual_tensor, patch_size=patch_size, num_heads=num_heads, window_size=window_size, drop_path_rate=drop_path_rate, deep_supervision=self.do_ds)
-            self.ca_layer = swin_cross_attention.BasicLayer(swin_abs_pos=False, 
-                                                            norm=norm,
-                                                            same_key_query=False,
-                                                            dim=int(self.d_model),
-                                                            proj=proj,
-                                                            input_resolution=self.bottleneck_size,
-                                                            use_conv_mlp=use_conv_mlp,
-                                                            depth=2,
-                                                            num_heads=bottleneck_heads,
-                                                            device=device,
-                                                            rpe_mode=rpe_mode,
-                                                            rpe_contextual_tensor=rpe_contextual_tensor,
-                                                            window_size=window_size,
-                                                            mlp_ratio=mlp_ratio,
-                                                            qkv_bias=qkv_bias, qk_scale=qk_scale,
-                                                            drop=drop_rate, attn_drop=attn_drop_rate,
-                                                            drop_path=dpr_bottleneck,
-                                                            norm_layer=nn.LayerNorm,
-                                                            use_checkpoint=use_checkpoint)
+            self.reduce_layer = nn.Conv2d(in_channels=int(self.d_model) * 2, out_channels=int(self.d_model), kernel_size=1)
+            self.big_attention = swin_transformer_2.BasicLayer(dim=int(self.d_model) * 2,
+                                                                norm=norm,
+                                                                attention_map=attention_map,
+                                                                input_resolution=self.bottleneck_size,
+                                                                shortcut=shortcut,
+                                                                depth=self.num_bottleneck_layers,
+                                                                num_heads=bottleneck_heads,
+                                                                proj=proj,
+                                                                use_conv_mlp=use_conv_mlp,
+                                                                device=device,
+                                                                rpe_mode=rpe_mode,
+                                                                rpe_contextual_tensor=rpe_contextual_tensor,
+                                                                window_size=window_size,
+                                                                mlp_ratio=mlp_ratio,
+                                                                qkv_bias=qkv_bias, qk_scale=qk_scale,
+                                                                drop=drop_rate, attn_drop=attn_drop_rate,
+                                                                drop_path=dpr_bottleneck,
+                                                                norm_layer=nn.LayerNorm,
+                                                                use_checkpoint=use_checkpoint)
+            #self.ca_layer = swin_cross_attention.BasicLayer(swin_abs_pos=False, 
+            #                                                norm=norm,
+            #                                                same_key_query=False,
+            #                                                dim=int(self.d_model),
+            #                                                proj=proj,
+            #                                                input_resolution=self.bottleneck_size,
+            #                                                use_conv_mlp=use_conv_mlp,
+            #                                                depth=self.num_bottleneck_layers,
+            #                                                num_heads=bottleneck_heads,
+            #                                                device=device,
+            #                                                rpe_mode=rpe_mode,
+            #                                                rpe_contextual_tensor=rpe_contextual_tensor,
+            #                                                window_size=window_size,
+            #                                                mlp_ratio=mlp_ratio,
+            #                                                qkv_bias=qkv_bias, qk_scale=qk_scale,
+            #                                                drop=drop_rate, attn_drop=attn_drop_rate,
+            #                                                drop_path=dpr_bottleneck,
+            #                                                norm_layer=nn.LayerNorm,
+            #                                                use_checkpoint=use_checkpoint)
+
+            #self.filter_layer = swin_cross_attention.SwinFilterBlock(in_dim=int(self.d_model),
+            #                                                        out_dim=int(self.d_model),
+            #                                                        input_resolution=self.bottleneck_size,
+            #                                                        num_heads=bottleneck_heads,
+            #                                                        norm=norm,
+            #                                                        proj=proj,
+            #                                                        device=device,
+            #                                                        rpe_mode=rpe_mode,
+            #                                                        rpe_contextual_tensor=rpe_contextual_tensor,
+            #                                                        window_size=window_size,
+            #                                                        depth=self.num_bottleneck_layers)
+
+            #if swin_bottleneck:
+            #    self.middle_bottleneck = swin_transformer_2.BasicLayer(dim=int(self.d_model),
+            #                                                            norm=norm,
+            #                                                            attention_map=attention_map,
+            #                                                            input_resolution=self.bottleneck_size,
+            #                                                            shortcut=shortcut,
+            #                                                            depth=self.num_bottleneck_layers,
+            #                                                            num_heads=bottleneck_heads,
+            #                                                            proj=proj,
+            #                                                            use_conv_mlp=use_conv_mlp,
+            #                                                            device=device,
+            #                                                            rpe_mode=rpe_mode,
+            #                                                            rpe_contextual_tensor=rpe_contextual_tensor,
+            #                                                            window_size=window_size,
+            #                                                            mlp_ratio=mlp_ratio,
+            #                                                            qkv_bias=qkv_bias, qk_scale=qk_scale,
+            #                                                            drop=drop_rate, attn_drop=attn_drop_rate,
+            #                                                            drop_path=dpr_bottleneck,
+            #                                                            norm_layer=nn.LayerNorm,
+            #                                                            use_checkpoint=use_checkpoint)
+            #else:
+            #    self.middle_bottleneck = ConvLayer(in_dim=int(self.d_model),
+            #                                    out_dim=int(self.d_model),
+            #                                    nb_se_blocks=self.num_bottleneck_layers, 
+            #                                    dpr=dpr_bottleneck)
 
         if swin_bottleneck:
-
             self.bottleneck = swin_transformer_2.BasicLayer(dim=int(self.d_model),
                                             norm=norm,
                                             attention_map=attention_map,
@@ -201,23 +279,52 @@ class MTLmodel(SegmentationNetwork):
         decoder_sm = None
         df = None
         parameters = None
+        vq_loss = None
         reconstruction_skip_connections = None
-        x_bottleneck, encoder_skip_connections = self.encoder(x, attention_map=attention_map)
-        x_bottleneck = self.bottleneck(x_bottleneck, attention_map=attention_map)
+        x_encoded, encoder_skip_connections = self.encoder(x, attention_map=attention_map)
+        x_encoded = self.bottleneck(x_encoded, attention_map=attention_map)
+        if self.vae:
+            x_bottleneck = self.pre_vae(x_encoded)
+            x_bottleneck, vq_loss = self.vae_block(x_bottleneck)
+            x_bottleneck = self.post_vae(x_bottleneck)
+        elif self.vq_vae:
+            x_bottleneck = self.pre_vae(x_encoded)
+            x_bottleneck, vq_loss = self.vq_vae_block(x_bottleneck)
+            #vq_loss, x_bottleneck, perplexity, _ = self.vq_vae(x_bottleneck)
+            x_bottleneck = self.post_vae(x_bottleneck)
         if self.learn_transforms:
             rotation_net_input = torch.flatten(x_bottleneck, start_dim=1)
             parameters = self.rotation_net(rotation_net_input)
         if self.reconstruction:
+            #if not self.training:
+            #    print(torch.all(torch.isfinite(x_bottleneck)))
+
             reconstructed, reconstruction_sm, reconstruction_skip_connections = self.reconstruction(x_bottleneck, encoder_skip_connections)
         if self.middle:
-            middle_bottleneck, _ = self.middle_encoder(middle, attention_map=attention_map)
-            x_bottleneck = self.ca_layer(x_bottleneck, middle_bottleneck)
-        pred, decoder_sm, df = self.decoder(x_bottleneck, encoder_skip_connections, reconstruction_skip_connections, attention_map=attention_map)
+            #matplotlib.use('QtAgg')
+            #fig, ax = plt.subplots(1, 4)
+            #ax[0].imshow((x - middle).cpu()[0, 0])
+            #ax[1].imshow(torch.abs((x - middle).cpu()[0, 0]))
+            #ax[2].imshow(x.cpu()[0, 0], cmap='gray')
+            #ax[3].imshow(middle.cpu()[0, 0], cmap='gray')
+            #plt.show()
+
+            middle, _ = self.middle_encoder(middle, attention_map=attention_map)
+            #middle = self.middle_bottleneck(middle, attention_map=attention_map)
+            x_bottleneck = torch.cat([x_encoded, middle], dim=1)
+            x_bottleneck = self.big_attention(x_bottleneck, attention_map=attention_map)
+            #filtered = self.filter_layer(x_bottleneck + middle, x_bottleneck)
+            #attention = self.ca_layer(x_bottleneck, middle)
+            #x_bottleneck = torch.cat([filtered, x_bottleneck], dim=1)
+            #x_bottleneck = torch.cat([attention, x_bottleneck], dim=1)
+            x_bottleneck = self.reduce_layer(x_bottleneck)
+
+        pred, decoder_sm, df = self.decoder(x_encoded, encoder_skip_connections, reconstruction_skip_connections, attention_map=attention_map)
         
         if not self.do_ds:
             pred = pred[0]
             reconstructed = reconstructed[0]
-        out = {'pred': pred, 'reconstructed': reconstructed, 'decoder_sm': decoder_sm, 'reconstruction_sm': reconstruction_sm, 'parameters': parameters, 'logsigma': self.logsigma, 'directional_field': df}
+        out = {'pred': pred, 'reconstructed': reconstructed, 'decoder_sm': decoder_sm, 'reconstruction_sm': reconstruction_sm, 'parameters': parameters, 'logsigma': self.logsigma, 'directional_field': df, 'vq_loss': vq_loss}
         return out
     
 

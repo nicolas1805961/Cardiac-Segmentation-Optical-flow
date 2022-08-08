@@ -81,10 +81,13 @@ class nnMTLTrainerV2(nnUNetTrainer):
         self.ds_loss_weights = None
         self.use_progress_bar=True
         self.directional_field = self.config['directional_field']
+        self.reconstruction = self.config['reconstruction']
 
         self.eval_images = self.initialize_image_data()
         self.iter_nb = 0
         self.middle = self.config['middle']
+        self.vae = self.config['vae']
+        self.vq_vae = self.config['vq_vae']
 
         self.val_loss = []
         self.train_loss = []
@@ -105,9 +108,14 @@ class nnMTLTrainerV2(nnUNetTrainer):
 
         if self.config['reconstruction']:
             self.loss_data['reconstruction'] = [self.config['reconstruction_loss_weight'], float('nan')]
-            self.loss_data['similarity'] = [self.config['similarity_weight'], float('nan')]
             self.mse_loss = nn.MSELoss()
-            self.similarity_loss = nn.L1Loss()
+            if self.vae:
+                self.loss_data['vae'] = [self.config['vae_loss_weight'], float('nan')]
+            elif self.vq_vae:
+                self.loss_data['vq_vae'] = [self.config['vae_loss_weight'], float('nan')]
+            else:
+                self.loss_data['similarity'] = [self.config['similarity_weight'], float('nan')]
+                self.similarity_loss = nn.L1Loss()
 
         if self.config['learn_transforms']:
             self.loss_data['rotation'] = [self.config['rotation_loss_weight'], float('nan')]
@@ -119,17 +127,18 @@ class nnMTLTrainerV2(nnUNetTrainer):
             self.directional_field_loss = DirectionalFieldLoss(weights=loss_weights, writer=self.writer)
             self.loss_data['directional_field'] = [self.config['directional_field_weight'], float('nan')]
 
-        #self.segmentation_loss = DiceFocalLoss(include_background=False, focal_weight=loss_weights[1:] if not self.config['binary'] else None, softmax=True)
         #self.segmentation_loss = torch.nn.CrossEntropyLoss(weight=loss_weights, ignore_index=0)
         #self.segmentation_loss = DiceLoss(include_background=False, softmax=True)
+        if self.config['loss'] == 'focal_and_dice2':
+            self.segmentation_loss = DiceFocalLoss(include_background=False, focal_weight=loss_weights[1:] if not self.config['binary'] else None, softmax=True, to_onehot_y=True)
         if self.config['loss'] == 'focal_and_dice':
             self.segmentation_loss = DC_and_focal_loss({'batch_dice': self.batch_dice, 'smooth': 1e-5, 'do_bg': False}, {'apply_nonlin': nn.Softmax(dim=1), 'alpha':0.5, 'gamma':2, 'smooth':1e-5})
         elif self.config['loss'] == 'topk_and_dice':
-            self.segmentation_loss = DC_and_topk_loss({'batch_dice': self.batch_dice, 'smooth': 1e-5, 'do_bg': False}, {'k': 10})
+            self.segmentation_loss = DC_and_topk_loss({'batch_dice': self.batch_dice, 'smooth': 1e-5, 'do_bg': False}, {'k': 10}, ce_weight=0.5, dc_weight=0.5)
         elif self.config['loss'] == 'ce_and_dice':
-            self.segmentation_loss = DC_and_CE_loss({'batch_dice': self.batch_dice, 'smooth': 1e-5, 'do_bg': False}, {'weight': loss_weights})
+            self.segmentation_loss = DC_and_CE_loss({'batch_dice': self.batch_dice, 'smooth': 1e-5, 'do_bg': False}, {'weight': loss_weights}, weight_ce=0.5, weight_dice=0.5)
         elif self.config['loss'] == 'ce':
-            self.segmentation_loss = RobustCrossEntropyLoss(weight=loss_weights, ignore_index=0)
+            self.segmentation_loss = RobustCrossEntropyLoss(weight=loss_weights)
 
         self.pin_memory = True
         self.similarity_downscale = self.config['similarity_down_scale']
@@ -265,7 +274,8 @@ class nnMTLTrainerV2(nnUNetTrainer):
                 seg_weights = weights
 
             self.segmentation_loss = MultipleOutputLoss2(self.segmentation_loss, seg_weights)
-            self.reconstruction_loss = MultipleOutputLoss2(self.mse_loss, weights)
+            if self.reconstruction:
+                self.reconstruction_loss = MultipleOutputLoss2(self.mse_loss, weights)
             ################# END ###################
 
             self.folder_with_preprocessed_data = join(self.dataset_directory, self.plans['data_identifier'] +
@@ -572,15 +582,20 @@ class nnMTLTrainerV2(nnUNetTrainer):
             seg_dice = ((2 * tp_hard) / (2 * tp_hard + fp_hard + fn_hard + 1e-8))
             for t in range(len(target)):
                 current_x = x[t, 0]
-                current_reconstructed = reconstructed[t, 0]
-                current_rec_sim = rec_sim[t]
-                current_dec_sim = dec_sim[t]
 
-                rec_ssim = ssim(current_x.type(torch.float32)[None, None, :, :], current_reconstructed.type(torch.float32)[None, None, :, :])
-                self.reconstruction_ssim_list.append(rec_ssim)
-
-                sim_l2 = torch.linalg.norm(current_rec_sim.type(torch.float32) - current_dec_sim.type(torch.float32), ord=2)
-                self.sim_l2_list.append(sim_l2)
+                if self.reconstruction:
+                    current_reconstructed = reconstructed[t, 0]
+                    rec_ssim = ssim(current_x.type(torch.float32)[None, None, :, :], current_reconstructed.type(torch.float32)[None, None, :, :])
+                    self.reconstruction_ssim_list.append(rec_ssim)
+                    self.set_up_image_rec(rec_ssim=rec_ssim, reconstructed=current_reconstructed, x=current_x)
+                    if not self.vae and not self.vq_vae:
+                        current_rec_sim = rec_sim[t]
+                        current_dec_sim = dec_sim[t]
+                        sim_l2 = torch.linalg.norm(current_rec_sim.type(torch.float32) - current_dec_sim.type(torch.float32), ord=2)
+                        self.sim_l2_list.append(sim_l2)
+                        current_rec_sim = self.get_similarity_ready(current_rec_sim)
+                        current_dec_sim = self.get_similarity_ready(current_dec_sim)
+                        self.set_up_image_sim(sim_l2=sim_l2, rec_sim=current_rec_sim, dec_sim=current_dec_sim, x=current_x)
 
                 if self.directional_field:
                     current_pred_df = pred_df[t]
@@ -594,12 +609,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
                 current_pred = torch.argmax(pred[t], dim=0)
                 current_target = target[t]
 
-                current_rec_sim = self.get_similarity_ready(current_rec_sim)
-                current_dec_sim = self.get_similarity_ready(current_dec_sim)
-
                 self.set_up_image_seg(seg_dice=seg_dice[t].mean(), gt=current_target, pred=current_pred, x=current_x)
-                self.set_up_image_sim(sim_l2=sim_l2, rec_sim=current_rec_sim, dec_sim=current_dec_sim, x=current_x)
-                self.set_up_image_rec(rec_ssim=rec_ssim, reconstructed=current_reconstructed, x=current_x)
                 
                 #with autocast():
 
@@ -639,23 +649,26 @@ class nnMTLTrainerV2(nnUNetTrainer):
 
         self.print_to_log_file("(interpret this as an estimate for the Dice of the different classes. This is not exact.)")
         self.print_to_log_file("Average global foreground Dice:", [np.round(i, 4) for i in global_dc_per_class])
-        self.print_to_log_file("Average reconstruction ssim:", torch.tensor(self.reconstruction_ssim_list).mean().item())
-        self.print_to_log_file("Average similarity L2 distance:", torch.tensor(self.sim_l2_list).mean().item())
+        if self.reconstruction:
+            self.print_to_log_file("Average reconstruction ssim:", torch.tensor(self.reconstruction_ssim_list).mean().item())
+            self.writer.add_scalar('Epoch/Reconstruction ssim', torch.tensor(self.reconstruction_ssim_list).mean().item(), self.epoch)
+            self.log_rec_images()
+            if not self.vae and not self.vq_vae:
+                self.print_to_log_file("Average similarity L2 distance:", torch.tensor(self.sim_l2_list).mean().item())
+                self.writer.add_scalar('Epoch/Similarity L2 distance', torch.tensor(self.sim_l2_list).mean().item(), self.epoch)
+                self.log_sim_images(colormap=cm.plasma)
 
         class_dice = {'RV': global_dc_per_class[0], 'MYO': global_dc_per_class[1], 'LV': global_dc_per_class[2]}
         overfit_data = {'Train': torch.tensor(self.train_loss).mean().item(), 'Val': torch.tensor(self.val_loss).mean().item()}
         self.writer.add_scalars('Epoch/Train_vs_val_loss', overfit_data, self.epoch)
         self.writer.add_scalars('Epoch/Class dice', class_dice, self.epoch)
         self.writer.add_scalar('Epoch/Dice', torch.tensor(global_dc_per_class).mean().item(), self.epoch)
-        self.writer.add_scalar('Epoch/Reconstruction ssim', torch.tensor(self.reconstruction_ssim_list).mean().item(), self.epoch)
-        self.writer.add_scalar('Epoch/Similarity L2 distance', torch.tensor(self.sim_l2_list).mean().item(), self.epoch)
 
-        self.log_rec_images()
         if self.directional_field:
             self.print_to_log_file("Average df ssim:", torch.tensor(self.df_ssim_list).mean().item())
             self.writer.add_scalar('Epoch/Directional field ssim', torch.tensor(self.df_ssim_list).mean().item(), self.epoch)
             self.log_df_images(colormap=cm.viridis)
-        self.log_sim_images(colormap=cm.plasma)
+
         cmap, norm = self.get_custom_colormap(colormap=cm.jet)
         self.log_seg_images(colormap=cmap, norm=norm)
 
@@ -685,9 +698,15 @@ class nnMTLTrainerV2(nnUNetTrainer):
         """
         pred = output['pred'][0]
         pred_df = output['directional_field']
-        reconstructed = output['reconstructed'][0]
-        rec_sim = output['reconstruction_sm']
-        dec_sim = output['decoder_sm']
+
+        if self.reconstruction:
+            reconstructed = output['reconstructed'][0]
+            rec_sim = output['reconstruction_sm']
+            dec_sim = output['decoder_sm']
+        else:
+            reconstructed = None
+            rec_sim = None
+            dec_sim = None
 
         x = data[0]
         target = target[0]
@@ -747,12 +766,19 @@ class nnMTLTrainerV2(nnUNetTrainer):
             assert t.shape[1] == 1
 
         pred = output['pred']
-        reconstructed = output['reconstructed']
-        decoder_sm = output['decoder_sm']
-        reconstruction_sm = output['reconstruction_sm']
-        #predicted_parameters = output['parameters']
-        assert pred[0].shape[-2:] == target[0].shape[-2:] == reconstructed[0].shape[-2:] == x[0].shape[-2:]
-        assert len(pred) == len(target) == len(reconstructed) == len(x)
+        if self.reconstruction:
+            if self.vae:
+                self.loss_data['vae'][1] = output['vq_loss']
+            elif self.vq_vae:
+                self.loss_data['vq_vae'][1] = output['vq_loss']
+            reconstructed = output['reconstructed']
+            decoder_sm = output['decoder_sm']
+            reconstruction_sm = output['reconstruction_sm']
+            assert pred[0].shape[-2:] == target[0].shape[-2:] == reconstructed[0].shape[-2:] == x[0].shape[-2:]
+            assert len(pred) == len(target) == len(reconstructed) == len(x)
+        else:
+            assert pred[0].shape[-2:] == target[0].shape[-2:]
+            assert len(pred) == len(target)
 
         #print(x[0].dtype)
         #print(reconstructed[0].dtype)
@@ -767,7 +793,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
         
         sim_loss = 0
         rec_loss = 0
-        if reconstructed is not None:
+        if self.reconstruction:
 
             #a = (self.end_similarity - self.start_similarity) / self.total_nb_of_iterations
             #b = self.start_similarity
@@ -776,12 +802,10 @@ class nnMTLTrainerV2(nnUNetTrainer):
             rec_loss = self.reconstruction_loss(reconstructed, x)
             self.loss_data['reconstruction'][1] = rec_loss
 
-            assert decoder_sm.shape == reconstruction_sm.shape
-            sim_loss = self.similarity_loss(decoder_sm, reconstruction_sm)
-            self.loss_data['similarity'][1] = sim_loss
-            #if self.dynamic_weight_averaging:
-            #    self.epoch_average_losses[self.epoch]['reconstruction'] += reconstruction_loss.item() / nb_iters
-            #    self.epoch_average_losses[self.epoch]['similarity'] += similarity_loss.item() / nb_iters
+            if not self.vae and not self.vq_vae:
+                assert decoder_sm.shape == reconstruction_sm.shape
+                sim_loss = self.similarity_loss(decoder_sm, reconstruction_sm)
+                self.loss_data['similarity'][1] = sim_loss
 
         #seg_target = []
         #for t in range(len(target)):
@@ -826,12 +850,12 @@ class nnMTLTrainerV2(nnUNetTrainer):
         else:
             middle = None
 
-        matplotlib.use('QtAgg')
-        fig, ax = plt.subplots(1, 3)
-        ax[0].imshow(data[0][0, 0], cmap='gray')
-        ax[1].imshow(data_dict['middle'][0, 0], cmap='gray')
-        ax[2].imshow(target[0][0, 0], cmap='gray')
-        plt.show()
+        #matplotlib.use('QtAgg')
+        #fig, ax = plt.subplots(1, 3)
+        #ax[0].imshow(data[0][0, 0], cmap='gray')
+        #ax[1].imshow(data_dict['middle'][0, 0], cmap='gray')
+        #ax[2].imshow(target[0][0, 0], cmap='gray')
+        #plt.show()
 
         if self.directional_field:
             gt_df = data_dict['directional_field']

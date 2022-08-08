@@ -4,16 +4,19 @@ device: 'cuda:0'
 deep_supervision: True
 val_subset_size: -1
 apply_clahe: True
+vq_vae: False
+vae: True
+vae_loss_weight: 0.1
 logging_metrics_iteration_number: 1000000000000
 logging_loss_iteration_number: 1000000000
 val_stride: 1
 scheduler: 'cosine'
 optimizer: 'sgd'
-middle: True
+middle: False
 start_reconstruction_dim: 16
 min_max_normalization: False
-initial_lr: 0.00001
-weight_decay: 0.0001
+initial_lr: 0.000075
+weight_decay: 0.0005
 spatial_transformer_learning_rate: 0.0001
 warmup_percent: 0.1
 smoothing: 0.0
@@ -37,7 +40,7 @@ transformer_depth: [] #[2, 2, 2], [2]
 num_heads: [] #[3, 6, 12], [8] [12]
 spatial_cross_attention_num_heads: [2, 4, 8] #[2, 4, 6, 8, 12] [12, 8, 6, 4, 2] [bottom, ..., top] [3, 6, 12] [4, 4, 8, 8, 16]
 method: 'equal'
-batch_size: 6 #8
+batch_size: 2 #8
 bottleneck: 'swin' # ['vit', 'swin', 'factorized', 'vit_3d', 'swin_3d']
 patch_size: [4, 4] # must be a 3d list for 3d encoder decoder, a 2d list for 2d encoder decoder
 rpe_mode: 'bias' # ['contextual', 'bias', 'None']

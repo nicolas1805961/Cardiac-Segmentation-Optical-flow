@@ -190,7 +190,7 @@ class SoftDiceLoss(nn.Module):
                 dc = dc[:, 1:]
         dc = dc.mean()
 
-        return -dc
+        return 1 - dc
 
 
 class MCCLoss(nn.Module):
@@ -297,14 +297,16 @@ class SoftDiceLossSquared(nn.Module):
                 dc = dc[:, 1:]
         dc = dc.mean()
 
-        return -dc
+        return 1 - dc
 
 
 class DC_and_focal_loss(nn.Module):
-    def __init__(self, soft_dice_kwargs, focal_kwargs, aggregate="sum", square_dice=False):
+    def __init__(self, soft_dice_kwargs, focal_kwargs, aggregate="sum", square_dice=False, focal_weight=1, dc_weight=1):
         super(DC_and_focal_loss, self).__init__()
         self.aggregate = aggregate
         self.focal = FocalLoss(**focal_kwargs)
+        self.focal_weight = focal_weight
+        self.dc_weight = dc_weight
         if not square_dice:
             self.dc = SoftDiceLoss(apply_nonlin=softmax_helper, **soft_dice_kwargs)
         else:
@@ -313,11 +315,11 @@ class DC_and_focal_loss(nn.Module):
     def forward(self, net_output, target):
         dc_loss = self.dc(net_output, target)
         focal_loss = self.focal(net_output, target)
+        print(dc_loss)
+        print(focal_loss)
+        print('*********************')
         if self.aggregate == "sum":
-            print(focal_loss)
-            print(dc_loss)
-            print('******************')
-            result = focal_loss + dc_loss
+            result = self.focal_weight * focal_loss + self.dc_weight * dc_loss
         else:
             raise NotImplementedError("nah son") # reserved for other stuff (later?)
         return result
@@ -429,10 +431,12 @@ class GDL_and_CE_loss(nn.Module):
 
 
 class DC_and_topk_loss(nn.Module):
-    def __init__(self, soft_dice_kwargs, ce_kwargs, aggregate="sum", square_dice=False):
+    def __init__(self, soft_dice_kwargs, ce_kwargs, aggregate="sum", square_dice=False, ce_weight=1, dc_weight=1):
         super(DC_and_topk_loss, self).__init__()
         self.aggregate = aggregate
         self.ce = TopKLoss(**ce_kwargs)
+        self.ce_weight = ce_weight
+        self.dc_weight = dc_weight
         if not square_dice:
             self.dc = SoftDiceLoss(apply_nonlin=softmax_helper, **soft_dice_kwargs)
         else:
@@ -442,7 +446,7 @@ class DC_and_topk_loss(nn.Module):
         dc_loss = self.dc(net_output, target)
         ce_loss = self.ce(net_output, target)
         if self.aggregate == "sum":
-            result = ce_loss + dc_loss
+            result = self.ce_weight * ce_loss + self.dc_weight * dc_loss
         else:
             raise NotImplementedError("nah son") # reserved for other stuff (later?)
         return result

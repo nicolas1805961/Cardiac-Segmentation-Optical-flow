@@ -889,8 +889,8 @@ def augment_gamma(data_sample, middle_sample, gamma_range=(0.5, 2), invert_image
         for c in range(data_sample.shape[0]):
             retain_stats_here = retain_stats() if callable(retain_stats) else retain_stats
             if retain_stats_here:
-                mnmiddle = middle_sample.mean()
-                sdmiddle = middle_sample.std()
+                mnmiddle = middle_sample[c].mean()
+                sdmiddle = middle_sample[c].std()
 
                 mn = data_sample[c].mean()
                 sd = data_sample[c].std()
@@ -900,18 +900,18 @@ def augment_gamma(data_sample, middle_sample, gamma_range=(0.5, 2), invert_image
             else:
                 gamma = np.random.uniform(max(gamma_range[0], 1), gamma_range[1])
 
-            minmiddle = middle_sample.min()
-            rngemiddle = middle_sample.max() - minmiddle
-            middle_sample = np.power(((middle_sample - minmiddle) / float(rngemiddle + epsilon)), gamma) * rngemiddle + minmiddle
+            minmiddle = middle_sample[c].min()
+            rngemiddle = middle_sample[c].max() - minmiddle
+            middle_sample[c] = np.power(((middle_sample[c] - minmiddle) / float(rngemiddle + epsilon)), gamma) * float(rngemiddle + epsilon) + minmiddle
 
             minm = data_sample[c].min()
             rnge = data_sample[c].max() - minm
             data_sample[c] = np.power(((data_sample[c] - minm) / float(rnge + epsilon)), gamma) * float(rnge + epsilon) + minm
 
             if retain_stats_here:
-                middle_sample = middle_sample - middle_sample.mean()
-                middle_sample = middle_sample / (middle_sample.std() + 1e-8) * sdmiddle
-                middle_sample = middle_sample + mnmiddle
+                middle_sample[c] = middle_sample[c] - middle_sample[c].mean()
+                middle_sample[c] = middle_sample[c] / (middle_sample[c].std() + 1e-8) * sdmiddle
+                middle_sample[c] = middle_sample[c] + mnmiddle
 
                 data_sample[c] = data_sample[c] - data_sample[c].mean()
                 data_sample[c] = data_sample[c] / (data_sample[c].std() + 1e-8) * sd

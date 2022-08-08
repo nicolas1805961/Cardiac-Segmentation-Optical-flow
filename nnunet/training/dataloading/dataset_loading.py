@@ -710,7 +710,8 @@ class DataLoader2DMiddle(SlimDataLoaderBase):
                     random_slice = np.random.choice(valid_slices)
                     voxels_of_that_class = voxels_of_that_class[voxels_of_that_class[:, 0] == random_slice]
                     voxels_of_that_class = voxels_of_that_class[:, 1:]
-            middle_slice = case_all_data.shape[1] // 2
+            #middle_slice = case_all_data.shape[1] // 2
+            middle_slice = random_slice - 1 if random_slice > 0 else case_all_data.shape[1] - 1
             if middle_slice == random_slice:
                 middle_slice = random_slice - 1
 
