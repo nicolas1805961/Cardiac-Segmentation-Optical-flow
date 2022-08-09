@@ -88,6 +88,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
         self.middle = self.config['middle']
         self.vae = self.config['vae']
         self.vq_vae = self.config['vq_vae']
+        self.similarity = self.config['similarity']
 
         self.val_loss = []
         self.train_loss = []
@@ -113,7 +114,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
                 self.loss_data['vae'] = [self.config['vae_loss_weight'], float('nan')]
             elif self.vq_vae:
                 self.loss_data['vq_vae'] = [self.config['vae_loss_weight'], float('nan')]
-            else:
+            if self.similarity:
                 self.loss_data['similarity'] = [self.config['similarity_weight'], float('nan')]
                 self.similarity_loss = nn.L1Loss()
 
@@ -588,7 +589,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
                     rec_ssim = ssim(current_x.type(torch.float32)[None, None, :, :], current_reconstructed.type(torch.float32)[None, None, :, :])
                     self.reconstruction_ssim_list.append(rec_ssim)
                     self.set_up_image_rec(rec_ssim=rec_ssim, reconstructed=current_reconstructed, x=current_x)
-                    if not self.vae and not self.vq_vae:
+                    if self.similarity:
                         current_rec_sim = rec_sim[t]
                         current_dec_sim = dec_sim[t]
                         sim_l2 = torch.linalg.norm(current_rec_sim.type(torch.float32) - current_dec_sim.type(torch.float32), ord=2)
@@ -653,7 +654,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
             self.print_to_log_file("Average reconstruction ssim:", torch.tensor(self.reconstruction_ssim_list).mean().item())
             self.writer.add_scalar('Epoch/Reconstruction ssim', torch.tensor(self.reconstruction_ssim_list).mean().item(), self.epoch)
             self.log_rec_images()
-            if not self.vae and not self.vq_vae:
+            if self.similarity:
                 self.print_to_log_file("Average similarity L2 distance:", torch.tensor(self.sim_l2_list).mean().item())
                 self.writer.add_scalar('Epoch/Similarity L2 distance', torch.tensor(self.sim_l2_list).mean().item(), self.epoch)
                 self.log_sim_images(colormap=cm.plasma)
@@ -802,7 +803,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
             rec_loss = self.reconstruction_loss(reconstructed, x)
             self.loss_data['reconstruction'][1] = rec_loss
 
-            if not self.vae and not self.vq_vae:
+            if self.similarity:
                 assert decoder_sm.shape == reconstruction_sm.shape
                 sim_loss = self.similarity_loss(decoder_sm, reconstruction_sm)
                 self.loss_data['similarity'][1] = sim_loss

@@ -76,13 +76,16 @@ class MTLmodel(SegmentationNetwork):
                 conv_depth,
                 swin_bottleneck,
                 num_heads,
+                vae_noise,
                 transformer_depth, 
                 filter_skip_co_reconstruction,
                 filter_skip_co_segmentation,
                 bottleneck_heads, 
                 vae,
                 vq_vae,
+                similarity,
                 norm,
+                add_extra_bottleneck_blocks,
                 transformer_type='swin',
                 bottleneck='swin',
                 mlp_ratio=4., 
@@ -111,6 +114,8 @@ class MTLmodel(SegmentationNetwork):
         self.middle = middle
         self.vae = vae
         self.vq_vae = vq_vae
+        self.similarity = similarity
+        self.add_extra_bottleneck_blocks = add_extra_bottleneck_blocks
         if uncertainty_weighting:
             self.logsigma = nn.Parameter(torch.FloatTensor([1.61, -0.7, -0.7]))
         else:
@@ -138,10 +143,12 @@ class MTLmodel(SegmentationNetwork):
             sm_computation = nn.Sequential(ReplicateChannels(4),
                                                 GetSimilarityMatrix(similarity_down_scale))
 
-            self.reconstruction = decoder_alt.ReconstructionDecoder(norm=norm, filter_skip_co_reconstruction=filter_skip_co_reconstruction, reconstruction=reconstruction, reconstruction_skip=reconstruction_skip, sm_computation=sm_computation, concat_spatial_cross_attention=concat_spatial_cross_attention, attention_type=reconstruction_attention_type, spatial_cross_attention_num_heads=spatial_cross_attention_num_heads[::-1], shortcut=shortcut, proj_qkv=proj, out_encoder_dims=out_encoder_dims[::-1], use_conv_mlp=use_conv_mlp, last_activation='identity', blur=blur, img_size=image_size, num_classes=1, blur_kernel=blur_kernel, device=device, swin_abs_pos=swin_abs_pos, in_encoder_dims=in_dims[::-1], merge=merge, conv_depth=conv_depth[::-1], transformer_depth=transformer_depth[::-1], dpr=dpr_decoder, rpe_mode=rpe_mode, rpe_contextual_tensor=rpe_contextual_tensor, num_heads=num_heads, window_size=window_size, drop_path_rate=drop_path_rate, deep_supervision=self.do_ds)
+            self.reconstruction = decoder_alt.ReconstructionDecoder(similarity=similarity, norm=norm, filter_skip_co_reconstruction=filter_skip_co_reconstruction, reconstruction=reconstruction, reconstruction_skip=reconstruction_skip, sm_computation=sm_computation, concat_spatial_cross_attention=concat_spatial_cross_attention, attention_type=reconstruction_attention_type, spatial_cross_attention_num_heads=spatial_cross_attention_num_heads[::-1], shortcut=shortcut, proj_qkv=proj, out_encoder_dims=out_encoder_dims[::-1], use_conv_mlp=use_conv_mlp, last_activation='identity', blur=blur, img_size=image_size, num_classes=1, blur_kernel=blur_kernel, device=device, swin_abs_pos=swin_abs_pos, in_encoder_dims=in_dims[::-1], merge=merge, conv_depth=conv_depth[::-1], transformer_depth=transformer_depth[::-1], dpr=dpr_decoder, rpe_mode=rpe_mode, rpe_contextual_tensor=rpe_contextual_tensor, num_heads=num_heads, window_size=window_size, drop_path_rate=drop_path_rate, deep_supervision=self.do_ds)
 
-        self.decoder = decoder_alt.SegmentationDecoder(norm=norm, similarity_down_scale=similarity_down_scale, filter_skip_co_segmentation=filter_skip_co_segmentation, shift_nb=shift_nb, start_reconstruction_dim=start_reconstruction_dim, directional_field=directional_field, attention_map=attention_map, reconstruction=reconstruction, reconstruction_skip=reconstruction_skip, concat_spatial_cross_attention=concat_spatial_cross_attention, attention_type=encoder_attention_type, spatial_cross_attention_num_heads=spatial_cross_attention_num_heads[::-1], shortcut=shortcut, proj_qkv=proj, out_encoder_dims=out_encoder_dims[::-1], use_conv_mlp=use_conv_mlp, last_activation='identity', blur=blur, img_size=image_size, num_classes=self.num_classes, blur_kernel=blur_kernel, device=device, swin_abs_pos=swin_abs_pos, in_encoder_dims=in_dims[::-1], merge=merge, conv_depth=conv_depth[::-1], transformer_depth=transformer_depth[::-1], dpr=dpr_decoder, rpe_mode=rpe_mode, rpe_contextual_tensor=rpe_contextual_tensor, num_heads=num_heads, window_size=window_size, drop_path_rate=drop_path_rate, deep_supervision=self.do_ds)
-        
+        self.decoder = decoder_alt.SegmentationDecoder(similarity=similarity, norm=norm, similarity_down_scale=similarity_down_scale, filter_skip_co_segmentation=filter_skip_co_segmentation, shift_nb=shift_nb, start_reconstruction_dim=start_reconstruction_dim, directional_field=directional_field, attention_map=attention_map, reconstruction=reconstruction, reconstruction_skip=reconstruction_skip, concat_spatial_cross_attention=concat_spatial_cross_attention, attention_type=encoder_attention_type, spatial_cross_attention_num_heads=spatial_cross_attention_num_heads[::-1], shortcut=shortcut, proj_qkv=proj, out_encoder_dims=out_encoder_dims[::-1], use_conv_mlp=use_conv_mlp, last_activation='identity', blur=blur, img_size=image_size, num_classes=self.num_classes, blur_kernel=blur_kernel, device=device, swin_abs_pos=swin_abs_pos, in_encoder_dims=in_dims[::-1], merge=merge, conv_depth=conv_depth[::-1], transformer_depth=transformer_depth[::-1], dpr=dpr_decoder, rpe_mode=rpe_mode, rpe_contextual_tensor=rpe_contextual_tensor, num_heads=num_heads, window_size=window_size, drop_path_rate=drop_path_rate, deep_supervision=self.do_ds)
+        if self.add_extra_bottleneck_blocks:
+            self.extra_bottleneck_block_1 = ConvLayer(in_dim=self.d_model, out_dim=self.d_model, nb_se_blocks=1, dpr=dpr_bottleneck, norm=norm)
+            self.extra_bottleneck_block_2 = ConvLayer(in_dim=self.d_model, out_dim=self.d_model, nb_se_blocks=1, dpr=dpr_bottleneck, norm=norm)
         if self.vae:
             H, W = (int(image_size / 2**(self.num_stages)), int(image_size / 2**(self.num_stages)))
             vae_dim = self.d_model
@@ -149,7 +156,7 @@ class MTLmodel(SegmentationNetwork):
             in_dim_linear = int(H * W * vae_dim)
             self.pre_vae = ConvBlock(in_dim=self.d_model, out_dim=vae_dim, kernel_size=1, norm=norm)
             self.post_vae = nn.Conv2d(in_channels=vae_dim, out_channels=self.d_model, kernel_size=1)
-            self.vae_block = VanillaVAE(flatten_dim=in_dim_linear, latent_dim=128)
+            self.vae_block = VanillaVAE(vae_noise=vae_noise, flatten_dim=in_dim_linear, latent_dim=128)
         elif self.vq_vae:
             vae_dim = 64
             self.pre_vae = nn.Conv2d(in_channels=self.d_model, out_channels=64, kernel_size=1)
@@ -282,7 +289,11 @@ class MTLmodel(SegmentationNetwork):
         vq_loss = None
         reconstruction_skip_connections = None
         x_encoded, encoder_skip_connections = self.encoder(x, attention_map=attention_map)
+        if self.add_extra_bottleneck_blocks:
+            x_encoded = self.extra_bottleneck_block_1(x_encoded)
         x_encoded = self.bottleneck(x_encoded, attention_map=attention_map)
+        if self.add_extra_bottleneck_blocks:
+            x_encoded = self.extra_bottleneck_block_2(x_encoded)
         if self.vae:
             x_bottleneck = self.pre_vae(x_encoded)
             x_bottleneck, vq_loss = self.vae_block(x_bottleneck)
@@ -292,13 +303,9 @@ class MTLmodel(SegmentationNetwork):
             x_bottleneck, vq_loss = self.vq_vae_block(x_bottleneck)
             #vq_loss, x_bottleneck, perplexity, _ = self.vq_vae(x_bottleneck)
             x_bottleneck = self.post_vae(x_bottleneck)
-        if self.learn_transforms:
-            rotation_net_input = torch.flatten(x_bottleneck, start_dim=1)
-            parameters = self.rotation_net(rotation_net_input)
+        else:
+            x_bottleneck = x_encoded
         if self.reconstruction:
-            #if not self.training:
-            #    print(torch.all(torch.isfinite(x_bottleneck)))
-
             reconstructed, reconstruction_sm, reconstruction_skip_connections = self.reconstruction(x_bottleneck, encoder_skip_connections)
         if self.middle:
             #matplotlib.use('QtAgg')
