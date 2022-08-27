@@ -17,6 +17,7 @@ from collections import OrderedDict
 from typing import Tuple
 import matplotlib
 from datetime import datetime
+from sklearn.metrics import accuracy_score
 
 from torch.nn.functional import interpolate
 import psutil
@@ -35,7 +36,7 @@ import torch
 from torchinfo import summary
 from nnunet.lib.ssim import ssim
 from nnunet.utilities.tensor_utilities import sum_tensor
-from nnunet.training.data_augmentation.data_augmentation_moreDA import get_moreDA_augmentation
+from nnunet.training.data_augmentation.data_augmentation_moreDA import get_moreDA_augmentation_mtl
 from nnunet.training.data_augmentation.data_augmentation_mtl import get_moreDA_augmentation_middle
 from nnunet.training.loss_functions.deep_supervision import MultipleOutputLoss2
 from nnunet.utilities.to_torch import maybe_to_torch, to_cuda
@@ -52,7 +53,7 @@ from torch import nn
 from torch.cuda.amp import autocast
 from nnunet.training.learning_rate.poly_lr import poly_lr
 from batchgenerators.utilities.file_and_folder_operations import *
-from nnunet.lib.training_utils import build_2d_model, read_config
+from nnunet.lib.training_utils import build_2d_model, read_config, build_discriminators
 from nnunet.lib.loss import DirectionalFieldLoss
 from nnunet.lib.dataset_utils import normalize_0_1
 from pathlib import Path
@@ -62,6 +63,8 @@ from nnunet.lib.boundary_utils import simplex
 from nnunet.training.loss_functions.dice_loss import DC_and_CE_loss, DC_and_focal_loss, DC_and_topk_loss
 from nnunet.training.loss_functions.crossentropy import RobustCrossEntropyLoss
 from nnunet.training.dataloading.dataset_loading import DataLoader2DMiddle
+
+from nnunet.lib.loss import logisticGradientPenalty
 
 
 class nnMTLTrainerV2(nnUNetTrainer):
@@ -83,6 +86,9 @@ class nnMTLTrainerV2(nnUNetTrainer):
         self.directional_field = self.config['directional_field']
         self.reconstruction = self.config['reconstruction']
 
+        self.deep_supervision = self.config['deep_supervision']
+        self.classification = self.config['classification']
+
         self.eval_images = self.initialize_image_data()
         self.iter_nb = 0
         self.middle = self.config['middle']
@@ -90,10 +96,11 @@ class nnMTLTrainerV2(nnUNetTrainer):
         self.vq_vae = self.config['vq_vae']
         self.similarity = self.config['similarity']
 
+        self.adversarial_loss = self.config['adversarial_loss']
+
         self.val_loss = []
         self.train_loss = []
         
-        self.min_max_normalization = self.config['min_max_normalization']
         self.image_size = self.config['image_size']
 
         if self.image_size == 224:
@@ -115,8 +122,20 @@ class nnMTLTrainerV2(nnUNetTrainer):
             elif self.vq_vae:
                 self.loss_data['vq_vae'] = [self.config['vae_loss_weight'], float('nan')]
             if self.similarity:
-                self.loss_data['similarity'] = [self.config['similarity_weight'], float('nan')]
+                similarity_initial_weight = self.config['similarity_weight'] if not self.config['progressive_similarity_growing'] else 0
+                self.loss_data['similarity'] = [similarity_initial_weight, float('nan')]
                 self.similarity_loss = nn.L1Loss()
+            if self.adversarial_loss:
+                self.loss_data['adv_rec'] = [self.config['adversarial_weight'], float('nan')]
+                self.loss_data['adv_seg'] = [self.config['adversarial_weight'], float('nan')]
+                self.adv_loss = nn.BCELoss()
+                self.discriminator_lr = self.config['discriminator_lr']
+                self.discriminator_decay = self.config['discriminator_decay']
+                self.r1_penalty_iteration = self.config['r1_penalty_iteration']
+        
+        if self.classification:
+            self.loss_data['classification'] = [self.config['classification_weight'], float('nan')]
+            self.classification_loss = nn.CrossEntropyLoss()
 
         if self.config['learn_transforms']:
             self.loss_data['rotation'] = [self.config['rotation_loss_weight'], float('nan')]
@@ -137,12 +156,16 @@ class nnMTLTrainerV2(nnUNetTrainer):
         elif self.config['loss'] == 'topk_and_dice':
             self.segmentation_loss = DC_and_topk_loss({'batch_dice': self.batch_dice, 'smooth': 1e-5, 'do_bg': False}, {'k': 10}, ce_weight=0.5, dc_weight=0.5)
         elif self.config['loss'] == 'ce_and_dice':
-            self.segmentation_loss = DC_and_CE_loss({'batch_dice': self.batch_dice, 'smooth': 1e-5, 'do_bg': False}, {'weight': loss_weights}, weight_ce=0.5, weight_dice=0.5)
+            self.segmentation_loss = DC_and_CE_loss({'batch_dice': self.batch_dice, 'smooth': 1e-5, 'do_bg': False}, {})
+            #self.segmentation_loss = DC_and_CE_loss({'batch_dice': self.batch_dice, 'smooth': 1e-5, 'do_bg': False}, {'weight': loss_weights}, weight_ce=0.5, weight_dice=0.5)
         elif self.config['loss'] == 'ce':
             self.segmentation_loss = RobustCrossEntropyLoss(weight=loss_weights)
 
         self.pin_memory = True
         self.similarity_downscale = self.config['similarity_down_scale']
+
+        if self.classification:
+            self.classification_accuracy_list = []
 
         self.reconstruction_ssim_list = []
         self.df_ssim_list = []
@@ -293,14 +316,13 @@ class nnMTLTrainerV2(nnUNetTrainer):
                         "will wait all winter for your model to finish!")
 
                 if not self.middle:
-                    self.tr_gen, self.val_gen = get_moreDA_augmentation(
+                    self.tr_gen, self.val_gen = get_moreDA_augmentation_mtl(
                         self.dl_tr, self.dl_val,
                         self.data_aug_params[
                             'patch_size_for_spatialtransform'],
                         directional_field=self.directional_field,
                         params=self.data_aug_params,
                         deep_supervision_scales=self.deep_supervision_scales,
-                        min_max_normalization=self.min_max_normalization,
                         pin_memory=self.pin_memory,
                         use_nondetMultiThreadedAugmenter=False
                     )
@@ -312,7 +334,6 @@ class nnMTLTrainerV2(nnUNetTrainer):
                         directional_field=self.directional_field,
                         params=self.data_aug_params,
                         deep_supervision_scales=self.deep_supervision_scales,
-                        min_max_normalization=self.min_max_normalization,
                         pin_memory=self.pin_memory,
                         use_nondetMultiThreadedAugmenter=False
                     )
@@ -331,39 +352,39 @@ class nnMTLTrainerV2(nnUNetTrainer):
             self.print_to_log_file('self.was_initialized is True, not running self.initialize again')
         self.was_initialized = True
     
-    def print_to_log_file(self, *args, also_print_to_console=True, add_timestamp=True):
-
-        timestamp = time()
-        dt_object = datetime.fromtimestamp(timestamp)
-
-        if add_timestamp:
-            args = ("%s:" % dt_object, *args)
-
-        if self.log_file is None:
-            maybe_mkdir_p(self.log_dir)
-            timestamp = datetime.now()
-            self.log_file = join(self.log_dir, "training_log_%d_%d_%d_%02.0d_%02.0d_%02.0d.txt" %
-                                 (timestamp.year, timestamp.month, timestamp.day, timestamp.hour, timestamp.minute,
-                                  timestamp.second))
-            with open(self.log_file, 'w') as f:
-                f.write("Starting... \n")
-        successful = False
-        max_attempts = 5
-        ctr = 0
-        while not successful and ctr < max_attempts:
-            try:
-                with open(self.log_file, 'a+', encoding='utf-8') as f:
-                    for a in args:
-                        f.write(str(a))
-                        f.write(" ")
-                    f.write("\n")
-                successful = True
-            except IOError:
-                print("%s: failed to log: " % datetime.fromtimestamp(timestamp), sys.exc_info())
-                sleep(0.5)
-                ctr += 1
-        if also_print_to_console:
-            print(*args)
+    #def print_to_log_file(self, *args, also_print_to_console=True, add_timestamp=True):
+#
+    #    timestamp = time()
+    #    dt_object = datetime.fromtimestamp(timestamp)
+#
+    #    if add_timestamp:
+    #        args = ("%s:" % dt_object, *args)
+#
+    #    if self.log_file is None:
+    #        maybe_mkdir_p(self.log_dir)
+    #        timestamp = datetime.now()
+    #        self.log_file = join(self.log_dir, "training_log_%d_%d_%d_%02.0d_%02.0d_%02.0d.txt" %
+    #                             (timestamp.year, timestamp.month, timestamp.day, timestamp.hour, timestamp.minute,
+    #                              timestamp.second))
+    #        with open(self.log_file, 'w') as f:
+    #            f.write("Starting... \n")
+    #    successful = False
+    #    max_attempts = 5
+    #    ctr = 0
+    #    while not successful and ctr < max_attempts:
+    #        try:
+    #            with open(self.log_file, 'a+', encoding='utf-8') as f:
+    #                for a in args:
+    #                    f.write(str(a))
+    #                    f.write(" ")
+    #                f.write("\n")
+    #            successful = True
+    #        except IOError:
+    #            print("%s: failed to log: " % datetime.fromtimestamp(timestamp), sys.exc_info())
+    #            sleep(0.5)
+    #            ctr += 1
+    #    if also_print_to_console:
+    #        print(*args)
     
     def count_parameters(self, config, models):
         params_sum = 0
@@ -392,10 +413,19 @@ class nnMTLTrainerV2(nnUNetTrainer):
         Known issue: forgot to set neg_slope=0 in InitWeights_He; should not make a difference though
         :return:
         """
-
-        self.network = build_2d_model(self.config, norm=getattr(torch.nn, self.config['norm']))
-
         models = {}
+        if self.adversarial_loss:
+            self.seg_discriminator, self.rec_discriminator = build_discriminators(self.config)
+            if torch.cuda.is_available():
+                self.seg_discriminator.cuda()
+                self.rec_discriminator.cuda()
+            seg_discriminator_input_size = (self.config['batch_size'], 4, 224, 224)
+            rec_discriminator_input_size = (self.config['batch_size'], 1, 224, 224)
+            models['segmentation discriminator'] = (self.seg_discriminator, seg_discriminator_input_size)
+            models['reconstruction discriminator'] = (self.rec_discriminator, rec_discriminator_input_size)
+
+        self.network = build_2d_model(self.config, norm=getattr(torch.nn, self.config['norm']), log_function=self.print_to_log_file)
+
         nb_inputs = 2 if self.middle else 1
         model_input_size = [(self.config['batch_size'], 1, self.image_size, self.image_size)] * nb_inputs
         models['model'] = (self.network, model_input_size)
@@ -405,20 +435,28 @@ class nnMTLTrainerV2(nnUNetTrainer):
             self.network.cuda()
         self.network.inference_apply_nonlin = softmax_helper
 
-    def initialize_optimizer_and_scheduler(self):
-        assert self.network is not None, "self.initialize_network must be called first"
+    def get_optimizer_scheduler(self, net, lr, decay):
         if self.config['optimizer'] == 'sgd':
-            self.optimizer = torch.optim.SGD(self.network.parameters(), self.initial_lr, weight_decay=self.weight_decay,
-                                            momentum=0.99, nesterov=True)
+            optimizer = torch.optim.SGD(net.parameters(), lr, weight_decay=decay, momentum=0.99, nesterov=True)
         elif self.config['optimizer'] == 'adam':
-            self.optimizer = torch.optim.AdamW(self.network.parameters(), lr=self.initial_lr, weight_decay=self.weight_decay)
+            optimizer = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=decay)
 
         if self.config['scheduler'] == 'cosine':
-            self.lr_scheduler = CosineAnnealingLR(self.optimizer, T_max=self.max_num_epochs)
+            lr_scheduler = CosineAnnealingLR(optimizer, T_max=self.max_num_epochs)
             #self.warmup = LinearLR(optimizer=self.optimizer, start_factor=0.1, end_factor=1, total_iters=self.num_batches_per_epoch)
             #self.lr_scheduler = SequentialLR(optimizer=self.optimizer, schedulers=[warmup, cosine_scheduler], milestones=[1])
         else:
-            self.lr_scheduler = None
+            lr_scheduler = None
+
+        return optimizer, lr_scheduler
+
+    def initialize_optimizer_and_scheduler(self):
+        assert self.network is not None, "self.initialize_network must be called first"
+        self.optimizer, self.lr_scheduler = self.get_optimizer_scheduler(net=self.network, lr=self.initial_lr, decay=self.weight_decay)
+
+        if self.adversarial_loss:
+            self.seg_discriminator_optimizer, self.seg_discriminator_scheduler = self.get_optimizer_scheduler(net=self.seg_discriminator, lr=self.discriminator_lr, decay=self.discriminator_decay)
+            self.rec_discriminator_optimizer, self.rec_discriminator_scheduler = self.get_optimizer_scheduler(net=self.rec_discriminator, lr=self.discriminator_lr, decay=self.discriminator_decay)
 
     def get_images_ready_for_display(self, image, colormap):
         if colormap is not None:
@@ -564,7 +602,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
         sim = torch.clamp(sim, min_sim, max_sim)
         return sim
 
-    def start_online_evaluation(self, pred, pred_df, reconstructed, x, target, gt_df, rec_sim, dec_sim):
+    def start_online_evaluation(self, pred, pred_df, reconstructed, x, target, gt_df, rec_sim, dec_sim, classification_pred, classification_gt):
 
         with torch.no_grad():
             num_classes = pred.shape[1]
@@ -581,6 +619,11 @@ class nnMTLTrainerV2(nnUNetTrainer):
                 fn_hard[:, c - 1] = sum_tensor((output_seg != c).float() * (target == c).float(), axes=axes)
 
             seg_dice = ((2 * tp_hard) / (2 * tp_hard + fp_hard + fn_hard + 1e-8))
+
+            if self.classification:
+                acc = accuracy_score(y_true=classification_gt.cpu(), y_pred=classification_pred.cpu())
+                self.classification_accuracy_list.append(acc)
+
             for t in range(len(target)):
                 current_x = x[t, 0]
 
@@ -650,6 +693,11 @@ class nnMTLTrainerV2(nnUNetTrainer):
 
         self.print_to_log_file("(interpret this as an estimate for the Dice of the different classes. This is not exact.)")
         self.print_to_log_file("Average global foreground Dice:", [np.round(i, 4) for i in global_dc_per_class])
+
+        if self.classification:
+            self.print_to_log_file("Classification accuracy:", torch.tensor(self.classification_accuracy_list).mean().item())
+            self.writer.add_scalar('Epoch/Classification accuracy', torch.tensor(self.classification_accuracy_list).mean().item(), self.epoch)
+
         if self.reconstruction:
             self.print_to_log_file("Average reconstruction ssim:", torch.tensor(self.reconstruction_ssim_list).mean().item())
             self.writer.add_scalar('Epoch/Reconstruction ssim', torch.tensor(self.reconstruction_ssim_list).mean().item(), self.epoch)
@@ -689,7 +737,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
 
         self.eval_images = self.initialize_image_data()
 
-    def run_online_evaluation(self, data, target, output, gt_df):
+    def run_online_evaluation(self, data, target, output, gt_df, classification_gt):
         """
         due to deep supervision the return value and the reference are now lists of tensors. We only need the full
         resolution output because this is what we are interested in in the end. The others are ignored
@@ -708,6 +756,13 @@ class nnMTLTrainerV2(nnUNetTrainer):
             reconstructed = None
             rec_sim = None
             dec_sim = None
+        
+        if self.classification:
+            classification_pred = output['classification']
+            classification_pred = torch.nn.functional.softmax(classification_pred, dim=1)
+            classification_pred = torch.argmax(classification_pred, dim=1)
+        else:
+            classification_pred = None
 
         x = data[0]
         target = target[0]
@@ -718,7 +773,9 @@ class nnMTLTrainerV2(nnUNetTrainer):
                                             target=target, 
                                             gt_df=gt_df, 
                                             rec_sim=rec_sim, 
-                                            dec_sim=dec_sim)
+                                            dec_sim=dec_sim,
+                                            classification_pred=classification_pred,
+                                            classification_gt=classification_gt)
         #return super().run_online_evaluation(output, target)
 
     def validate(self, do_mirroring: bool = True, use_sliding_window: bool = True,
@@ -730,7 +787,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
         """
         ds = self.network.do_ds
         self.network.do_ds = False
-        ret = super().validate(do_mirroring=do_mirroring, use_sliding_window=use_sliding_window, step_size=step_size,
+        ret = super().validate(log_function=self.print_to_log_file, do_mirroring=do_mirroring, use_sliding_window=use_sliding_window, step_size=step_size,
                                save_softmax=save_softmax, use_gaussian=use_gaussian,
                                overwrite=overwrite, validation_folder_name=validation_folder_name, debug=debug,
                                all_in_gpu=all_in_gpu, segmentation_export_kwargs=segmentation_export_kwargs,
@@ -762,7 +819,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
         self.network.do_ds = ds
         return ret
 
-    def compute_losses(self, x, output, target, gt_df, do_backprop):
+    def compute_losses(self, x, output, target, gt_df, do_backprop, gt_classification):
         for t in target:
             assert t.shape[1] == 1
 
@@ -780,6 +837,10 @@ class nnMTLTrainerV2(nnUNetTrainer):
         else:
             assert pred[0].shape[-2:] == target[0].shape[-2:]
             assert len(pred) == len(target)
+
+        if self.classification:
+            classification_loss = self.classification_loss(output['classification'], gt_classification)
+            self.loss_data['classification'][1] = classification_loss
 
         #print(x[0].dtype)
         #print(reconstructed[0].dtype)
@@ -807,6 +868,39 @@ class nnMTLTrainerV2(nnUNetTrainer):
                 assert decoder_sm.shape == reconstruction_sm.shape
                 sim_loss = self.similarity_loss(decoder_sm, reconstruction_sm)
                 self.loss_data['similarity'][1] = sim_loss
+
+            if self.adversarial_loss:
+                if do_backprop:
+                    self.seg_discriminator.train()
+                    self.rec_discriminator.train()
+                else:
+                    self.seg_discriminator.eval()
+                    self.rec_discriminator.eval()
+
+                fake_seg = torch.nn.functional.softmax(pred[0], dim=1)
+                fake_seg = torch.argmax(fake_seg, dim=1).long()
+                fake_seg = torch.nn.functional.one_hot(fake_seg, num_classes=4).permute(0, 3, 1, 2).float()
+                real_seg = torch.nn.functional.one_hot(target[0].long(), num_classes=4).permute(0, 4, 2, 3, 1).squeeze(-1).float()
+
+                assert fake_seg.shape == real_seg.shape
+                assert x[0].shape == reconstructed[0].shape
+
+                self.loss_data['adv_seg'][1], seg_dis_loss = self.get_adversarial_loss(self.seg_discriminator, 
+                                                                        self.seg_discriminator_optimizer,
+                                                                        real=real_seg, 
+                                                                        fake=fake_seg,
+                                                                        iter_nb=self.iter_nb,
+                                                                        do_backprop=do_backprop)
+                self.loss_data['adv_rec'][1], rec_dis_loss = self.get_adversarial_loss(self.rec_discriminator, 
+                                                                        self.rec_discriminator_optimizer,
+                                                                        real=x[0], 
+                                                                        fake=reconstructed[0],
+                                                                        iter_nb=self.iter_nb,
+                                                                        do_backprop=do_backprop)
+                
+                if do_backprop:
+                    self.writer.add_scalar('Iteration/seg_dis_loss', seg_dis_loss, self.iter_nb)
+                    self.writer.add_scalar('Iteration/rec_dis_loss', rec_dis_loss, self.iter_nb)
 
         #seg_target = []
         #for t in range(len(target)):
@@ -842,6 +936,14 @@ class nnMTLTrainerV2(nnUNetTrainer):
         data_dict = next(data_generator)
         data = data_dict['data']
         target = data_dict['target']
+
+        if self.classification:
+            gt_classification = data_dict['classification']
+            gt_classification = maybe_to_torch(gt_classification).long()
+            if torch.cuda.is_available():
+                gt_classification = to_cuda(gt_classification)
+        else:
+            gt_classification = None
 
         if self.middle:
             middle = data_dict['middle']
@@ -881,48 +983,66 @@ class nnMTLTrainerV2(nnUNetTrainer):
 
         self.optimizer.zero_grad()
 
-        if self.fp16:
-            with autocast():
+        output = self.network(data[0], middle=middle)
+        l = self.compute_losses(x=data, output=output, target=target, gt_df=gt_df, do_backprop=do_backprop, gt_classification=gt_classification)
 
-                #matplotlib.use('QtAgg')
-                #plt.imshow(data[0][0, 0].detach().cpu(), cmap='gray')
-                #plt.show()
-
-                output = self.network(data[0], middle=middle)
-
-                l = self.compute_losses(x=data, output=output, target=target, gt_df=gt_df, do_backprop=do_backprop)
-
-                if not do_backprop:
-                    self.val_loss.append(l.detach().cpu())
-                else:
-                    self.train_loss.append(l.detach().cpu())
-                #del data
-
-                #l = self.loss(output, target)
-
-            if do_backprop:
-                self.amp_grad_scaler.scale(l).backward()
-                self.amp_grad_scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-                self.amp_grad_scaler.step(self.optimizer)
-                self.amp_grad_scaler.update()
+        if not do_backprop:
+            self.val_loss.append(l.detach().cpu())
         else:
-            output = self.network(data[0], middle=middle)
-            l = self.compute_losses(x=data, output=output, target=target, gt_df=gt_df, do_backprop=do_backprop)
+            if self.vq_vae:
+                self.writer.add_scalar('Iteration/Perplexity', output['perplexity'], self.iter_nb)
+            self.train_loss.append(l.detach().cpu())
+        #l = self.loss(output, target)
 
-            if not do_backprop:
-                self.val_loss.append(l.detach().cpu())
-            else:
-                self.train_loss.append(l.detach().cpu())
-            #l = self.loss(output, target)
+        if do_backprop:
+            l.backward()
+            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+            self.optimizer.step()
 
-            if do_backprop:
-                l.backward()
-                torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-                self.optimizer.step()
+        #if self.fp16 and not self.vq_vae and not self.adversarial_loss:
+        #    with autocast():
+#
+        #        #matplotlib.use('QtAgg')
+        #        #plt.imshow(data[0][0, 0].detach().cpu(), cmap='gray')
+        #        #plt.show()
+#
+        #        output = self.network(data[0], middle=middle)
+#
+        #        l = self.compute_losses(x=data, output=output, target=target, gt_df=gt_df, do_backprop=do_backprop)
+#
+        #        if not do_backprop:
+        #            self.val_loss.append(l.detach().cpu())
+        #        else:
+        #            self.train_loss.append(l.detach().cpu())
+        #        #del data
+#
+        #        #l = self.loss(output, target)
+#
+        #    if do_backprop:
+        #        self.amp_grad_scaler.scale(l).backward()
+        #        self.amp_grad_scaler.unscale_(self.optimizer)
+        #        torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+        #        self.amp_grad_scaler.step(self.optimizer)
+        #        self.amp_grad_scaler.update()
+        #else:
+        #    output = self.network(data[0], middle=middle)
+        #    l = self.compute_losses(x=data, output=output, target=target, gt_df=gt_df, do_backprop=do_backprop)
+#
+        #    if not do_backprop:
+        #        self.val_loss.append(l.detach().cpu())
+        #    else:
+        #        if self.vq_vae:
+        #            self.writer.add_scalar('Iteration/Perplexity', output['perplexity'], self.iter_nb)
+        #        self.train_loss.append(l.detach().cpu())
+        #    #l = self.loss(output, target)
+#
+        #    if do_backprop:
+        #        l.backward()
+        #        torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+        #        self.optimizer.step()
 
         if run_online_evaluation:
-            self.run_online_evaluation(data=data, target=target, output=output, gt_df=gt_df)
+            self.run_online_evaluation(data=data, target=target, output=output, gt_df=gt_df, classification_gt=gt_classification)
         del data
 
         del target
@@ -1088,13 +1208,26 @@ class nnMTLTrainerV2(nnUNetTrainer):
             ep = self.epoch + 1
             if self.config['scheduler'] == 'cosine':
                 self.lr_scheduler.step()
+                if self.adversarial_loss:
+                    self.seg_discriminator_scheduler.step()
+                    self.rec_discriminator_scheduler.step()
             else:
                 self.optimizer.param_groups[0]['lr'] = poly_lr(ep, self.max_num_epochs, self.initial_lr, 0.9)
-            self.writer.add_scalar('Epoch/Learning rate', self.optimizer.param_groups[0]['lr'], self.epoch)
+                if self.adversarial_loss:
+                    self.seg_discriminator_optimizer.param_groups[0]['lr'] = poly_lr(ep, self.max_num_epochs, self.discriminator_lr, 0.9)
+                    self.rec_discriminator_optimizer.param_groups[0]['lr'] = poly_lr(ep, self.max_num_epochs, self.discriminator_lr, 0.9)
+            if self.adversarial_loss:
+                lrs = {'Unet_lr': self.optimizer.param_groups[0]['lr'], 'discriminator_lr': self.seg_discriminator_optimizer.param_groups[0]['lr']}
+                self.writer.add_scalars('Epoch/Learning rate', lrs, self.epoch)
+            else:
+                self.writer.add_scalar('Epoch/Learning rate', self.optimizer.param_groups[0]['lr'], self.epoch)
         else:
             ep = epoch
             if not self.config['scheduler'] == 'cosine':
                 self.optimizer.param_groups[0]['lr'] = poly_lr(ep, self.max_num_epochs, self.initial_lr, 0.9)
+                if self.adversarial_loss:
+                    self.seg_discriminator_optimizer.param_groups[0]['lr'] = poly_lr(ep, self.max_num_epochs, self.discriminator_lr, 0.9)
+                    self.rec_discriminator_optimizer.param_groups[0]['lr'] = poly_lr(ep, self.max_num_epochs, self.discriminator_lr, 0.9)
 
         self.print_to_log_file("lr:", np.round(self.optimizer.param_groups[0]['lr'], decimals=6))
 
@@ -1105,6 +1238,13 @@ class nnMTLTrainerV2(nnUNetTrainer):
         """
         super().on_epoch_end()
         continue_training = self.epoch < self.max_num_epochs
+
+        if self.config['progressive_similarity_growing']:
+            epoch_threshold = self.max_num_epochs / 20
+            if self.epoch + 1 <= epoch_threshold:
+                a = self.config['similarity_weight'] / epoch_threshold
+                self.loss_data['similarity'][0] = a * (self.epoch + 1)
+
 
         # it can rarely happen that the momentum of nnUNetTrainerV2 is too high for some dataset. If at epoch 100 the
         # estimated validation Dice is still 0 then we reduce the momentum from 0.99 to 0.95
@@ -1148,8 +1288,47 @@ class nnMTLTrainerV2(nnUNetTrainer):
         else:
             dl_tr = DataLoader2D(self.dataset_tr, self.basic_generator_patch_size, self.patch_size, self.batch_size,
                                 oversample_foreground_percent=self.oversample_foreground_percent,
-                                pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
+                                pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r', classification=self.classification)
             dl_val = DataLoader2D(self.dataset_val, self.patch_size, self.patch_size, self.batch_size,
                                 oversample_foreground_percent=self.oversample_foreground_percent,
-                                pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
+                                pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r', classification=self.classification)
         return dl_tr, dl_val
+
+
+    def get_adversarial_loss(self, discriminator, discriminator_optimizer, real, fake, iter_nb, do_backprop):
+        discriminator_loss = None
+        adversarial_loss = None
+        label = torch.full((self.batch_size,), 1, dtype=torch.float, device=real.device)
+        if do_backprop:
+            discriminator.zero_grad()
+            discriminator_optimizer.zero_grad()
+            output_real = discriminator(real).reshape(-1)
+            loss_real = self.adv_loss(output_real, label)
+            #self.writer.add_scalar('Iteration/Discriminator real', output_real.mean(), iter_nb)
+            #loss_real.backward() #retain_graph if reuse output of discriminator for r1 penalty
+
+            r1_penalty = 0
+            #if iter_nb % self.r1_penalty_iteration == 0:
+            #    r1_penalty = logisticGradientPenalty(real, discriminator, weight=5)
+        
+            loss_real_r1 = loss_real + r1_penalty
+            loss_real_r1.backward()
+
+            assert fake.size() == real.size()
+            label.fill_(0)
+            output_fake = discriminator(fake.detach()).view(-1)
+            loss_fake = self.adv_loss(output_fake, label)
+            #self.writer.add_scalar('Iteration/Discriminator fake', output_fake.mean(), iter_nb)
+            loss_fake.backward()
+
+            discriminator_loss = loss_real + loss_fake + r1_penalty
+            discriminator_optimizer.step()
+            #discriminator_scheduler.step()
+
+        #self.model.reconstruction.zero_grad()
+        label.fill_(1)
+        output = discriminator(fake).view(-1)
+        adversarial_loss = self.adv_loss(output, label)
+
+        return adversarial_loss, discriminator_loss
+    

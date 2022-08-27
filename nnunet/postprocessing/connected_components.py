@@ -124,7 +124,8 @@ def determine_postprocessing(base, gt_labels_folder, raw_subfolder_name="validat
                              final_subf_name="validation_final", processes=default_num_threads,
                              dice_threshold=0, debug=False,
                              advanced_postprocessing=False,
-                             pp_filename="postprocessing.json"):
+                             pp_filename="postprocessing.json",
+                             log_function=print):
     """
     :param base:
     :param gt_labels_folder: subfolder of base with niftis of ground truth labels
@@ -204,8 +205,10 @@ def determine_postprocessing(base, gt_labels_folder, raw_subfolder_name="validat
                     else:
                         min_size_kept[k] = min(min_size_kept[k], min_kept[k])
 
-        print("foreground vs background, smallest valid object size was", min_size_kept[tuple(classes)])
-        print("removing only objects smaller than that...")
+        #print("foreground vs background, smallest valid object size was", min_size_kept[tuple(classes)])
+        #print("removing only objects smaller than that...")
+        log_function("foreground vs background, smallest valid object size was:", min_size_kept[tuple(classes)])
+        log_function("removing only objects smaller than that...")
 
     else:
         min_size_kept = None
@@ -247,9 +250,12 @@ def determine_postprocessing(base, gt_labels_folder, raw_subfolder_name="validat
             cl in classes]
     before = np.mean([pp_results['dc_per_class_raw'][str(cl)] for cl in classes])
     after = np.mean([pp_results['dc_per_class_pp_all'][str(cl)] for cl in classes])
-    print("Foreground vs background")
-    print("before:", before)
-    print("after: ", after)
+    log_function("Foreground vs background")
+    log_function("before:", before)
+    log_function("after: ", after)
+    #print("Foreground vs background")
+    #print("before:", before)
+    #print("after: ", after)
     if any(comp):
         # at least one class improved - yay!
         # now check if another got worse
@@ -261,9 +267,12 @@ def determine_postprocessing(base, gt_labels_folder, raw_subfolder_name="validat
             if min_size_kept is not None:
                 pp_results['min_valid_object_sizes'].update(deepcopy(min_size_kept))
             do_fg_cc = True
-            print("Removing all but the largest foreground region improved results!")
-            print('for_which_classes', classes)
-            print('min_valid_object_sizes', min_size_kept)
+            log_function("Removing all but the largest foreground region improved results!")
+            log_function("for_which_classes", classes)
+            log_function("min_valid_object_sizes", min_size_kept)
+            #print("Removing all but the largest foreground region improved results!")
+            #print('for_which_classes', classes)
+            #print('min_valid_object_sizes', min_size_kept)
     else:
         # did not improve things - don't do it
         pass
@@ -303,10 +312,14 @@ def determine_postprocessing(base, gt_labels_folder, raw_subfolder_name="validat
                             min_size_kept[k] = min_kept[k]
                         else:
                             min_size_kept[k] = min(min_size_kept[k], min_kept[k])
+            
+            log_function("classes treated separately, smallest valid object sizes are")
+            log_function(min_size_kept)
+            log_function("removing only objects smaller than that")
 
-            print("classes treated separately, smallest valid object sizes are")
-            print(min_size_kept)
-            print("removing only objects smaller than that")
+            #print("classes treated separately, smallest valid object sizes are")
+            #print(min_size_kept)
+            #print("removing only objects smaller than that")
         else:
             min_size_kept = None
 
@@ -338,27 +351,38 @@ def determine_postprocessing(base, gt_labels_folder, raw_subfolder_name="validat
             dc_raw = old_res[str(c)]['Dice']
             dc_pp = validation_result_PP_test[str(c)]['Dice']
             pp_results['dc_per_class_pp_per_class'][str(c)] = dc_pp
-            print(c)
-            print("before:", dc_raw)
-            print("after: ", dc_pp)
+            log_function(c)
+            log_function("before:", dc_raw)
+            log_function("after: ", dc_pp)
+            #print(c)
+            #print("before:", dc_raw)
+            #print("after: ", dc_pp)
 
             if dc_pp > (dc_raw + dice_threshold):
                 pp_results['for_which_classes'].append(int(c))
                 if min_size_kept is not None:
                     pp_results['min_valid_object_sizes'].update({c: min_size_kept[c]})
-                print("Removing all but the largest region for class %d improved results!" % c)
-                print('min_valid_object_sizes', min_size_kept)
+                log_function("Removing all but the largest region for class", c, "improved results!")
+                log_function("min_valid_object_sizes", min_size_kept)
+                #print("Removing all but the largest region for class %d improved results!" % c)
+                #print('min_valid_object_sizes', min_size_kept)
     else:
         print("Only one class present, no need to do each class separately as this is covered in fg vs bg")
 
     if not advanced_postprocessing:
         pp_results['min_valid_object_sizes'] = None
 
-    print("done")
-    print("for which classes:")
-    print(pp_results['for_which_classes'])
-    print("min_object_sizes")
-    print(pp_results['min_valid_object_sizes'])
+    log_function("done")
+    log_function("for which classes:")
+    log_function(pp_results['for_which_classes'])
+    log_function("min_object_sizes")
+    log_function(pp_results['min_valid_object_sizes'])
+
+    #print("done")
+    #print("for which classes:")
+    #print(pp_results['for_which_classes'])
+    #print("min_object_sizes")
+    #print(pp_results['min_valid_object_sizes'])
 
     pp_results['validation_raw'] = raw_subfolder_name
     pp_results['validation_final'] = final_subf_name
@@ -395,7 +419,8 @@ def determine_postprocessing(base, gt_labels_folder, raw_subfolder_name="validat
 
     p.close()
     p.join()
-    print("done")
+    #print("done")
+    log_function("done")
 
 
 def apply_postprocessing_to_folder(input_folder: str, output_folder: str, for_which_classes: list,

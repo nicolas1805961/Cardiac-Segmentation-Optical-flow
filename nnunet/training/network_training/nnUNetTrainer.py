@@ -523,7 +523,7 @@ class nnUNetTrainer(NetworkTrainer):
         self.network.train(current_mode)
         return ret
 
-    def validate(self, do_mirroring: bool = True, use_sliding_window: bool = True, step_size: float = 0.5,
+    def validate(self, log_function, do_mirroring: bool = True, use_sliding_window: bool = True, step_size: float = 0.5,
                  save_softmax: bool = True, use_gaussian: bool = True, overwrite: bool = True,
                  validation_folder_name: str = 'validation_raw', debug: bool = False, all_in_gpu: bool = False,
                  segmentation_export_kwargs: dict = None, run_postprocessing_on_folds: bool = True):
@@ -589,7 +589,8 @@ class nnUNetTrainer(NetworkTrainer):
                     (save_softmax and not isfile(join(output_folder, fname + ".npz"))):
                 data = np.load(self.dataset[k]['data_file'])['data']
 
-                print(k, data.shape)
+                #print(k, data.shape)
+                self.print_to_log_file(k, data.shape)
                 data[-1][data[-1] == -1] = 0
 
                 softmax_pred = self.predict_preprocessed_data_return_seg_and_softmax(data[:-1],
@@ -652,7 +653,7 @@ class nnUNetTrainer(NetworkTrainer):
             # have this applied during inference as well
             self.print_to_log_file("determining postprocessing")
             determine_postprocessing(self.output_folder, self.gt_niftis_folder, validation_folder_name,
-                                     final_subf_name=validation_folder_name + "_postprocessed", debug=debug)
+                                     final_subf_name=validation_folder_name + "_postprocessed", debug=debug, log_function=log_function)
             # after this the final predictions for the vlaidation set can be found in validation_folder_name_base + "_postprocessed"
             # They are always in that folder, even if no postprocessing as applied!
 

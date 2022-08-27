@@ -134,7 +134,15 @@ def main():
     #     raise ValueError("force_separate_z must be None, True or False. Given: %s" % force_separate_z)
 
     plans_file, output_folder_name, dataset_directory, batch_dice, stage, \
-    trainer_class = get_default_configuration(network, task, network_trainer, plans_identifier)
+        trainer_class = get_default_configuration(network, task, network_trainer, plans_identifier)
+
+    #if network_trainer == 'nnUNetTrainerV2':
+    #    plans_file, output_folder_name, dataset_directory, batch_dice, stage, \
+    #    trainer_class = get_default_configuration(network, task, network_trainer, plans_identifier)
+    #elif network_trainer == 'nnMTLTrainerV2':
+    #    #plans_identifier = 'nnMTLPlansv2.1'
+    #    plans_file, output_folder_name, dataset_directory, batch_dice, stage, \
+    #    trainer_class = get_default_configuration_mtl(network, task, network_trainer, plans_identifier)
 
     if trainer_class is None:
         raise RuntimeError("Could not find trainer class in nnunet.training.network_training")

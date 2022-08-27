@@ -30,7 +30,7 @@ except ImportError as ie:
 from .custom_transform_middle import *
 
 
-def get_moreDA_augmentation_middle(dataloader_train, dataloader_val, patch_size, directional_field, min_max_normalization, params=default_3D_augmentation_params,
+def get_moreDA_augmentation_middle(dataloader_train, dataloader_val, patch_size, directional_field, params=default_3D_augmentation_params,
                             border_val_seg=-1,
                             seeds_train=None, seeds_val=None, order_seg=1, order_data=3, deep_supervision_scales=None,
                             soft_ds=False,
@@ -145,13 +145,9 @@ def get_moreDA_augmentation_middle(dataloader_train, dataloader_val, patch_size,
             assert classes is not None
             tr_transforms.append(DownsampleSegForDSTransform3(scales, 'target', 'target', classes))
             tr_transforms.append(DownsampleX(deep_supervision_scales, input_key='data', output_key='data', order=3))
-            if min_max_normalization:
-                tr_transforms.append(Min_Max_normalize(input_key='data', output_key='data'))
         else:
             tr_transforms.append(DownsampleSegForDSTransform2(scales, 0, input_key='target', output_key='target'))
             tr_transforms.append(DownsampleX(deep_supervision_scales, input_key='data', output_key='data', order=3))
-            if min_max_normalization:
-                tr_transforms.append(Min_Max_normalize(input_key='data', output_key='data'))
 
     tr_transforms.append(NumpyToTensor(['data', 'target', 'middle'], 'float'))
     tr_transforms = Compose(tr_transforms)
@@ -195,13 +191,9 @@ def get_moreDA_augmentation_middle(dataloader_train, dataloader_val, patch_size,
             assert classes is not None
             val_transforms.append(DownsampleSegForDSTransform3(scales, 'target', 'target', classes))
             val_transforms.append(DownsampleX(deep_supervision_scales, input_key='data', output_key='data', order=3))
-            if min_max_normalization:
-                val_transforms.append(Min_Max_normalize(input_key='data', output_key='data'))
         else:
             val_transforms.append(DownsampleSegForDSTransform2(scales, 0, input_key='target', output_key='target'))
             val_transforms.append(DownsampleX(deep_supervision_scales, input_key='data', output_key='data', order=3))
-            if min_max_normalization:
-                val_transforms.append(Min_Max_normalize(input_key='data', output_key='data'))
             
 
     val_transforms.append(NumpyToTensor(['data', 'target', 'middle'], 'float'))

@@ -27,4 +27,4 @@ export nnUNet_preprocessed="out/nnUNet_preprocessed"
 export RESULTS_FOLDER="out/nnUNet_trained_models"
 
 # execution du code
-python run/run_training.py 2d nnMTLTrainerV2 Task027_ACDC 0
+python run/run_training.py 2d nnMTLTrainerV2 Task027_ACDC 0 -p custom_experiment_planner

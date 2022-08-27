@@ -382,7 +382,7 @@ class DataLoader3D(SlimDataLoaderBase):
 class DataLoader2D(SlimDataLoaderBase):
     def __init__(self, data, patch_size, final_patch_size, batch_size, oversample_foreground_percent=0.0,
                  memmap_mode="r", pseudo_3d_slices=1, pad_mode="edge",
-                 pad_kwargs_data=None, pad_sides=None):
+                 pad_kwargs_data=None, pad_sides=None, classification=False):
         """
         This is the basic data loader for 2D networks. It uses preprocessed data as produced by my (Fabian) preprocessing.
         You can load the data with load_dataset(folder) where folder is the folder where the npz files are located. If there
@@ -425,6 +425,12 @@ class DataLoader2D(SlimDataLoaderBase):
             self.need_to_pad += pad_sides
         self.pad_sides = pad_sides
         self.data_shape, self.seg_shape = self.determine_shapes()
+        self.classification = classification
+        if classification:
+            lut = []
+            for t in range(5):
+                lut.append(np.full((20,), fill_value=t))
+            self.lut = np.concatenate(lut, axis=0)
 
     def determine_shapes(self):
         num_seg = 1
@@ -448,8 +454,14 @@ class DataLoader2D(SlimDataLoaderBase):
         data = np.zeros(self.data_shape, dtype=np.float32)
         seg = np.zeros(self.seg_shape, dtype=np.float32)
 
+        classification = np.zeros((self.batch_size,), dtype=np.int32) if self.classification else None
+
         case_properties = []
         for j, i in enumerate(selected_keys):
+            if self.classification:
+                nb = int(i.split('patient')[-1][:3])
+                classification[j] = self.lut[nb - 1]
+
             if 'properties' in self._data[i].keys():
                 properties = self._data[i]['properties']
             else:
@@ -590,7 +602,7 @@ class DataLoader2D(SlimDataLoaderBase):
             seg[j] = case_all_data_segonly
 
         keys = selected_keys
-        return {'data': data, 'seg': seg, 'properties': case_properties, "keys": keys}
+        return {'data': data, 'seg': seg, 'properties': case_properties, "keys": keys, "classification": classification}
 
 
 class DataLoader2DMiddle(SlimDataLoaderBase):

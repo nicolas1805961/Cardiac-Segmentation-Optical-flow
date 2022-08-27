@@ -690,6 +690,82 @@ class PreprocessorFor2D(GenericPreprocessor):
         return data, seg, properties
 
 
+class CustomPreprocessorFor2D(GenericPreprocessor):
+    def __init__(self, normalization_scheme_per_modality, use_nonzero_mask, transpose_forward: (tuple, list), intensityproperties=None):
+        super(CustomPreprocessorFor2D, self).__init__(normalization_scheme_per_modality, use_nonzero_mask,
+                                                transpose_forward, intensityproperties)
+
+    def run(self, target_spacings, input_folder_with_cropped_npz, output_folder, data_identifier,
+            num_threads=default_num_threads, force_separate_z=None):
+        print("Initializing to run preprocessing")
+        print("npz folder:", input_folder_with_cropped_npz)
+        print("output_folder:", output_folder)
+        list_of_cropped_npz_files = subfiles(input_folder_with_cropped_npz, True, None, ".npz", True)
+        assert len(list_of_cropped_npz_files) != 0, "set list of files first"
+        maybe_mkdir_p(output_folder)
+        all_args = []
+        num_stages = len(target_spacings)
+
+        # we need to know which classes are present in this dataset so that we can precompute where these classes are
+        # located. This is needed for oversampling foreground
+        all_classes = load_pickle(join(input_folder_with_cropped_npz, 'dataset_properties.pkl'))['all_classes']
+
+        for i in range(num_stages):
+            output_folder_stage = os.path.join(output_folder, data_identifier + "_stage%d" % i)
+            maybe_mkdir_p(output_folder_stage)
+            spacing = target_spacings[i]
+            for j, case in enumerate(list_of_cropped_npz_files):
+                case_identifier = get_case_identifier_from_npz(case)
+                args = spacing, case_identifier, output_folder_stage, input_folder_with_cropped_npz, force_separate_z, all_classes
+                all_args.append(args)
+        p = Pool(num_threads)
+        p.starmap(self._run_internal, all_args)
+        p.close()
+        p.join()
+
+    def resample_and_normalize(self, data, target_spacing, properties, seg=None, force_separate_z=None):
+        original_spacing_transposed = np.array(properties["original_spacing"])[self.transpose_forward]
+        before = {
+            'spacing': properties["original_spacing"],
+            'spacing_transposed': original_spacing_transposed,
+            'data.shape (data is transposed)': data.shape
+        }
+        target_spacing[0] = original_spacing_transposed[0]
+        data, seg = resample_patient(data, seg, np.array(original_spacing_transposed), target_spacing, 3, 1,
+                                     force_separate_z=force_separate_z, order_z_data=0, order_z_seg=0,
+                                     separate_z_anisotropy_threshold=self.resample_separate_z_anisotropy_threshold)
+        after = {
+            'spacing': target_spacing,
+            'data.shape (data is resampled)': data.shape
+        }
+        print("before:", before, "\nafter: ", after, "\n")
+
+        if seg is not None:  # hippocampus 243 has one voxel with -2 as label. wtf?
+            seg[seg < -1] = 0
+
+        properties["size_after_resampling"] = data[0].shape
+        properties["spacing_after_resampling"] = target_spacing
+        use_nonzero_mask = self.use_nonzero_mask
+
+        assert len(self.normalization_scheme_per_modality) == len(data), "self.normalization_scheme_per_modality " \
+                                                                         "must have as many entries as data has " \
+                                                                         "modalities"
+        assert len(self.use_nonzero_mask) == len(data), "self.use_nonzero_mask must have as many entries as data" \
+                                                        " has modalities"
+
+        print("normalization...")
+
+        for c in range(len(data)):
+            if use_nonzero_mask[c]:
+                mask = seg[-1] >= 0
+            else:
+                mask = np.ones(seg.shape[1:], dtype=bool)
+            data[c][mask] = (data[c][mask] - data[c][mask].min()) / (data[c][mask].max() - data[c][mask].min() + 1e-8)
+            data[c][mask == 0] = 0
+        print("normalization done")
+        return data, seg, properties
+
+
 class PreprocessorFor2D_edgeLength512(PreprocessorFor2D):
     target_edge_size = 512
 
