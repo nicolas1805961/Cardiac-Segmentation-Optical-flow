@@ -9,7 +9,7 @@
 ##SBATCH --cpus-per-task=3           # nombre de coeurs CPU par tache (pour gpu_p2 : 1/8 du noeud 8-GPU)
 # /!\ Attention, "multithread" fait reference Ã  l'hyperthreading dans la terminologie Slurm
 #SBATCH --hint=nomultithread         # hyperthreading desactive
-#SBATCH --time=72:00:00          # 48:00:00 temps maximum d'execution demande (HH:MM:SS) 00:05:00 20:00:00  
+#SBATCH --time=100:00:00          # 48:00:00 temps maximum d'execution demande (HH:MM:SS) 00:05:00 20:00:00  
 #SBATCH --output=gpu_mono%j.out      # nom du fichier de sortie
 #SBATCH --error=gpu_mono%j.out       # nom du fichier d'erreur (ici commun avec la sortie)
 
@@ -27,5 +27,5 @@ export nnUNet_preprocessed="out/nnUNet_preprocessed"
 export RESULTS_FOLDER="out/nnUNet_trained_models"
 
 # execution du code
-python run/run_training.py 2d nnMTLTrainerV2 Task027_ACDC 0 -p custom_experiment_planner
+python run/run_training.py 2d nnMTLTrainerV2 Task026_MMs 0 -p custom_experiment_planner
 #python run/run_training.py 2d nnUNetTrainerV2 Task027_ACDC 0

@@ -26,20 +26,37 @@ from torch.cuda.amp import autocast
 from nnunet.utilities.random_stuff import no_op
 from typing import Union, Tuple
 
-class WholeModel(nn.Module):
-    def __init__(self, model1, model2=None):
+class ModelWrap(SegmentationNetwork):
+    def __init__(self, model1, model2, do_ds):
         super().__init__()
         self.model1 = model1
         self.model2 = model2
+        self.conv_op=nn.Conv2d
+        self.num_classes = 4
+
+        self._do_ds = do_ds
+    
+    @property
+    def do_ds(self):
+        return self.model1.do_ds
+
+    @do_ds.setter
+    def do_ds(self, value):
+        self.model1.do_ds = value
 
     def forward(self, x, model_nb=1):
-        if not self.training:
-            return self.model1(x)
+        #if not self.training:
+        #    return self.model1(x)
 
         if model_nb == 1:
             return self.model1(x)
         elif model_nb == 2:
             return self.model2(x)
+    
+    def _internal_maybe_mirror_and_pred_2D(self, x: Union[np.ndarray, torch.tensor], mirror_axes: tuple,
+                                           do_mirroring: bool = True,
+                                           mult: np.ndarray or torch.tensor = None) -> torch.tensor:
+        return self.model1._internal_maybe_mirror_and_pred_2D(x, mirror_axes, do_mirroring, mult)
 
 
 class MTLmodel(SegmentationNetwork):
@@ -153,9 +170,6 @@ class MTLmodel(SegmentationNetwork):
         
         if self.reconstruction:
             
-            #sm_computation = nn.Sequential(ReplicateChannels(4),
-            #                                    GetSimilarityMatrix(similarity_down_scale))
-            
             sm_computation = nn.Sequential(ConvBlock(in_dim=1, out_dim=4, kernel_size=1, norm=norm),
                                                 GetSimilarityMatrix(similarity_down_scale))
 
@@ -189,7 +203,7 @@ class MTLmodel(SegmentationNetwork):
                                                     nn.GELU(),
                                                     nn.Dropout(0.5))
             #in_dim_linear = int(H * W * self.d_model)
-            self.classification_net = nn.Sequential(nn.Linear(784, 392), nn.GELU(), nn.Dropout(p=0.5), 
+            self.classification_net = nn.Sequential(nn.Linear(784, 392), nn.GELU(), nn.Dropout(0.5),
                                                     nn.Linear(392, 5))
             #self.classification_net[-1].weight.data.zero_()
             #self.classification_net[-1].bias.data.copy_(torch.tensor([0, 1], dtype=torch.float))

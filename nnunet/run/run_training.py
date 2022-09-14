@@ -24,6 +24,16 @@ from nnunet.training.network_training.nnUNetTrainerCascadeFullRes import nnUNetT
 from nnunet.training.network_training.nnUNetTrainerV2_CascadeFullRes import nnUNetTrainerV2CascadeFullRes
 from nnunet.utilities.task_name_id_conversion import convert_id_to_task_name
 
+from nnunet.lib.training_utils import read_config
+from pathlib import Path
+
+import warnings
+
+import torch
+
+#torch.autograd.set_detect_anomaly(True)
+#warnings.filterwarnings("always", category=UserWarning)
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -133,8 +143,10 @@ def main():
     # else:
     #     raise ValueError("force_separate_z must be None, True or False. Given: %s" % force_separate_z)
 
+    config = read_config(os.path.join(Path.cwd(), 'adversarial_acdc.yaml'))
+
     plans_file, output_folder_name, dataset_directory, batch_dice, stage, \
-        trainer_class = get_default_configuration(network, task, network_trainer, plans_identifier)
+        trainer_class = get_default_configuration(network, task, network_trainer, config, plans_identifier)
 
     #if network_trainer == 'nnUNetTrainerV2':
     #    plans_file, output_folder_name, dataset_directory, batch_dice, stage, \
@@ -184,7 +196,10 @@ def main():
                 # new training without pretraine weights, do nothing
                 pass
 
-            trainer.run_training()
+            if config['unlabeled']:
+                trainer.run_training_unlabeled()
+            else:
+                trainer.run_training()
         else:
             if valbest:
                 trainer.load_best_checkpoint(train=False)

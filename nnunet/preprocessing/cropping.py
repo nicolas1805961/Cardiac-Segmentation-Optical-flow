@@ -166,10 +166,30 @@ class ImageCropper(object):
                     or (not os.path.isfile(os.path.join(self.output_folder, "%s.npz" % case_identifier))
                         or not os.path.isfile(os.path.join(self.output_folder, "%s.pkl" % case_identifier))):
                 
-
                 data, seg, properties = self.crop_from_list_of_files(case[:-1], case[-1])
 
                 all_data = np.vstack((data, seg))
+                np.savez_compressed(os.path.join(self.output_folder, "%s.npz" % case_identifier), data=all_data)
+                with open(os.path.join(self.output_folder, "%s.pkl" % case_identifier), 'wb') as f:
+                    pickle.dump(properties, f)
+        except Exception as e:
+            print("Exception in", case_identifier, ":")
+            print(e)
+            raise e
+    
+    def load_crop_save_unlabeled(self, case, case_identifier, overwrite_existing=False):
+        try:
+            print(case_identifier)
+            #print(self.output_folder)
+            #print("%s.npz" % case_identifier)
+            #print(os.path.join(self.output_folder, "%s.npz" % case_identifier))
+            if overwrite_existing \
+                    or (not os.path.isfile(os.path.join(self.output_folder, "%s.npz" % case_identifier))
+                        or not os.path.isfile(os.path.join(self.output_folder, "%s.pkl" % case_identifier))):
+                
+                data, seg, properties = self.crop_from_list_of_files(case, None)
+
+                all_data = data
                 np.savez_compressed(os.path.join(self.output_folder, "%s.npz" % case_identifier), data=all_data)
                 with open(os.path.join(self.output_folder, "%s.pkl" % case_identifier), 'wb') as f:
                     pickle.dump(properties, f)
@@ -209,6 +229,28 @@ class ImageCropper(object):
 
         p = Pool(self.num_threads)
         p.starmap(self.load_crop_save, list_of_args)
+        p.close()
+        p.join()
+    
+    def run_cropping_unlabeled(self, list_of_files, overwrite_existing=False, output_folder=None):
+        """
+        also copied ground truth nifti segmentation into the preprocessed folder so that we can use them for evaluation
+        on the cluster
+        :param list_of_files: list of list of files [[PATIENTID_TIMESTEP_0000.nii.gz], [PATIENTID_TIMESTEP_0000.nii.gz]]
+        :param overwrite_existing:
+        :param output_folder:
+        :return:
+        """
+        if output_folder is not None:
+            self.output_folder = output_folder
+
+        list_of_args = []
+        for j, case in enumerate(list_of_files):
+            case_identifier = get_case_identifier(case)
+            list_of_args.append((case, case_identifier, overwrite_existing))
+
+        p = Pool(self.num_threads)
+        p.starmap(self.load_crop_save_unlabeled, list_of_args)
         p.close()
         p.join()
 

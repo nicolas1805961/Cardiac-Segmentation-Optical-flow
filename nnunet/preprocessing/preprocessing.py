@@ -24,6 +24,8 @@ import numpy as np
 from batchgenerators.utilities.file_and_folder_operations import *
 from multiprocessing.pool import Pool
 
+import sys
+
 
 def get_do_separate_z(spacing, anisotropy_threshold=RESAMPLING_SEPARATE_Z_ANISO_THRESHOLD):
     do_separate_z = (np.max(spacing) / np.min(spacing)) > anisotropy_threshold
@@ -222,6 +224,14 @@ class GenericPreprocessor(object):
         with open(os.path.join(cropped_output_dir, "%s.pkl" % case_identifier), 'rb') as f:
             properties = pickle.load(f)
         return data, seg, properties
+    
+    @staticmethod
+    def load_cropped_unlabeled(cropped_output_dir, case_identifier):
+        all_data = np.load(os.path.join(cropped_output_dir, "%s.npz" % case_identifier))['data']
+        data = all_data.astype(np.float32)
+        with open(os.path.join(cropped_output_dir, "%s.pkl" % case_identifier), 'rb') as f:
+            properties = pickle.load(f)
+        return data, properties
 
     def resample_and_normalize(self, data, target_spacing, properties, seg=None, force_separate_z=None):
         """
@@ -320,37 +330,40 @@ class GenericPreprocessor(object):
                                                             force_separate_z=force_separate_z)
         return data.astype(np.float32), seg, properties
 
+
     def _run_internal(self, target_spacing, case_identifier, output_folder_stage, cropped_output_dir, force_separate_z,
                       all_classes):
-        data, seg, properties = self.load_cropped(cropped_output_dir, case_identifier)
+        if '_u' in case_identifier:
+            data, properties = self.load_cropped_unlabeled(cropped_output_dir, case_identifier)
+            data = data.transpose((0, *[i + 1 for i in self.transpose_forward]))
+            data, seg, properties = self.resample_and_normalize(data, target_spacing, properties, None, force_separate_z)
+            all_data = data.astype(np.float32)
+        else:
+            data, seg, properties = self.load_cropped(cropped_output_dir, case_identifier)
+            seg = seg.transpose((0, *[i + 1 for i in self.transpose_forward]))
+            data = data.transpose((0, *[i + 1 for i in self.transpose_forward]))
+            data, seg, properties = self.resample_and_normalize(data, target_spacing, properties, seg, force_separate_z)
+            all_data = np.vstack((data, seg)).astype(np.float32)
 
-        data = data.transpose((0, *[i + 1 for i in self.transpose_forward]))
-        seg = seg.transpose((0, *[i + 1 for i in self.transpose_forward]))
+            # we need to find out where the classes are and sample some random locations
+            # let's do 10.000 samples per class
+            # seed this for reproducibility!
+            num_samples = 10000
+            min_percent_coverage = 0.01 # at least 1% of the class voxels need to be selected, otherwise it may be too sparse
+            rndst = np.random.RandomState(1234)
+            class_locs = {}
+            for c in all_classes:
+                all_locs = np.argwhere(all_data[-1] == c)
+                if len(all_locs) == 0:
+                    class_locs[c] = []
+                    continue
+                target_num_samples = min(num_samples, len(all_locs))
+                target_num_samples = max(target_num_samples, int(np.ceil(len(all_locs) * min_percent_coverage)))
 
-        data, seg, properties = self.resample_and_normalize(data, target_spacing,
-                                                            properties, seg, force_separate_z)
-
-        all_data = np.vstack((data, seg)).astype(np.float32)
-
-        # we need to find out where the classes are and sample some random locations
-        # let's do 10.000 samples per class
-        # seed this for reproducibility!
-        num_samples = 10000
-        min_percent_coverage = 0.01 # at least 1% of the class voxels need to be selected, otherwise it may be too sparse
-        rndst = np.random.RandomState(1234)
-        class_locs = {}
-        for c in all_classes:
-            all_locs = np.argwhere(all_data[-1] == c)
-            if len(all_locs) == 0:
-                class_locs[c] = []
-                continue
-            target_num_samples = min(num_samples, len(all_locs))
-            target_num_samples = max(target_num_samples, int(np.ceil(len(all_locs) * min_percent_coverage)))
-
-            selected = all_locs[rndst.choice(len(all_locs), target_num_samples, replace=False)]
-            class_locs[c] = selected
-            print(c, target_num_samples)
-        properties['class_locations'] = class_locs
+                selected = all_locs[rndst.choice(len(all_locs), target_num_samples, replace=False)]
+                class_locs[c] = selected
+                print(c, target_num_samples)
+            properties['class_locations'] = class_locs
 
         print("saving: ", os.path.join(output_folder_stage, "%s.npz" % case_identifier))
         np.savez_compressed(os.path.join(output_folder_stage, "%s.npz" % case_identifier),
@@ -395,6 +408,47 @@ class GenericPreprocessor(object):
                 all_args.append(args)
             p = Pool(num_threads[i])
             p.starmap(self._run_internal, all_args)
+            p.close()
+            p.join()
+
+    
+    def run_unlabeled(self, target_spacings, input_folder_with_cropped_npz, output_folder, data_identifier,
+            num_threads=default_num_threads, force_separate_z=None):
+        """
+
+        :param target_spacings: list of lists [[1.25, 1.25, 5]]
+        :param input_folder_with_cropped_npz: dim: c, x, y, z | npz_file['data'] np.savez_compressed(fname.npz, data=arr)
+        :param output_folder:
+        :param num_threads:
+        :param force_separate_z: None
+        :return:
+        """
+        print("Initializing to run preprocessing")
+        print("npz folder:", input_folder_with_cropped_npz)
+        print("output_folder:", output_folder)
+        list_of_cropped_npz_files = subfiles(input_folder_with_cropped_npz, True, None, "_u.npz", True)
+        maybe_mkdir_p(output_folder)
+        num_stages = len(target_spacings)
+        if not isinstance(num_threads, (list, tuple, np.ndarray)):
+            num_threads = [num_threads] * num_stages
+
+        assert len(num_threads) == num_stages
+
+        # we need to know which classes are present in this dataset so that we can precompute where these classes are
+        # located. This is needed for oversampling foreground
+        all_classes = load_pickle(join(input_folder_with_cropped_npz, 'dataset_properties.pkl'))['all_classes']
+
+        for i in range(num_stages):
+            all_args = []
+            output_folder_stage = os.path.join(output_folder, data_identifier + "_stage%d" % i)
+            maybe_mkdir_p(output_folder_stage)
+            spacing = target_spacings[i]
+            for j, case in enumerate(list_of_cropped_npz_files):
+                case_identifier = get_case_identifier_from_npz(case)
+                args = spacing, case_identifier, output_folder_stage, input_folder_with_cropped_npz, force_separate_z, all_classes
+                all_args.append(args)
+            p = Pool(num_threads[i])
+            p.starmap(self._run_internal_unlabeled, all_args)
             p.close()
             p.join()
 
@@ -683,85 +737,12 @@ class PreprocessorFor2D(GenericPreprocessor):
                 if use_nonzero_mask[c]:
                     mask = seg[-1] >= 0
                 else:
-                    mask = np.ones(seg.shape[1:], dtype=bool)
+                    if seg is not None:
+                        assert seg.shape[1:] == data[c].shape
+                    mask = np.ones(data[c].shape, dtype=bool)
+                    #mask = np.ones(seg.shape[1:], dtype=bool)
                 data[c][mask] = (data[c][mask] - data[c][mask].mean()) / (data[c][mask].std() + 1e-8)
                 data[c][mask == 0] = 0
-        print("normalization done")
-        return data, seg, properties
-
-
-class CustomPreprocessorFor2D(GenericPreprocessor):
-    def __init__(self, normalization_scheme_per_modality, use_nonzero_mask, transpose_forward: (tuple, list), intensityproperties=None):
-        super(CustomPreprocessorFor2D, self).__init__(normalization_scheme_per_modality, use_nonzero_mask,
-                                                transpose_forward, intensityproperties)
-
-    def run(self, target_spacings, input_folder_with_cropped_npz, output_folder, data_identifier,
-            num_threads=default_num_threads, force_separate_z=None):
-        print("Initializing to run preprocessing")
-        print("npz folder:", input_folder_with_cropped_npz)
-        print("output_folder:", output_folder)
-        list_of_cropped_npz_files = subfiles(input_folder_with_cropped_npz, True, None, ".npz", True)
-        assert len(list_of_cropped_npz_files) != 0, "set list of files first"
-        maybe_mkdir_p(output_folder)
-        all_args = []
-        num_stages = len(target_spacings)
-
-        # we need to know which classes are present in this dataset so that we can precompute where these classes are
-        # located. This is needed for oversampling foreground
-        all_classes = load_pickle(join(input_folder_with_cropped_npz, 'dataset_properties.pkl'))['all_classes']
-
-        for i in range(num_stages):
-            output_folder_stage = os.path.join(output_folder, data_identifier + "_stage%d" % i)
-            maybe_mkdir_p(output_folder_stage)
-            spacing = target_spacings[i]
-            for j, case in enumerate(list_of_cropped_npz_files):
-                case_identifier = get_case_identifier_from_npz(case)
-                args = spacing, case_identifier, output_folder_stage, input_folder_with_cropped_npz, force_separate_z, all_classes
-                all_args.append(args)
-        p = Pool(num_threads)
-        p.starmap(self._run_internal, all_args)
-        p.close()
-        p.join()
-
-    def resample_and_normalize(self, data, target_spacing, properties, seg=None, force_separate_z=None):
-        original_spacing_transposed = np.array(properties["original_spacing"])[self.transpose_forward]
-        before = {
-            'spacing': properties["original_spacing"],
-            'spacing_transposed': original_spacing_transposed,
-            'data.shape (data is transposed)': data.shape
-        }
-        target_spacing[0] = original_spacing_transposed[0]
-        data, seg = resample_patient(data, seg, np.array(original_spacing_transposed), target_spacing, 3, 1,
-                                     force_separate_z=force_separate_z, order_z_data=0, order_z_seg=0,
-                                     separate_z_anisotropy_threshold=self.resample_separate_z_anisotropy_threshold)
-        after = {
-            'spacing': target_spacing,
-            'data.shape (data is resampled)': data.shape
-        }
-        print("before:", before, "\nafter: ", after, "\n")
-
-        if seg is not None:  # hippocampus 243 has one voxel with -2 as label. wtf?
-            seg[seg < -1] = 0
-
-        properties["size_after_resampling"] = data[0].shape
-        properties["spacing_after_resampling"] = target_spacing
-        use_nonzero_mask = self.use_nonzero_mask
-
-        assert len(self.normalization_scheme_per_modality) == len(data), "self.normalization_scheme_per_modality " \
-                                                                         "must have as many entries as data has " \
-                                                                         "modalities"
-        assert len(self.use_nonzero_mask) == len(data), "self.use_nonzero_mask must have as many entries as data" \
-                                                        " has modalities"
-
-        print("normalization...")
-
-        for c in range(len(data)):
-            if use_nonzero_mask[c]:
-                mask = seg[-1] >= 0
-            else:
-                mask = np.ones(seg.shape[1:], dtype=bool)
-            data[c][mask] = (data[c][mask] - data[c][mask].min()) / (data[c][mask].max() - data[c][mask].min() + 1e-8)
-            data[c][mask == 0] = 0
         print("normalization done")
         return data, seg, properties
 
@@ -940,6 +921,13 @@ class PreprocessorFor3D_LeaveOriginalZSpacing(GenericPreprocessor):
         for i in range(len(target_spacings)):
             target_spacings[i][0] = None
         super().run(target_spacings, input_folder_with_cropped_npz, output_folder, data_identifier,
+                    default_num_threads, force_separate_z)
+    
+    def run_unlabeled(self, target_spacings, input_folder_with_cropped_npz, output_folder, data_identifier,
+            num_threads=default_num_threads, force_separate_z=None):
+        for i in range(len(target_spacings)):
+            target_spacings[i][0] = None
+        super().run_unlabeled(target_spacings, input_folder_with_cropped_npz, output_folder, data_identifier,
                     default_num_threads, force_separate_z)
 
 

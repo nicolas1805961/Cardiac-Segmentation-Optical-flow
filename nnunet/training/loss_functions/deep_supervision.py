@@ -33,30 +33,22 @@ class MultipleOutputLoss2(nn.Module):
         self.weight_factors = weight_factors
         self.loss = loss
 
-    def forward(self, x, y):
+    def forward(self, x, y, confidence_weights=None):
         assert isinstance(x, (tuple, list)), "x must be either tuple or list"
         assert isinstance(y, (tuple, list)), "y must be either tuple or list"
         if self.weight_factors is None:
             weights = [1] * len(x)
         else:
             weights = self.weight_factors
-
-        l = weights[0] * self.loss(x[0], y[0])
-        for i in range(1, len(x)):
-
-            #print(weights[i])
-            #print(x[i].shape)
-            #print(y[i].shape)
-            #matplotlib.use('QtAgg')
-            #for t in range(len(x[i])):
-            #    fig, ax = plt.subplots(1, 2)
-            #    x_show = x[i][t, 0].detach().cpu()
-            #    y_show = torch.argmax(y[i], dim=1)[t].detach().cpu() if y[i].shape[1] != 1 else y[i][t, 0].detach().cpu()
-            #    ax[0].imshow(x_show, cmap='gray')
-            #    ax[1].imshow(y_show, cmap='gray')
-            #    plt.show()
-            #print('******************')
-
-            if weights[i] != 0:
-                l += weights[i] * self.loss(x[i], y[i])
+        
+        if confidence_weights is not None:
+            l = weights[0] * self.loss(x[0], y[0], weights=confidence_weights[0])
+            for i in range(1, len(x)):
+                if weights[i] != 0:
+                    l += weights[i] * self.loss(x[i], y[i], weights=confidence_weights[i])
+        else:
+            l = weights[0] * self.loss(x[0], y[0])
+            for i in range(1, len(x)):
+                if weights[i] != 0:
+                    l += weights[i] * self.loss(x[i], y[i])
         return l

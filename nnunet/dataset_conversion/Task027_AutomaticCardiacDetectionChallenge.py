@@ -17,6 +17,16 @@ from batchgenerators.utilities.file_and_folder_operations import *
 import shutil
 import numpy as np
 from sklearn.model_selection import KFold
+import nibabel as nib
+import sys
+
+def get_labeled_frame_nb(info_file):
+    indices = []
+    with open(info_file) as fd:
+        lines = fd.readlines()
+        indices.append(int(lines[0].split(' ')[-1]) - 1)
+        indices.append(int(lines[1].split(' ')[-1]) - 1)
+    return indices
 
 
 def convert_to_submission(source_dir, target_dir):
@@ -44,6 +54,7 @@ if __name__ == "__main__":
 
     # train
     all_train_files = []
+    all_unlabeled_train_files = []
     patient_dirs_train = subfolders(folder, prefix="patient")
     for p in patient_dirs_train:
         current_dir = p
@@ -54,6 +65,25 @@ if __name__ == "__main__":
             all_train_files.append(patient_identifier + "_0000.nii.gz")
             shutil.copy(d, join(out_folder, "imagesTr", patient_identifier + "_0000.nii.gz"))
             shutil.copy(s, join(out_folder, "labelsTr", patient_identifier + ".nii.gz"))
+
+        info_file = [i for i in subfiles(current_dir, suffix=".cfg")][0]
+        labeled_frame_indices = get_labeled_frame_nb(info_file)
+        data_file_train_unlabeled = [i for i in subfiles(current_dir, suffix=".nii.gz") if i.find("_4d") >= 0][0]
+        in_nib_img = nib.load(data_file_train_unlabeled)
+        original_header = in_nib_img.header
+        original_affine = in_nib_img.affine
+        img = in_nib_img.get_fdata()
+        for i in range(img.shape[-1]):
+            if i in labeled_frame_indices:
+                continue
+            else:
+                patient_identifier = data_file_train_unlabeled.split(os.sep)[-1].split('4d')[0] + 'frame' + str(i + 1).zfill(2) + '_u'
+                all_unlabeled_train_files.append(patient_identifier + "_0000.nii.gz")
+                out_path = join(out_folder, "imagesTr", patient_identifier + "_0000.nii.gz")
+                out_nib_img = nib.Nifti1Image(img[:, :, :, i], original_affine, original_header)
+                assert ~np.all(np.array(out_nib_img.header['pixdim']) == 1.0), print(p)
+                nib.save(out_nib_img, out_path)
+
 
     # test
     all_test_files = []
@@ -84,7 +114,10 @@ if __name__ == "__main__":
         "3": "LVC"
     }
     json_dict['numTraining'] = len(all_train_files)
+    json_dict['numUnlabeled'] = len(all_unlabeled_train_files)
     json_dict['numTest'] = len(all_test_files)
+    json_dict['unlabeled'] = [{'image': "./imagesTr/%s.nii.gz" % i.split("/")[-1][:-12]} for i in
+                             all_unlabeled_train_files]
     json_dict['training'] = [{'image': "./imagesTr/%s.nii.gz" % i.split("/")[-1][:-12], "label": "./labelsTr/%s.nii.gz" % i.split("/")[-1][:-12]} for i in
                              all_train_files]
     json_dict['test'] = ["./imagesTs/%s.nii.gz" % i.split("/")[-1][:-12] for i in all_test_files]

@@ -26,7 +26,7 @@ from nnunet.experiment_planning.DatasetAnalyzer import DatasetAnalyzer
 from nnunet.experiment_planning.common_utils import split_4d_nifti
 from nnunet.paths import nnUNet_raw_data, nnUNet_cropped_data, preprocessing_output_dir
 from nnunet.preprocessing.cropping import ImageCropper
-
+import sys
 
 def split_4d(input_folder, num_processes=default_num_threads, overwrite_task_output_id=None):
     assert isdir(join(input_folder, "imagesTr")) and isdir(join(input_folder, "labelsTr")) and \
@@ -96,6 +96,22 @@ def create_lists_from_splitted_dataset(base_folder_splitted):
         lists.append(cur_pat)
     return lists, {int(i): d['modality'][str(i)] for i in d['modality'].keys()}
 
+def create_lists_from_splitted_dataset_unlabeled(base_folder_splitted):
+    lists = []
+
+    json_file = join(base_folder_splitted, "dataset.json")
+    with open(json_file) as jsn:
+        d = json.load(jsn)
+        training_files = d['unlabeled']
+    num_modalities = len(d['modality'].keys())
+    for tr in training_files:
+        cur_pat = []
+        for mod in range(num_modalities):
+            cur_pat.append(join(base_folder_splitted, "imagesTr", tr['image'].split("/")[-1][:-7] +
+                                "_%04.0d.nii.gz" % mod))
+        lists.append(cur_pat)
+    return lists, {int(i): d['modality'][str(i)] for i in d['modality'].keys()}
+
 
 def create_lists_from_splitted_dataset_folder(folder):
     """
@@ -132,6 +148,23 @@ def crop(task_string, override=False, num_threads=default_num_threads):
 
     imgcrop = ImageCropper(num_threads, cropped_out_dir)
     imgcrop.run_cropping(lists, overwrite_existing=override)
+    shutil.copy(join(nnUNet_raw_data, task_string, "dataset.json"), cropped_out_dir)
+
+
+def crop_unlabeled(task_string, override=False, num_threads=default_num_threads):
+    #cropped_out_dir = join(nnUNet_cropped_data, task_string, 'unlabeled')
+    cropped_out_dir = join(nnUNet_cropped_data, task_string)
+    maybe_mkdir_p(cropped_out_dir)
+
+    if override and isdir(cropped_out_dir):
+        shutil.rmtree(cropped_out_dir)
+        maybe_mkdir_p(cropped_out_dir)
+
+    splitted_4d_output_dir_task = join(nnUNet_raw_data, task_string)
+    lists, _ = create_lists_from_splitted_dataset_unlabeled(splitted_4d_output_dir_task)
+
+    imgcrop = ImageCropper(num_threads, cropped_out_dir)
+    imgcrop.run_cropping_unlabeled(lists, overwrite_existing=override)
     shutil.copy(join(nnUNet_raw_data, task_string, "dataset.json"), cropped_out_dir)
 
 

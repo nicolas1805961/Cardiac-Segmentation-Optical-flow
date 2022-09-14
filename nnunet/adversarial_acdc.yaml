@@ -6,25 +6,29 @@ val_subset_size: -1
 apply_clahe: True
 add_extra_bottleneck_blocks: True
 cat_x: False
+unlabeled_loss_weight: 2
+unlabeled: False
 progressive_similarity_growing: False
-classification_weight: 1.45 #1.45
-classification: True
+classification_weight: 0.1 #1.45
+classification: False
 similarity: False
 asymmetric_unet: True
 vq_vae: False
 vae: False
 vae_noise: False
 vae_loss_weight: 1.0
-logging_metrics_iteration_number: 1000000000000
-logging_loss_iteration_number: 1000000000
+epoch_log: 1
 val_stride: 1
 scheduler: 'cosine'
 optimizer: 'adam'
+no_da: False
+cutmix: False
 middle: False
 adversarial_loss: False
-adversarial_weight: 0.01
+alpha_discriminator: 0.10 #0.125
+adversarial_weight: 1.0 #0.1
 start_reconstruction_dim: 4
-discriminator_lr: 0.00005
+discriminator_lr: 0.00001 # 0.00005
 initial_lr: 0.0001 #0.0001
 discriminator_decay: 0.0001
 weight_decay: 0.0001 #0.0001
@@ -32,8 +36,8 @@ warmup_percent: 0.1
 smoothing: 0.0
 max_num_epochs: 1000
 swin_bottleneck: True
-window_size: 7
-image_size: 224
+#window_size: 7
+#image_size: 224
 norm: 'BatchNorm2d' # 'InstanceNorm2d', 'BatchNorm2d', ''
 filter_skip_co_reconstruction: False
 filter_skip_co_segmentation: True
@@ -124,7 +128,7 @@ binary: False
 reconstruction: True
 reconstruction_skip: False
 reconstruction_loss_weight: 2.65 #2.65
-similarity_weight: 4.0 #4.0
+similarity_weight: 0.1 #0.0001
 similarity_down_scale: 8
 uncertainty_weighting: False
 dynamic_weight_averaging: False

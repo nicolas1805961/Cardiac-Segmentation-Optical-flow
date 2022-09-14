@@ -14,10 +14,15 @@
 
 
 from collections import OrderedDict
+from traceback import print_tb
 from typing import Tuple
 import matplotlib
 from datetime import datetime
 from sklearn.metrics import accuracy_score
+from tqdm import trange
+import torch.backends.cudnn as cudnn
+from _warnings import warn
+from sklearn.model_selection import train_test_split
 
 from torch.nn.functional import interpolate
 import psutil
@@ -33,9 +38,10 @@ from time import time, sleep, strftime
 import yaml
 import numpy as np
 import torch
-from torchinfo import summary
+from nnunet.torchinfo.torchinfo.torchinfo import summary
 from nnunet.lib.ssim import ssim
 from nnunet.utilities.tensor_utilities import sum_tensor
+from nnunet.training.data_augmentation.data_augmentation_noDA import get_no_augmentation_mtl
 from nnunet.training.data_augmentation.data_augmentation_moreDA import get_moreDA_augmentation_mtl
 from nnunet.training.data_augmentation.data_augmentation_mtl import get_moreDA_augmentation_middle
 from nnunet.training.loss_functions.deep_supervision import MultipleOutputLoss2
@@ -53,18 +59,22 @@ from torch import nn
 from torch.cuda.amp import autocast
 from nnunet.training.learning_rate.poly_lr import poly_lr
 from batchgenerators.utilities.file_and_folder_operations import *
-from nnunet.lib.training_utils import build_2d_model, read_config, build_discriminators
+from nnunet.lib.training_utils import build_2d_model, build_confidence_network, read_config, build_discriminator, build_discriminator
 from nnunet.lib.loss import DirectionalFieldLoss
 from nnunet.lib.dataset_utils import normalize_0_1
 from pathlib import Path
 from monai.losses import DiceFocalLoss, DiceLoss
 from torch.utils.tensorboard import SummaryWriter
 from nnunet.lib.boundary_utils import simplex
-from nnunet.training.loss_functions.dice_loss import DC_and_CE_loss, DC_and_focal_loss, DC_and_topk_loss
-from nnunet.training.loss_functions.crossentropy import RobustCrossEntropyLoss
-from nnunet.training.dataloading.dataset_loading import DataLoader2DMiddle
+from nnunet.training.loss_functions.dice_loss import DC_and_CE_loss, DC_and_focal_loss, DC_and_topk_loss, DC_and_CE_loss_Weighted, SoftDiceLoss
+from nnunet.training.loss_functions.crossentropy import RobustCrossEntropyLoss, WeightedRobustCrossEntropyLoss
+from nnunet.training.dataloading.dataset_loading import DataLoader2DMiddle, DataLoader2DUnlabeled
+from nnunet.training.dataloading.dataset_loading import load_dataset, load_unlabeled_dataset
+from nnunet.network_architecture.MTL_model import ModelWrap
 
 from nnunet.lib.loss import logisticGradientPenalty
+
+from nnunet.training.data_augmentation.cutmix import cutmix, batched_rand_bbox
 
 
 class nnMTLTrainerV2(nnUNetTrainer):
@@ -85,9 +95,14 @@ class nnMTLTrainerV2(nnUNetTrainer):
         self.use_progress_bar=True
         self.directional_field = self.config['directional_field']
         self.reconstruction = self.config['reconstruction']
+        self.unlabeled = self.config['unlabeled']
+        self.no_da = self.config['no_da']
+        if self.unlabeled:
+            self.unlabeled_loss_weight = self.config['unlabeled_loss_weight']
 
         self.deep_supervision = self.config['deep_supervision']
         self.classification = self.config['classification']
+        self.adversarial_loss = self.config['adversarial_loss']
 
         self.eval_images = self.initialize_image_data()
         self.iter_nb = 0
@@ -95,72 +110,23 @@ class nnMTLTrainerV2(nnUNetTrainer):
         self.vae = self.config['vae']
         self.vq_vae = self.config['vq_vae']
         self.similarity = self.config['similarity']
-
-        self.adversarial_loss = self.config['adversarial_loss']
+        self.cutmix = self.config['cutmix']
 
         self.val_loss = []
         self.train_loss = []
         
-        self.image_size = self.config['image_size']
-
-        if self.image_size == 224:
-            loss_weights = torch.tensor(self.config['224_loss_weights'], device=self.config['device'])
-        elif self.image_size == 128:
-            loss_weights = torch.tensor(self.config['128_loss_weights_125'], device=self.config['device'])
+        self.image_size = 288 if '026' in dataset_directory else 224
+        self.window_size = 7 if self.image_size == 224 else 9
+        loss_weights = torch.tensor(self.config['224_loss_weights'], device=self.config['device'])
 
         timestr = strftime("%Y-%m-%d_%HH%M")
-        self.log_dir = os.path.join(self.output_folder, timestr)
+        self.log_dir = os.path.join(copy(self.output_folder), timestr)
         self.writer = SummaryWriter(log_dir=self.log_dir)
 
-        self.loss_data = {'segmentation': [1.0, float('nan')]}
+        self.output_folder = self.log_dir
 
-        if self.config['reconstruction']:
-            self.loss_data['reconstruction'] = [self.config['reconstruction_loss_weight'], float('nan')]
-            self.mse_loss = nn.MSELoss()
-            if self.vae:
-                self.loss_data['vae'] = [self.config['vae_loss_weight'], float('nan')]
-            elif self.vq_vae:
-                self.loss_data['vq_vae'] = [self.config['vae_loss_weight'], float('nan')]
-            if self.similarity:
-                similarity_initial_weight = self.config['similarity_weight'] if not self.config['progressive_similarity_growing'] else 0
-                self.loss_data['similarity'] = [similarity_initial_weight, float('nan')]
-                self.similarity_loss = nn.L1Loss()
-            if self.adversarial_loss:
-                self.loss_data['adv_rec'] = [self.config['adversarial_weight'], float('nan')]
-                self.loss_data['adv_seg'] = [self.config['adversarial_weight'], float('nan')]
-                self.adv_loss = nn.BCELoss()
-                self.discriminator_lr = self.config['discriminator_lr']
-                self.discriminator_decay = self.config['discriminator_decay']
-                self.r1_penalty_iteration = self.config['r1_penalty_iteration']
+        self.setup_loss_functions(loss_weights)
         
-        if self.classification:
-            self.loss_data['classification'] = [self.config['classification_weight'], float('nan')]
-            self.classification_loss = nn.CrossEntropyLoss()
-
-        if self.config['learn_transforms']:
-            self.loss_data['rotation'] = [self.config['rotation_loss_weight'], float('nan')]
-            self.loss_data['rotation_reconstruction'] = [self.config['reconstruction_rotation_loss_weight'], float('nan')]
-            self.loss_data['scaling'] = [self.config['scaling_loss_weight'], float('nan')]
-            self.loss_data['scaling_reconstruction'] = [self.config['reconstruction_scaling_loss_weight'], float('nan')]
-        
-        if self.directional_field:
-            self.directional_field_loss = DirectionalFieldLoss(weights=loss_weights, writer=self.writer)
-            self.loss_data['directional_field'] = [self.config['directional_field_weight'], float('nan')]
-
-        #self.segmentation_loss = torch.nn.CrossEntropyLoss(weight=loss_weights, ignore_index=0)
-        #self.segmentation_loss = DiceLoss(include_background=False, softmax=True)
-        if self.config['loss'] == 'focal_and_dice2':
-            self.segmentation_loss = DiceFocalLoss(include_background=False, focal_weight=loss_weights[1:] if not self.config['binary'] else None, softmax=True, to_onehot_y=True)
-        if self.config['loss'] == 'focal_and_dice':
-            self.segmentation_loss = DC_and_focal_loss({'batch_dice': self.batch_dice, 'smooth': 1e-5, 'do_bg': False}, {'apply_nonlin': nn.Softmax(dim=1), 'alpha':0.5, 'gamma':2, 'smooth':1e-5})
-        elif self.config['loss'] == 'topk_and_dice':
-            self.segmentation_loss = DC_and_topk_loss({'batch_dice': self.batch_dice, 'smooth': 1e-5, 'do_bg': False}, {'k': 10}, ce_weight=0.5, dc_weight=0.5)
-        elif self.config['loss'] == 'ce_and_dice':
-            self.segmentation_loss = DC_and_CE_loss({'batch_dice': self.batch_dice, 'smooth': 1e-5, 'do_bg': False}, {})
-            #self.segmentation_loss = DC_and_CE_loss({'batch_dice': self.batch_dice, 'smooth': 1e-5, 'do_bg': False}, {'weight': loss_weights}, weight_ce=0.5, weight_dice=0.5)
-        elif self.config['loss'] == 'ce':
-            self.segmentation_loss = RobustCrossEntropyLoss(weight=loss_weights)
-
         self.pin_memory = True
         self.similarity_downscale = self.config['similarity_down_scale']
 
@@ -171,6 +137,67 @@ class nnMTLTrainerV2(nnUNetTrainer):
         self.df_ssim_list = []
         self.sim_l2_list = []
 
+    def setup_loss_data(self):
+        loss_data = {'segmentation': [1.0, float('nan')]}
+
+        if self.config['reconstruction']:
+            loss_data['reconstruction'] = [self.config['reconstruction_loss_weight'], float('nan')]
+            if self.vae:
+                loss_data['vae'] = [self.config['vae_loss_weight'], float('nan')]
+            elif self.vq_vae:
+                loss_data['vq_vae'] = [self.config['vae_loss_weight'], float('nan')]
+            if self.similarity:
+                similarity_initial_weight = self.config['similarity_weight'] if not self.config['progressive_similarity_growing'] else 0
+                loss_data['similarity'] = [similarity_initial_weight, float('nan')]
+
+        if self.adversarial_loss:
+            loss_data['adversarial'] = [self.config['adversarial_weight'], float('nan')]
+            if self.unlabeled:
+                loss_data['confidence'] = [1.0, float('nan')]
+            #else:
+            #    loss_data['seg_adversarial'] = [self.config['adversarial_weight'], float('nan')]
+            #    loss_data['rec_adversarial'] = [self.config['adversarial_weight'], float('nan')]
+        
+        if self.classification:
+            loss_data['classification'] = [self.config['classification_weight'], float('nan')]
+        
+        if self.directional_field:
+            loss_data['directional_field'] = [self.config['directional_field_weight'], float('nan')]
+        return loss_data
+    
+    def setup_loss_functions(self, loss_weights):
+        if self.config['reconstruction']:
+            self.mse_loss = nn.MSELoss()
+            if self.similarity:
+                self.similarity_loss = nn.L1Loss()
+        if self.adversarial_loss:
+            self.adv_loss = nn.BCELoss()
+            self.discriminator_lr = self.config['discriminator_lr']
+            self.discriminator_decay = self.config['discriminator_decay']
+            self.r1_penalty_iteration = self.config['r1_penalty_iteration']
+        
+        if self.classification:
+            self.classification_loss = nn.CrossEntropyLoss()
+        
+        if self.directional_field:
+            self.directional_field_loss = DirectionalFieldLoss(weights=loss_weights, writer=self.writer)
+
+        if self.unlabeled and self.adversarial_loss:
+            self.confidence_loss = WeightedRobustCrossEntropyLoss(reduction='none')
+            self.segmentation_loss = SoftDiceLoss(apply_nonlin=softmax_helper, batch_dice=self.batch_dice, do_bg=False, smooth=1e-5)
+        else:
+            if self.config['loss'] == 'focal_and_dice2':
+                self.segmentation_loss = DiceFocalLoss(include_background=False, focal_weight=loss_weights[1:] if not self.config['binary'] else None, softmax=True, to_onehot_y=True)
+            if self.config['loss'] == 'focal_and_dice':
+                self.segmentation_loss = DC_and_focal_loss({'batch_dice': self.batch_dice, 'smooth': 1e-5, 'do_bg': False}, {'apply_nonlin': nn.Softmax(dim=1), 'alpha':0.5, 'gamma':2, 'smooth':1e-5})
+            elif self.config['loss'] == 'topk_and_dice':
+                self.segmentation_loss = DC_and_topk_loss({'batch_dice': self.batch_dice, 'smooth': 1e-5, 'do_bg': False}, {'k': 10}, ce_weight=0.5, dc_weight=0.5)
+            elif self.config['loss'] == 'ce_and_dice':
+                self.segmentation_loss = DC_and_CE_loss({'batch_dice': self.batch_dice, 'smooth': 1e-5, 'do_bg': False}, {})
+                #self.segmentation_loss = DC_and_CE_loss({'batch_dice': self.batch_dice, 'smooth': 1e-5, 'do_bg': False}, {'weight': loss_weights}, weight_ce=0.5, weight_dice=0.5)
+            elif self.config['loss'] == 'ce':
+                self.segmentation_loss = RobustCrossEntropyLoss(weight=loss_weights)
+
     def initialize_image_data(self):
 
         log_images_nb = 8
@@ -178,6 +205,9 @@ class nnMTLTrainerV2(nnUNetTrainer):
                         'sim': None,
                         'df': None,
                         'seg': None}
+        
+        if self.unlabeled and self.adversarial_loss:
+            eval_images['confidence'] = None
 
         for key in eval_images.keys():
             data = []
@@ -210,6 +240,14 @@ class nnMTLTrainerV2(nnUNetTrainer):
                                 'pred': None,
                                 'gt': None}
                     score = 1
+                    data.append(payload)
+                    scores.append(score)
+            elif key == 'confidence':
+                for i in range(log_images_nb):
+                    payload = {'input': None,
+                                'pred': None,
+                                'confidence': None}
+                    score = 0
                     data.append(payload)
                     scores.append(score)
             eval_images[key] = np.stack([np.array(data), np.array(scores)], axis=0)
@@ -298,6 +336,8 @@ class nnMTLTrainerV2(nnUNetTrainer):
                 seg_weights = weights
 
             self.segmentation_loss = MultipleOutputLoss2(self.segmentation_loss, seg_weights)
+            if self.unlabeled and self.adversarial_loss:
+                self.confidence_loss = MultipleOutputLoss2(self.confidence_loss, seg_weights)
             if self.reconstruction:
                 self.reconstruction_loss = MultipleOutputLoss2(self.mse_loss, weights)
             ################# END ###################
@@ -305,7 +345,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
             self.folder_with_preprocessed_data = join(self.dataset_directory, self.plans['data_identifier'] +
                                                       "_stage%d" % self.stage)
             if training:
-                self.dl_tr, self.dl_val = self.get_basic_generators()
+                self.dl_tr, self.dl_val, self.dl_un_tr, self.dl_un_val = self.get_basic_generators()
                 if self.unpack_data:
                     print("unpacking dataset")
                     unpack_dataset(self.folder_with_preprocessed_data)
@@ -316,8 +356,20 @@ class nnMTLTrainerV2(nnUNetTrainer):
                         "will wait all winter for your model to finish!")
 
                 if not self.middle:
-                    self.tr_gen, self.val_gen = get_moreDA_augmentation_mtl(
-                        self.dl_tr, self.dl_val,
+                    
+                    if self.no_da:
+                        self.data_aug_params['do_mirror'] = False
+                        self.tr_gen, self.val_gen, self.tr_un_gen, self.val_un_gen = get_no_augmentation_mtl(
+                            self.dl_tr, self.dl_val, self.dl_un_tr, self.dl_un_val,
+                            self.data_aug_params[
+                                'patch_size_for_spatialtransform'],
+                            directional_field=self.directional_field,
+                            params=self.data_aug_params,
+                            deep_supervision_scales=self.deep_supervision_scales
+                        )
+                    else:
+                        self.tr_gen, self.val_gen, self.tr_un_gen, self.val_un_gen = get_moreDA_augmentation_mtl(
+                        self.dl_tr, self.dl_val, self.dl_un_tr, self.dl_un_val,
                         self.data_aug_params[
                             'patch_size_for_spatialtransform'],
                         directional_field=self.directional_field,
@@ -325,7 +377,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
                         deep_supervision_scales=self.deep_supervision_scales,
                         pin_memory=self.pin_memory,
                         use_nondetMultiThreadedAugmenter=False
-                    )
+                        )
                 else:
                     self.tr_gen, self.val_gen = get_moreDA_augmentation_middle(
                         self.dl_tr, self.dl_val,
@@ -340,6 +392,11 @@ class nnMTLTrainerV2(nnUNetTrainer):
                 self.print_to_log_file("TRAINING KEYS:\n %s" % (str(self.dataset_tr.keys())),
                                        also_print_to_console=False)
                 self.print_to_log_file("VALIDATION KEYS:\n %s" % (str(self.dataset_val.keys())),
+                                       also_print_to_console=False)
+                if self.unlabeled:
+                    self.print_to_log_file("UNLABELED TRAINING KEYS:\n %s" % (str(self.dataset_un_tr.keys())),
+                                       also_print_to_console=False)
+                    self.print_to_log_file("UNLABELED VALIDATION KEYS:\n %s" % (str(self.dataset_un_val.keys())),
                                        also_print_to_console=False)
             else:
                 pass
@@ -388,12 +445,12 @@ class nnMTLTrainerV2(nnUNetTrainer):
     
     def count_parameters(self, config, models):
         params_sum = 0
+        self.print_to_log_file(yaml.safe_dump(config, default_flow_style=None, sort_keys=False), also_print_to_console=False)
         for k, v in models.items():
             nb_params =  sum(p.numel() for p in v[0].parameters() if p.requires_grad)
             params_sum += nb_params
-            self.print_to_log_file(yaml.safe_dump(config, default_flow_style=None, sort_keys=False), also_print_to_console=False)
 
-            model_stats = summary(v[0], input_size=v[1], 
+            model_stats = summary(v[0], input_data=v[1], 
                                 col_names=["input_size", "output_size", "num_params", "mult_adds"], 
                                 col_width=16,
                                 verbose=0)
@@ -414,22 +471,46 @@ class nnMTLTrainerV2(nnUNetTrainer):
         :return:
         """
         models = {}
-        if self.adversarial_loss:
-            self.seg_discriminator, self.rec_discriminator = build_discriminators(self.config)
-            if torch.cuda.is_available():
-                self.seg_discriminator.cuda()
-                self.rec_discriminator.cuda()
-            seg_discriminator_input_size = (self.config['batch_size'], 4, 224, 224)
-            rec_discriminator_input_size = (self.config['batch_size'], 1, 224, 224)
-            models['segmentation discriminator'] = (self.seg_discriminator, seg_discriminator_input_size)
-            models['reconstruction discriminator'] = (self.rec_discriminator, rec_discriminator_input_size)
+        
 
-        self.network = build_2d_model(self.config, norm=getattr(torch.nn, self.config['norm']), log_function=self.print_to_log_file)
+        if self.unlabeled:
+            if self.adversarial_loss:
+                self.discriminator = build_confidence_network(self.config, alpha=self.config['alpha_discriminator'], image_size=self.image_size, window_size=self.window_size)
+                if torch.cuda.is_available():
+                    self.discriminator.cuda()
+                discriminator_input = torch.randn(self.config['batch_size'], 4, self.image_size, self.image_size)
+                models['discriminator'] = (self.discriminator, discriminator_input)
 
-        nb_inputs = 2 if self.middle else 1
-        model_input_size = [(self.config['batch_size'], 1, self.image_size, self.image_size)] * nb_inputs
-        models['model'] = (self.network, model_input_size)
-        self.count_parameters(self.config, models)
+            net1 = build_2d_model(self.config, norm=getattr(torch.nn, self.config['norm']), log_function=self.print_to_log_file, image_size=self.image_size, window_size=self.window_size)
+            net2 = build_2d_model(self.config, norm=getattr(torch.nn, self.config['norm']), log_function=self.print_to_log_file, image_size=self.image_size, window_size=self.window_size)
+            self.network = ModelWrap(net1, net2, do_ds=self.config['deep_supervision'])
+
+            model_input_data = torch.randn(self.config['batch_size'], 1, self.image_size, self.image_size)
+            model_input_data1 = [model_input_data, 1]
+            models['model'] = (self.network, model_input_data1)
+            self.count_parameters(self.config, models)
+        else:
+            if self.adversarial_loss:
+                self.discriminator = build_discriminator(self.config, alpha=self.config['alpha_discriminator'], use_swin_discriminator=False, in_channel=5, image_size=self.image_size, window_size=self.window_size)
+                if torch.cuda.is_available():
+                    self.discriminator.cuda()
+                discriminator_input = torch.randn(self.config['batch_size'], 5, self.image_size, self.image_size)
+                models['discriminator'] = (self.discriminator, discriminator_input)
+
+                #self.rec_discriminator = build_discriminator(self.config, alpha=0.125, use_swin_discriminator=False, in_channel=1)
+                #if torch.cuda.is_available():
+                #    self.rec_discriminator.cuda()
+                #discriminator_input = torch.randn(self.config['batch_size'], 1, self.image_size, self.image_size)
+                #models['rec_discriminator'] = (self.rec_discriminator, discriminator_input)
+
+            self.network = build_2d_model(self.config, norm=getattr(torch.nn, self.config['norm']), log_function=self.print_to_log_file, image_size=self.image_size, window_size=self.window_size)
+
+            model_input_data = torch.randn(self.config['batch_size'], 1, self.image_size, self.image_size)
+            models['model'] = (self.network, model_input_data)
+            self.count_parameters(self.config, models)
+
+        #nb_inputs = 2 if self.middle else 1
+        #model_input_size = [(self.config['batch_size'], 1, self.image_size, self.image_size)] * nb_inputs
 
         if torch.cuda.is_available():
             self.network.cuda()
@@ -455,8 +536,11 @@ class nnMTLTrainerV2(nnUNetTrainer):
         self.optimizer, self.lr_scheduler = self.get_optimizer_scheduler(net=self.network, lr=self.initial_lr, decay=self.weight_decay)
 
         if self.adversarial_loss:
-            self.seg_discriminator_optimizer, self.seg_discriminator_scheduler = self.get_optimizer_scheduler(net=self.seg_discriminator, lr=self.discriminator_lr, decay=self.discriminator_decay)
-            self.rec_discriminator_optimizer, self.rec_discriminator_scheduler = self.get_optimizer_scheduler(net=self.rec_discriminator, lr=self.discriminator_lr, decay=self.discriminator_decay)
+            self.discriminator_optimizer, self.discriminator_scheduler = self.get_optimizer_scheduler(net=self.discriminator, lr=self.discriminator_lr, decay=self.discriminator_decay)
+            #if self.unlabeled:
+            #else:
+            #    self.seg_discriminator_optimizer, self.seg_discriminator_scheduler = self.get_optimizer_scheduler(net=self.seg_discriminator, lr=self.discriminator_lr, decay=self.discriminator_decay)
+            #    self.rec_discriminator_optimizer, self.rec_discriminator_scheduler = self.get_optimizer_scheduler(net=self.rec_discriminator, lr=self.discriminator_lr, decay=self.discriminator_decay)
 
     def get_images_ready_for_display(self, image, colormap):
         if colormap is not None:
@@ -475,7 +559,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
         if len(image.shape) < 3:
             image = image[:, :, None]
         return image
-    
+
     def log_rec_images(self):
         input_image = self.eval_images['rec'][0, 0]['input']
         input_image = self.get_images_ready_for_display(input_image, colormap=None)
@@ -537,6 +621,23 @@ class nnMTLTrainerV2(nnUNetTrainer):
         self.writer.add_images(os.path.join('Segmentation', 'ground_truth').replace('\\', '/'), gt_list, self.epoch, dataformats='NHWC')
         self.writer.add_images(os.path.join('Segmentation', 'prediction').replace('\\', '/'), pred_list, self.epoch, dataformats='NHWC')
     
+    def log_confidence_images(self, colormap, colormap_seg, norm):
+        input_list = [x['input'] for x in self.eval_images['confidence'][0]]
+        input_list = [self.get_images_ready_for_display(x, colormap=None) for x in input_list]
+        input_list = np.stack(input_list, axis=0)
+
+        confidence_list = [x['confidence'] for x in self.eval_images['confidence'][0]]
+        confidence_list = [self.get_images_ready_for_display(x, colormap) for x in confidence_list]
+        confidence_list = np.stack(confidence_list, axis=0)
+
+        pred_list = [x['pred'] for x in self.eval_images['confidence'][0]]
+        pred_list = [self.get_seg_images_ready_for_display(x, colormap_seg, norm) for x in pred_list]
+        pred_list = np.stack(pred_list, axis=0)
+
+        self.writer.add_images(os.path.join('Confidence', 'input').replace('\\', '/'), input_list, self.epoch, dataformats='NHWC')
+        self.writer.add_images(os.path.join('Confidence', 'confidence_map').replace('\\', '/'), confidence_list, self.epoch, dataformats='NHWC')
+        self.writer.add_images(os.path.join('Confidence', 'prediction').replace('\\', '/'), pred_list, self.epoch, dataformats='NHWC')
+    
     def set_up_image_seg(self, seg_dice, gt, pred, x):
         seg_dice = seg_dice.cpu().numpy()
         gt = gt.cpu().numpy()
@@ -552,6 +653,22 @@ class nnMTLTrainerV2(nnUNetTrainer):
 
             sorted_indices = self.eval_images['seg'][1, :].argsort()
             self.eval_images['seg'] = self.eval_images['seg'][:, sorted_indices]
+        
+    def set_up_image_confidence(self, seg_dice, confidence, pred, x):
+        seg_dice = seg_dice.cpu().numpy()
+        confidence = confidence.cpu().numpy()
+        pred = pred.cpu().numpy()
+        x = x.cpu().numpy()
+
+        if self.eval_images['confidence'][1, 0] < seg_dice:
+
+            self.eval_images['confidence'][0, 0]['confidence'] = confidence.astype(np.float32)
+            self.eval_images['confidence'][0, 0]['pred'] = pred.astype(np.float32)
+            self.eval_images['confidence'][0, 0]['input'] = x.astype(np.float32)
+            self.eval_images['confidence'][1, 0] = seg_dice
+
+            sorted_indices = self.eval_images['confidence'][1, :].argsort()
+            self.eval_images['confidence'] = self.eval_images['confidence'][:, sorted_indices]
 
     def set_up_image_df(self, df_ssim, gt_df, pred_df, x):
         df_ssim = df_ssim.cpu().numpy()
@@ -602,23 +719,48 @@ class nnMTLTrainerV2(nnUNetTrainer):
         sim = torch.clamp(sim, min_sim, max_sim)
         return sim
 
-    def start_online_evaluation(self, pred, pred_df, reconstructed, x, target, gt_df, rec_sim, dec_sim, classification_pred, classification_gt):
+    def compute_dice(self, target, num_classes, output_seg):
+        axes = tuple(range(1, len(target.shape)))
+        tp_hard = torch.zeros((target.shape[0], num_classes - 1)).to(output_seg.device.index)
+        fp_hard = torch.zeros((target.shape[0], num_classes - 1)).to(output_seg.device.index)
+        fn_hard = torch.zeros((target.shape[0], num_classes - 1)).to(output_seg.device.index)
+        for c in range(1, num_classes):
+            tp_hard[:, c - 1] = sum_tensor((output_seg == c).float() * (target == c).float(), axes=axes)
+            fp_hard[:, c - 1] = sum_tensor((output_seg == c).float() * (target != c).float(), axes=axes)
+            fn_hard[:, c - 1] = sum_tensor((output_seg != c).float() * (target == c).float(), axes=axes)
+
+        seg_dice = ((2 * tp_hard) / (2 * tp_hard + fp_hard + fn_hard + 1e-8))
+
+        tp_hard = tp_hard.sum(0, keepdim=False).detach().cpu().numpy()
+        fp_hard = fp_hard.sum(0, keepdim=False).detach().cpu().numpy()
+        fn_hard = fn_hard.sum(0, keepdim=False).detach().cpu().numpy()
+
+        self.online_eval_foreground_dc.append(list((2 * tp_hard) / (2 * tp_hard + fp_hard + fn_hard + 1e-8)))
+        self.online_eval_tp.append(list(tp_hard))
+        self.online_eval_fp.append(list(fp_hard))
+        self.online_eval_fn.append(list(fn_hard))
+            
+        return seg_dice
+
+
+    def start_online_evaluation(self, pred, pred_df, reconstructed, x, target, gt_df, rec_sim, dec_sim, classification_pred, classification_gt, confidence):
 
         with torch.no_grad():
             num_classes = pred.shape[1]
             output_softmax = softmax_helper(pred)
             output_seg = output_softmax.argmax(1)
             target = target[:, 0]
-            axes = tuple(range(1, len(target.shape)))
-            tp_hard = torch.zeros((target.shape[0], num_classes - 1)).to(output_seg.device.index)
-            fp_hard = torch.zeros((target.shape[0], num_classes - 1)).to(output_seg.device.index)
-            fn_hard = torch.zeros((target.shape[0], num_classes - 1)).to(output_seg.device.index)
-            for c in range(1, num_classes):
-                tp_hard[:, c - 1] = sum_tensor((output_seg == c).float() * (target == c).float(), axes=axes)
-                fp_hard[:, c - 1] = sum_tensor((output_seg == c).float() * (target != c).float(), axes=axes)
-                fn_hard[:, c - 1] = sum_tensor((output_seg != c).float() * (target == c).float(), axes=axes)
-
-            seg_dice = ((2 * tp_hard) / (2 * tp_hard + fp_hard + fn_hard + 1e-8))
+            seg_dice = self.compute_dice(target, num_classes, output_seg)
+            #axes = tuple(range(1, len(target.shape)))
+            #tp_hard = torch.zeros((target.shape[0], num_classes - 1)).to(output_seg.device.index)
+            #fp_hard = torch.zeros((target.shape[0], num_classes - 1)).to(output_seg.device.index)
+            #fn_hard = torch.zeros((target.shape[0], num_classes - 1)).to(output_seg.device.index)
+            #for c in range(1, num_classes):
+            #    tp_hard[:, c - 1] = sum_tensor((output_seg == c).float() * (target == c).float(), axes=axes)
+            #    fp_hard[:, c - 1] = sum_tensor((output_seg == c).float() * (target != c).float(), axes=axes)
+            #    fn_hard[:, c - 1] = sum_tensor((output_seg != c).float() * (target == c).float(), axes=axes)
+#
+            #seg_dice = ((2 * tp_hard) / (2 * tp_hard + fp_hard + fn_hard + 1e-8))
 
             if self.classification:
                 acc = accuracy_score(y_true=classification_gt.cpu(), y_pred=classification_pred.cpu())
@@ -650,21 +792,24 @@ class nnMTLTrainerV2(nnUNetTrainer):
                     current_pred_df = current_pred_df[0]
                     self.set_up_image_df(df_ssim=df_ssim, gt_df=current_gt_df, pred_df=current_pred_df, x=current_x)
 
-                current_pred = torch.argmax(pred[t], dim=0)
+                current_pred = torch.argmax(output_softmax[t], dim=0)
+                if self.adversarial_loss and self.unlabeled:
+                    self.set_up_image_confidence(seg_dice=seg_dice[t].mean(), confidence=confidence[t, 0], pred=current_pred, x=current_x)
+
                 current_target = target[t]
 
                 self.set_up_image_seg(seg_dice=seg_dice[t].mean(), gt=current_target, pred=current_pred, x=current_x)
                 
                 #with autocast():
 
-            tp_hard = tp_hard.sum(0, keepdim=False).detach().cpu().numpy()
-            fp_hard = fp_hard.sum(0, keepdim=False).detach().cpu().numpy()
-            fn_hard = fn_hard.sum(0, keepdim=False).detach().cpu().numpy()
-
-            self.online_eval_foreground_dc.append(list((2 * tp_hard) / (2 * tp_hard + fp_hard + fn_hard + 1e-8)))
-            self.online_eval_tp.append(list(tp_hard))
-            self.online_eval_fp.append(list(fp_hard))
-            self.online_eval_fn.append(list(fn_hard))
+            #tp_hard = tp_hard.sum(0, keepdim=False).detach().cpu().numpy()
+            #fp_hard = fp_hard.sum(0, keepdim=False).detach().cpu().numpy()
+            #fn_hard = fn_hard.sum(0, keepdim=False).detach().cpu().numpy()
+#
+            #self.online_eval_foreground_dc.append(list((2 * tp_hard) / (2 * tp_hard + fp_hard + fn_hard + 1e-8)))
+            #self.online_eval_tp.append(list(tp_hard))
+            #self.online_eval_fp.append(list(fp_hard))
+            #self.online_eval_fn.append(list(fn_hard))
 
     def get_custom_colormap(self, colormap):
         # extract all colors from the .jet map
@@ -720,6 +865,8 @@ class nnMTLTrainerV2(nnUNetTrainer):
 
         cmap, norm = self.get_custom_colormap(colormap=cm.jet)
         self.log_seg_images(colormap=cmap, norm=norm)
+        if self.unlabeled and self.adversarial_loss:
+            self.log_confidence_images(colormap=cm.plasma, colormap_seg=cmap, norm=norm)
 
         max_memory_allocated = torch.cuda.max_memory_allocated(device=self.network.get_device())
         self.print_to_log_file("Max GPU Memory allocated:", max_memory_allocated / 10e8, "Gb")
@@ -735,9 +882,15 @@ class nnMTLTrainerV2(nnUNetTrainer):
         self.val_loss = []
         self.train_loss = []
 
+        if self.unlabeled:
+            self.pseudo_online_eval_foreground_dc = []
+            self.pseudo_online_eval_tp = []
+            self.pseudo_online_eval_fp = []
+            self.pseudo_online_eval_fn = []
+
         self.eval_images = self.initialize_image_data()
 
-    def run_online_evaluation(self, data, target, output, gt_df, classification_gt):
+    def run_online_evaluation(self, data, target, output, gt_df, classification_gt, confidence):
         """
         due to deep supervision the return value and the reference are now lists of tensors. We only need the full
         resolution output because this is what we are interested in in the end. The others are ignored
@@ -745,6 +898,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
         :param target:
         :return:
         """
+
         pred = output['pred'][0]
         pred_df = output['directional_field']
 
@@ -775,7 +929,8 @@ class nnMTLTrainerV2(nnUNetTrainer):
                                             rec_sim=rec_sim, 
                                             dec_sim=dec_sim,
                                             classification_pred=classification_pred,
-                                            classification_gt=classification_gt)
+                                            classification_gt=classification_gt,
+                                            confidence=confidence)
         #return super().run_online_evaluation(output, target)
 
     def validate(self, do_mirroring: bool = True, use_sliding_window: bool = True,
@@ -785,6 +940,9 @@ class nnMTLTrainerV2(nnUNetTrainer):
         """
         We need to wrap this because we need to enforce self.network.do_ds = False for prediction
         """
+        if self.config['no_da']:
+            do_mirroring = False
+            
         ds = self.network.do_ds
         self.network.do_ds = False
         ret = super().validate(log_function=self.print_to_log_file, do_mirroring=do_mirroring, use_sliding_window=use_sliding_window, step_size=step_size,
@@ -819,16 +977,18 @@ class nnMTLTrainerV2(nnUNetTrainer):
         self.network.do_ds = ds
         return ret
 
-    def compute_losses(self, x, output, target, gt_df, do_backprop, gt_classification):
+    def compute_losses(self, x, output, target, do_backprop, gt_df=None, gt_classification=None):
+        loss_data = self.setup_loss_data()
+
         for t in target:
             assert t.shape[1] == 1
 
         pred = output['pred']
         if self.reconstruction:
             if self.vae:
-                self.loss_data['vae'][1] = output['vq_loss']
+                loss_data['vae'][1] = output['vq_loss']
             elif self.vq_vae:
-                self.loss_data['vq_vae'][1] = output['vq_loss']
+                loss_data['vq_vae'][1] = output['vq_loss']
             reconstructed = output['reconstructed']
             decoder_sm = output['decoder_sm']
             reconstruction_sm = output['reconstruction_sm']
@@ -840,7 +1000,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
 
         if self.classification:
             classification_loss = self.classification_loss(output['classification'], gt_classification)
-            self.loss_data['classification'][1] = classification_loss
+            loss_data['classification'][1] = classification_loss
 
         #print(x[0].dtype)
         #print(reconstructed[0].dtype)
@@ -851,7 +1011,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
         if self.directional_field:
             df_pred = output['directional_field']
             directional_field_loss = self.directional_field_loss(pred=df_pred, y_df=gt_df, y_seg=target[0].squeeze(1), iter_nb=self.iter_nb, do_backprop=do_backprop)
-            self.loss_data['directional_field'][1] = directional_field_loss
+            loss_data['directional_field'][1] = directional_field_loss
         
         sim_loss = 0
         rec_loss = 0
@@ -860,68 +1020,119 @@ class nnMTLTrainerV2(nnUNetTrainer):
             #a = (self.end_similarity - self.start_similarity) / self.total_nb_of_iterations
             #b = self.start_similarity
             #self.current_similarity_weight = a * iter_nb + b
-            #self.loss_data['similarity'][0] = self.current_similarity_weight
+            #loss_data['similarity'][0] = self.current_similarity_weight
             rec_loss = self.reconstruction_loss(reconstructed, x)
-            self.loss_data['reconstruction'][1] = rec_loss
+            loss_data['reconstruction'][1] = rec_loss
 
             if self.similarity:
                 assert decoder_sm.shape == reconstruction_sm.shape
                 sim_loss = self.similarity_loss(decoder_sm, reconstruction_sm)
-                self.loss_data['similarity'][1] = sim_loss
+                loss_data['similarity'][1] = sim_loss
 
-            if self.adversarial_loss:
+        if self.adversarial_loss:
+            if not self.unlabeled:
                 if do_backprop:
-                    self.seg_discriminator.train()
-                    self.rec_discriminator.train()
+                    self.discriminator.train()
+                    #self.rec_discriminator.train()
                 else:
-                    self.seg_discriminator.eval()
-                    self.rec_discriminator.eval()
+                    self.discriminator.eval()
+                    #self.rec_discriminator.eval()
 
-                fake_seg = torch.nn.functional.softmax(pred[0], dim=1)
-                fake_seg = torch.argmax(fake_seg, dim=1).long()
-                fake_seg = torch.nn.functional.one_hot(fake_seg, num_classes=4).permute(0, 3, 1, 2).float()
-                real_seg = torch.nn.functional.one_hot(target[0].long(), num_classes=4).permute(0, 4, 2, 3, 1).squeeze(-1).float()
+                fake = torch.nn.functional.softmax(pred[0], dim=1)
+                fake = torch.argmax(fake, dim=1).long()
+                fake = torch.nn.functional.one_hot(fake, num_classes=4).permute(0, 3, 1, 2).float()
+                fake = torch.cat([fake, reconstructed[0]], dim=1)
+                real = torch.nn.functional.one_hot(target[0].long(), num_classes=4).permute(0, 4, 2, 3, 1).squeeze(-1).float()
+                real = torch.cat([real, x[0]], dim=1)
 
-                assert fake_seg.shape == real_seg.shape
-                assert x[0].shape == reconstructed[0].shape
+                assert fake.shape == real.shape
 
-                self.loss_data['adv_seg'][1], seg_dis_loss = self.get_adversarial_loss(self.seg_discriminator, 
-                                                                        self.seg_discriminator_optimizer,
-                                                                        real=real_seg, 
-                                                                        fake=fake_seg,
-                                                                        iter_nb=self.iter_nb,
+                loss_data['adversarial'][1], discriminator_loss, output_real, output_fake = self.get_adversarial_loss(self.discriminator, 
+                                                                        self.discriminator_optimizer,
+                                                                        real=real, 
+                                                                        fake=fake,
                                                                         do_backprop=do_backprop)
-                self.loss_data['adv_rec'][1], rec_dis_loss = self.get_adversarial_loss(self.rec_discriminator, 
-                                                                        self.rec_discriminator_optimizer,
-                                                                        real=x[0], 
-                                                                        fake=reconstructed[0],
-                                                                        iter_nb=self.iter_nb,
-                                                                        do_backprop=do_backprop)
+
+                
+                #loss_data['rec_adversarial'][1], rec_discriminator_loss, rec_output_real, rec_output_fake = self.get_adversarial_loss(self.rec_discriminator, 
+                #                                                        self.rec_discriminator_optimizer,
+                #                                                        real=x[0], 
+                #                                                        fake=reconstructed[0],
+                #                                                        do_backprop=do_backprop)
                 
                 if do_backprop:
-                    self.writer.add_scalar('Iteration/seg_dis_loss', seg_dis_loss, self.iter_nb)
-                    self.writer.add_scalar('Iteration/rec_dis_loss', rec_dis_loss, self.iter_nb)
-
-        #seg_target = []
-        #for t in range(len(target)):
-        #    temp = torch.clone(target[t]).squeeze().long()
-        #    temp = torch.nn.functional.one_hot(temp, num_classes=4).permute(0, 3, 1, 2).float()
-        #    seg_target.append(temp)
+                    self.writer.add_scalar('Discriminator/Discriminator real', output_real.mean(), self.iter_nb)
+                    self.writer.add_scalar('Discriminator/Discriminator fake', output_fake.mean(), self.iter_nb)
+                    self.writer.add_scalar('Discriminator/Discriminator_loss', discriminator_loss, self.iter_nb)
+                    #self.writer.add_scalar('Discriminator/Rec discriminator real', rec_output_real.mean(), self.iter_nb)
+                    #self.writer.add_scalar('Discriminator/Rec discriminator fake', rec_output_fake.mean(), self.iter_nb)
+                    #self.writer.add_scalar('Discriminator/rec_discriminator_loss', rec_discriminator_loss, self.iter_nb)
+            else:
+                loss_data['adversarial'][1] = 0
+                loss_data['confidence'][1] = 0
             
         seg_loss = self.segmentation_loss(pred, target)
-        self.loss_data['segmentation'][1] = seg_loss
+        loss_data['segmentation'][1] = seg_loss
 
-        loss = 0
-        for key, value in self.loss_data.items():
-            if do_backprop:
-                self.writer.add_scalar('Iteration/' + key + ' loss', value[1], self.iter_nb)
-            loss += value[0] * value[1]
+        return loss_data
 
-        if do_backprop:
-            self.writer.add_scalars('Iteration/loss weights', {key:value[0] for key, value in self.loss_data.items()}, self.iter_nb)
-            self.writer.add_scalar('Iteration/Training loss', loss, self.iter_nb)
 
-        return loss
+
+    def compute_losses_unlabeled(self, x, output, target, fake):
+        loss_data = self.setup_loss_data()
+
+        for t in target:
+            assert t.shape[1] == 1
+
+        pred = output['pred']
+        if self.reconstruction:
+            if self.vae:
+                loss_data['vae'][1] = output['vq_loss']
+            elif self.vq_vae:
+                loss_data['vq_vae'][1] = output['vq_loss']
+            reconstructed = output['reconstructed']
+            decoder_sm = output['decoder_sm']
+            reconstruction_sm = output['reconstruction_sm']
+            assert pred[0].shape[-2:] == target[0].shape[-2:] == reconstructed[0].shape[-2:] == x[0].shape[-2:]
+            assert len(pred) == len(target) == len(reconstructed) == len(x)
+        else:
+            assert pred[0].shape[-2:] == target[0].shape[-2:]
+            assert len(pred) == len(target)
+
+        #print(x[0].dtype)
+        #print(reconstructed[0].dtype)
+        #print(reconstruction_sm.dtype)
+        #print(decoder_sm.dtype)
+        #print(output['directional_field'].dtype)
+        
+        sim_loss = 0
+        rec_loss = 0
+        if self.reconstruction:
+
+            #a = (self.end_similarity - self.start_similarity) / self.total_nb_of_iterations
+            #b = self.start_similarity
+            #self.current_similarity_weight = a * iter_nb + b
+            #loss_data['similarity'][0] = self.current_similarity_weight
+            rec_loss = self.reconstruction_loss(reconstructed, x)
+            loss_data['reconstruction'][1] = rec_loss
+
+            if self.similarity:
+                assert decoder_sm.shape == reconstruction_sm.shape
+                sim_loss = self.similarity_loss(decoder_sm, reconstruction_sm)
+                loss_data['similarity'][1] = sim_loss
+
+        if self.adversarial_loss:
+            loss_data['adversarial'][1], confidence = self.get_adversarial_loss_unlabeled(self.discriminator, fake)
+            seg_loss = self.confidence_loss(pred, target, confidence_weights=confidence)
+            loss_data['confidence'][1] = seg_loss
+            confidence = confidence[0].detach()
+            loss_data['segmentation'][1] = 0
+        else:
+            seg_loss = self.segmentation_loss(pred, target)
+            loss_data['segmentation'][1] = seg_loss
+            confidence = None
+
+        return loss_data
 
 
     def run_iteration(self, data_generator, do_backprop=True, run_online_evaluation=False):
@@ -983,8 +1194,13 @@ class nnMTLTrainerV2(nnUNetTrainer):
 
         self.optimizer.zero_grad()
 
-        output = self.network(data[0], middle=middle)
-        l = self.compute_losses(x=data, output=output, target=target, gt_df=gt_df, do_backprop=do_backprop, gt_classification=gt_classification)
+        #output = self.network(data[0], middle=middle)
+
+        output = self.network(data[0])
+        
+        loss_data = self.compute_losses(x=data, output=output, target=target, gt_df=gt_df, do_backprop=do_backprop, gt_classification=gt_classification)
+        l = self.consolidate_only_one_loss_data(loss_data, log=do_backprop)
+        #del loss_data
 
         if not do_backprop:
             self.val_loss.append(l.detach().cpu())
@@ -992,9 +1208,6 @@ class nnMTLTrainerV2(nnUNetTrainer):
             if self.vq_vae:
                 self.writer.add_scalar('Iteration/Perplexity', output['perplexity'], self.iter_nb)
             self.train_loss.append(l.detach().cpu())
-        #l = self.loss(output, target)
-
-        if do_backprop:
             l.backward()
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.optimizer.step()
@@ -1042,10 +1255,285 @@ class nnMTLTrainerV2(nnUNetTrainer):
         #        self.optimizer.step()
 
         if run_online_evaluation:
-            self.run_online_evaluation(data=data, target=target, output=output, gt_df=gt_df, classification_gt=gt_classification)
+            self.run_online_evaluation(data=data, target=target, output=output, gt_df=gt_df, classification_gt=gt_classification, confidence=None)
         del data
 
         del target
+
+        if do_backprop:
+            self.iter_nb += 1
+
+        return l.detach().cpu().numpy()
+    
+
+    def get_middle_ready(self, tr_data_dict, un_data_dict):
+        if self.middle:
+            tr_middle = tr_data_dict['middle']
+            tr_middle = maybe_to_torch(tr_middle)
+            if torch.cuda.is_available():
+                tr_middle = to_cuda(tr_middle)
+            
+            un_middle = un_data_dict['middle']
+            un_middle = maybe_to_torch(un_middle)
+            if torch.cuda.is_available():
+                un_middle = to_cuda(un_middle)
+        else:
+            tr_middle = None
+            un_middle = None
+        return tr_middle, un_middle
+    
+
+    def get_classification_ready(self, tr_data_dict, un_data_dict):
+        if self.classification:
+            tr_gt_classification = tr_data_dict['classification']
+            tr_gt_classification = maybe_to_torch(tr_gt_classification).long()
+            if torch.cuda.is_available():
+                tr_gt_classification = to_cuda(tr_gt_classification)
+            
+            un_gt_classification = un_data_dict['classification']
+            un_gt_classification = maybe_to_torch(un_gt_classification).long()
+            if torch.cuda.is_available():
+                un_gt_classification = to_cuda(un_gt_classification)
+        else:
+            tr_gt_classification = None
+            un_gt_classification = None
+        return tr_gt_classification, un_gt_classification
+    
+
+    def get_directional_field_ready(self, tr_data_dict, un_data_dict):
+        if self.directional_field:
+            tr_gt_df = tr_data_dict['directional_field']
+            tr_gt_df = maybe_to_torch(tr_gt_df)
+            if torch.cuda.is_available():
+                tr_gt_df = to_cuda(tr_gt_df)
+
+            un_gt_df = un_data_dict['directional_field']
+            un_gt_df = maybe_to_torch(un_gt_df)
+            if torch.cuda.is_available():
+                un_gt_df = to_cuda(un_gt_df)
+        else:
+            tr_gt_df = None
+            un_gt_df = None
+        return tr_gt_df, un_gt_df
+    
+    def get_cps_loss_cutmix(self, data1, data2):
+        mask_coords = batched_rand_bbox(data1[0].size())
+        cutmixed_img = cutmix(data1, data2, mask_coords)
+        with torch.no_grad():
+            output1_1 = self.network(data1[0], 1)
+            output1_2 = self.network(data2[0], 1)
+            output1_1_pred = output1_1['pred']
+            output1_2_pred = output1_2['pred']
+
+            output2_1 = self.network(data1[0], 2)
+            output2_2 = self.network(data2[0], 2)
+            output2_1_pred = output2_1['pred']
+            output2_2_pred = output2_2['pred']
+        
+        pseudo_mask2 = []
+        pseudo_mask1 = []
+
+        for i in range(len(output1_1_pred)):
+            mask_coords = [x//(2**i) for x in mask_coords]
+
+            softmaxed1_1 = torch.nn.functional.softmax(output1_1_pred[i], dim=1)
+            argmaxed1_1 = torch.argmax(softmaxed1_1, dim=1, keepdim=True)
+            softmaxed1_2 = torch.nn.functional.softmax(output1_2_pred[i], dim=1)
+            argmaxed1_2 = torch.argmax(softmaxed1_2, dim=1, keepdim=True)
+            pseudo_mask1.append(cutmix(argmaxed1_1, argmaxed1_2, mask_coords))
+
+            softmaxed2_1 = torch.nn.functional.softmax(output2_1_pred[i], dim=1)
+            argmaxed2_1 = torch.argmax(softmaxed2_1, dim=1, keepdim=True)
+            softmaxed2_2 = torch.nn.functional.softmax(output2_2_pred[i], dim=1)
+            argmaxed2_2 = torch.argmax(softmaxed2_2, dim=1, keepdim=True)
+            pseudo_mask2.append(cutmix(argmaxed2_1, argmaxed2_2, mask_coords))
+        
+        fake1 = torch.nn.functional.one_hot(pseudo_mask1[0].squeeze(1), num_classes=4).permute(0, 3, 1, 2).float()
+        fake2 = torch.nn.functional.one_hot(pseudo_mask2[0].squeeze(1), num_classes=4).permute(0, 3, 1, 2).float()
+        #fake1 = torch.cat([fake1, cutmixed_img[0]], dim=1)
+        #fake2 = torch.cat([fake2, cutmixed_img[0]], dim=1)
+
+        output1 = self.network(cutmixed_img[0], 1)
+        output2 = self.network(cutmixed_img[0], 2)
+
+        loss_data1 = self.compute_losses_unlabeled(x=cutmixed_img, output=output1, target=pseudo_mask2, fake=fake1)
+        loss_data2 = self.compute_losses_unlabeled(x=cutmixed_img, output=output2, target=pseudo_mask1, fake=fake2)
+
+        loss_data = self.consolidate_loss_data(loss_data1, loss_data2, log=False)
+        return loss_data, fake1.detach(), fake2.detach()
+
+    def get_cps_loss(self, data):
+        with torch.no_grad():
+            output1 = self.network(data[0], 1)
+            output2 = self.network(data[0], 2)
+
+        output1_pred = output1['pred']
+        output2_pred = output2['pred']
+        
+        pseudo_mask2 = []
+        pseudo_mask1 = []
+
+        for i in range(len(output1_pred)):
+            softmaxed1 = torch.nn.functional.softmax(output1_pred[i], dim=1)
+            pseudo_mask1.append(torch.argmax(softmaxed1, dim=1, keepdim=True))
+
+            softmaxed2 = torch.nn.functional.softmax(output2_pred[i], dim=1)
+            pseudo_mask2.append(torch.argmax(softmaxed2, dim=1, keepdim=True))
+
+        fake1 = torch.nn.functional.one_hot(pseudo_mask1[0].squeeze(1), num_classes=4).permute(0, 3, 1, 2).float()
+        fake2 = torch.nn.functional.one_hot(pseudo_mask2[0].squeeze(1), num_classes=4).permute(0, 3, 1, 2).float()
+        #fake1 = torch.cat([fake1, data[0]], dim=1)
+        #fake2 = torch.cat([fake2, data[0]], dim=1)
+
+        loss_data1 = self.compute_losses_unlabeled(x=data, output=output1, target=pseudo_mask2, fake=fake1)
+        loss_data2 = self.compute_losses_unlabeled(x=data, output=output2, target=pseudo_mask1, fake=fake2)
+
+        loss_data = self.consolidate_loss_data(loss_data1, loss_data2, log=False)
+        return loss_data, fake1.detach(), fake2.detach()
+    
+    def get_confidence(self, data):
+        with torch.no_grad():
+            output = self.network(data[0], 1)
+
+            output_pred = output['pred']
+            pseudo_mask = []
+
+            for i in range(len(output_pred)):
+                softmaxed1 = torch.nn.functional.softmax(output_pred[i], dim=1)
+                pseudo_mask.append(torch.argmax(softmaxed1, dim=1, keepdim=True))
+
+            fake = torch.nn.functional.one_hot(pseudo_mask[0].squeeze(1), num_classes=4).permute(0, 3, 1, 2).float()
+
+            _, confidence = self.get_adversarial_loss_unlabeled(self.discriminator, fake)
+            confidence = confidence[0].detach()
+
+            return confidence
+
+    def consolidate_only_one_loss_data(self, loss_data, log):
+        loss = 0
+        for key, value in loss_data.items():
+            if log:
+                self.writer.add_scalar('Iteration/' + key + ' loss', value[1], self.iter_nb)
+            loss += value[0] * value[1]
+        if log:
+            self.writer.add_scalars('Iteration/loss weights', {key:value[0] for key, value in loss_data.items()}, self.iter_nb)
+            self.writer.add_scalar('Iteration/Training loss', loss, self.iter_nb)
+        return loss
+
+    def consolidate_loss_data(self, loss_data1, loss_data2, log, description=None, w1=1, w2=1):
+        loss_data_consolidated = self.setup_loss_data()
+        for (key1, value1), (key2, value2) in zip(loss_data1.items(), loss_data2.items()):
+            assert key1 == key2
+            loss_data_consolidated[key1][1] = w1 * value1[1] + w2 * value2[1]
+            if log:
+                self.writer.add_scalar('Iteration/' + description + key1 + ' loss', loss_data_consolidated[key1][1], self.iter_nb)
+        return loss_data_consolidated
+    
+    def convert_loss_data_to_number(self, loss_data):
+        loss = 0
+        for key, value in loss_data.items():
+            loss += value[0] * value[1]
+        return loss
+            
+    def run_iteration_unlabeled(self, tr_generator, un_generator, do_backprop, run_online_evaluation=False):
+        """
+        gradient clipping improves training stability
+
+        :param data_generator:
+        :param do_backprop:
+        :param run_online_evaluation:
+        :return:
+        """
+        tr_data_dict1 = next(tr_generator)
+        un_data_dict1 = next(un_generator)
+
+        if self.cutmix:
+            #tr_data_dict2 = next(tr_generator)
+            #tr_data2 = tr_data_dict2['data']
+            #tr_data2 = maybe_to_torch(tr_data2)
+            un_data_dict2 = next(un_generator)
+            un_data2 = un_data_dict2['data']
+            un_data2 = maybe_to_torch(un_data2)
+            if torch.cuda.is_available():
+                #tr_data2 = to_cuda(tr_data2)
+                un_data2 = to_cuda(un_data2)
+
+
+        tr_data1 = tr_data_dict1['data']
+        tr_target1 = tr_data_dict1['target']
+        un_data1 = un_data_dict1['data']
+
+        #matplotlib.use('QtAgg')
+        #fig, ax = plt.subplots(1, 3)
+        #ax[0].imshow(un_data[0][0, 0], cmap='gray')
+        #ax[1].imshow(tr_data[0][0, 0], cmap='gray')
+        #ax[2].imshow(tr_target1[0][0, 0], cmap='gray')
+        #plt.show()
+
+        tr_data1 = maybe_to_torch(tr_data1)
+        un_data1 = maybe_to_torch(un_data1)
+        tr_target1 = maybe_to_torch(tr_target1)
+
+        if torch.cuda.is_available():
+            tr_data1 = to_cuda(tr_data1)
+            un_data1 = to_cuda(un_data1)
+            tr_target1 = to_cuda(tr_target1)
+
+        if self.adversarial_loss:
+            if do_backprop:
+                self.discriminator.train()
+            else:
+                self.discriminator.eval()
+
+        self.optimizer.zero_grad()
+
+        if self.cutmix:
+            un_loss_data, un_fake1, un_fake2 = self.get_cps_loss_cutmix(un_data1, un_data2)
+            #tr_loss_data, tr_fake1, tr_fake2, confidence = self.get_cps_loss_cutmix(tr_data1, tr_data2)
+        else:
+            un_loss_data, un_fake1, un_fake2 = self.get_cps_loss(un_data1)
+            #tr_loss_data, tr_fake1, tr_fake2, confidence = self.get_cps_loss(tr_data1)
+        #cps_loss_data = self.consolidate_loss_data(un_loss_data, tr_loss_data, log=False)
+        self.writer.add_scalar('Iteration/Whole cps loss', self.convert_loss_data_to_number(un_loss_data), self.iter_nb)
+        #del un_loss_data, tr_loss_data
+
+        l_output1 = self.network(tr_data1[0], 1)
+        l_output2 = self.network(tr_data1[0], 2)
+
+        s_loss_data1 = self.compute_losses(x=tr_data1, output=l_output1, target=tr_target1, do_backprop=do_backprop)
+        s_loss_data2 = self.compute_losses(x=tr_data1, output=l_output2, target=tr_target1, do_backprop=do_backprop)
+        s_loss_data = self.consolidate_loss_data(s_loss_data1, s_loss_data2, log=False)
+        self.writer.add_scalar('Iteration/Whole supervised loss', self.convert_loss_data_to_number(s_loss_data), self.iter_nb)
+        del s_loss_data1, s_loss_data2
+
+        l_loss_data = self.consolidate_loss_data(s_loss_data, un_loss_data, log=do_backprop, description='Whole ', w1=1, w2=self.unlabeled_loss_weight)
+        self.writer.add_scalars('Iteration/supervised loss weights', {key:value[0] for key, value in l_loss_data.items()}, self.iter_nb)
+
+        l = self.convert_loss_data_to_number(l_loss_data)
+
+        if do_backprop:
+            self.writer.add_scalar('Iteration/Training loss', l, self.iter_nb)
+            self.val_loss.append(l.detach().cpu())
+            l.backward()
+            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+            self.optimizer.step()
+
+            if self.adversarial_loss:
+                real = torch.nn.functional.one_hot(tr_target1[0].squeeze(1).long(), num_classes=4).permute(0, 3, 1, 2).float()
+                #real = torch.cat([real, tr_data1[0]], dim=1)
+                #fake = [un_fake1, un_fake2, tr_fake1, tr_fake2]
+                fake = [un_fake1, un_fake2]
+                discriminator_loss = self.learn_discriminator_unlabeled(self.discriminator, self.discriminator_optimizer, real, fake)
+                self.writer.add_scalar('Discriminator/discriminator_loss', discriminator_loss, self.iter_nb)
+        else:
+            #if self.vq_vae:
+            #    self.writer.add_scalar('Iteration/Perplexity', output['perplexity'], self.iter_nb)
+            self.train_loss.append(l.detach().cpu())
+
+        if run_online_evaluation:
+            confidence = self.get_confidence(tr_data1)
+            self.run_online_evaluation(data=tr_data1, target=tr_target1, output=l_output1, gt_df=None, classification_gt=None, confidence=confidence)
+        del tr_data1, un_data1, tr_target1
 
         if do_backprop:
             self.iter_nb += 1
@@ -1076,7 +1564,19 @@ class nnMTLTrainerV2(nnUNetTrainer):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-
+    def get_mms_split_indices(self, all_keys_sorted):
+        train_indices = []
+        test_indices = []
+        patient_dirs_test = subfolders(os.path.join(Path.cwd(), 'OpenDataset', 'Testing'))
+        patient_dirs_val = subfolders(os.path.join(Path.cwd(), 'OpenDataset', 'Validation'))
+        test_paths = patient_dirs_test + patient_dirs_val
+        test_id = [x.split(os.sep)[-1] for x in test_paths]
+        for idx, string_id in enumerate(all_keys_sorted):
+            if any(string_id.split('_')[0] in x for x in test_id):
+                test_indices.append(idx)
+            else:
+                train_indices.append(idx)
+        return train_indices, test_indices
 
     def do_split(self):
         """
@@ -1092,27 +1592,57 @@ class nnMTLTrainerV2(nnUNetTrainer):
         if self.fold == "all":
             # if fold==all then we use all images for training and validation
             tr_keys = val_keys = list(self.dataset.keys())
+            if self.unlabeled:
+                un_tr_keys, un_val_keys= list(self.unlabeled_dataset.keys())
         else:
             splits_file = join(self.dataset_directory, "splits_final.pkl")
 
             # if the split file does not exist we need to create it
             if not isfile(splits_file):
-                self.print_to_log_file("Creating new 5-fold cross-validation split...")
                 splits = []
-                all_keys_sorted = np.sort(list(self.dataset.keys()))
-                kfold = KFold(n_splits=5, shuffle=True, random_state=12345)
-                for i, (train_idx, test_idx) in enumerate(kfold.split(all_keys_sorted)):
+                if '026' in self.dataset_directory:
+                    self.print_to_log_file("Creating new M&Ms split...")
+                    all_keys_sorted = np.sort(list(self.dataset.keys()))
+                    splits.append(OrderedDict())
+                    train_idx, test_idx = self.get_mms_split_indices(all_keys_sorted)
                     train_keys = np.array(all_keys_sorted)[train_idx]
                     test_keys = np.array(all_keys_sorted)[test_idx]
-                    splits.append(OrderedDict())
                     splits[-1]['train'] = train_keys
                     splits[-1]['val'] = test_keys
+                else:
+                    self.print_to_log_file("Creating new 5-fold cross-validation split...")
+                    all_keys_sorted = np.sort(list(self.dataset.keys()))
+                    kfold = KFold(n_splits=5, shuffle=True, random_state=12345)
+                    for i, (train_idx, test_idx) in enumerate(kfold.split(all_keys_sorted)):
+                        train_keys = np.array(all_keys_sorted)[train_idx]
+                        test_keys = np.array(all_keys_sorted)[test_idx]
+                        splits.append(OrderedDict())
+                        splits[-1]['train'] = train_keys
+                        splits[-1]['val'] = test_keys
                 save_pickle(splits, splits_file)
-
             else:
                 self.print_to_log_file("Using splits from existing split file:", splits_file)
                 splits = load_pickle(splits_file)
                 self.print_to_log_file("The split file contains %d splits." % len(splits))
+            
+            if self.unlabeled:
+                un_splits_file = join(self.dataset_directory, "unlabeled_splits_final.pkl")
+                if not isfile(un_splits_file):
+                    self.print_to_log_file("Creating new unlabeled train test split...")
+                    un_tr_keys, un_val_keys = train_test_split(list(self.unlabeled_dataset.keys()), test_size=int(len(all_keys_sorted) / 5), random_state=12345, shuffle=True)
+                    un_train_test_split = OrderedDict()
+                    un_train_test_split['un_train'] = un_tr_keys
+                    un_train_test_split['un_val'] = un_val_keys
+                    save_pickle(un_train_test_split, un_splits_file)
+                else:
+                    self.print_to_log_file("Using splits from existing unlabeled train test split file:", un_splits_file)
+                    un_train_test_split = load_pickle(un_splits_file)
+
+            if self.unlabeled:
+                un_tr_keys = un_train_test_split['un_train']
+                un_val_keys = un_train_test_split['un_val']
+                self.print_to_log_file("This unlabeled train test split has %d training and %d validation cases."
+                                       % (len(un_tr_keys), len(un_val_keys)))
 
             self.print_to_log_file("Desired fold for training: %d" % self.fold)
             if self.fold < len(splits):
@@ -1142,6 +1672,16 @@ class nnMTLTrainerV2(nnUNetTrainer):
         self.dataset_val = OrderedDict()
         for i in val_keys:
             self.dataset_val[i] = self.dataset[i]
+        
+        if self.unlabeled:
+            un_tr_keys.sort()
+            un_val_keys.sort()
+            self.dataset_un_tr = OrderedDict()
+            for i in un_tr_keys:
+                self.dataset_un_tr[i] = self.unlabeled_dataset[i]
+            self.dataset_un_val = OrderedDict()
+            for i in un_val_keys:
+                self.dataset_un_val[i] = self.unlabeled_dataset[i]
 
     def setup_DA_params(self):
         """
@@ -1188,6 +1728,12 @@ class nnMTLTrainerV2(nnUNetTrainer):
                                                              self.data_aug_params['scale_range'])
 
         self.data_aug_params["scale_range"] = (0.7, 1.4)
+        self.data_aug_params["noise_p"] = 0.1
+        self.data_aug_params["blur_p"] = 0.2
+        self.data_aug_params["mult_brightness_p"] = 0.15
+        self.data_aug_params["constrast_p"] = 0.15
+        self.data_aug_params["low_res_p"] = 0.25
+        self.data_aug_params["inverted_gamma_p"] = 0.1
         self.data_aug_params["do_elastic"] = False
         self.data_aug_params['selected_seg_channels'] = [0]
         self.data_aug_params['patch_size_for_spatialtransform'] = self.patch_size
@@ -1209,15 +1755,24 @@ class nnMTLTrainerV2(nnUNetTrainer):
             if self.config['scheduler'] == 'cosine':
                 self.lr_scheduler.step()
                 if self.adversarial_loss:
-                    self.seg_discriminator_scheduler.step()
-                    self.rec_discriminator_scheduler.step()
+                    self.discriminator_scheduler.step()
+                    #if self.unlabeled:
+                    #else:
+                    #    self.seg_discriminator_scheduler.step()
+                    #    self.rec_discriminator_scheduler.step()
             else:
                 self.optimizer.param_groups[0]['lr'] = poly_lr(ep, self.max_num_epochs, self.initial_lr, 0.9)
                 if self.adversarial_loss:
-                    self.seg_discriminator_optimizer.param_groups[0]['lr'] = poly_lr(ep, self.max_num_epochs, self.discriminator_lr, 0.9)
-                    self.rec_discriminator_optimizer.param_groups[0]['lr'] = poly_lr(ep, self.max_num_epochs, self.discriminator_lr, 0.9)
+                    self.discriminator_optimizer.param_groups[0]['lr'] = poly_lr(ep, self.max_num_epochs, self.discriminator_lr, 0.9)
+                    #if self.unlabeled:
+                    #else:
+                    #    self.seg_discriminator_optimizer.param_groups[0]['lr'] = poly_lr(ep, self.max_num_epochs, self.discriminator_lr, 0.9)
+                    #    self.rec_discriminator_optimizer.param_groups[0]['lr'] = poly_lr(ep, self.max_num_epochs, self.discriminator_lr, 0.9)
             if self.adversarial_loss:
-                lrs = {'Unet_lr': self.optimizer.param_groups[0]['lr'], 'discriminator_lr': self.seg_discriminator_optimizer.param_groups[0]['lr']}
+                lrs = {'Unet_lr': self.optimizer.param_groups[0]['lr'], 'discriminator_lr': self.discriminator_optimizer.param_groups[0]['lr']}
+                #if self.unlabeled:
+                #else:
+                #    lrs = {'Unet_lr': self.optimizer.param_groups[0]['lr'], 'seg_discriminator_lr': self.seg_discriminator_optimizer.param_groups[0]['lr'], 'rec_discriminator_lr': self.rec_discriminator_optimizer.param_groups[0]['lr']}
                 self.writer.add_scalars('Epoch/Learning rate', lrs, self.epoch)
             else:
                 self.writer.add_scalar('Epoch/Learning rate', self.optimizer.param_groups[0]['lr'], self.epoch)
@@ -1226,8 +1781,11 @@ class nnMTLTrainerV2(nnUNetTrainer):
             if not self.config['scheduler'] == 'cosine':
                 self.optimizer.param_groups[0]['lr'] = poly_lr(ep, self.max_num_epochs, self.initial_lr, 0.9)
                 if self.adversarial_loss:
-                    self.seg_discriminator_optimizer.param_groups[0]['lr'] = poly_lr(ep, self.max_num_epochs, self.discriminator_lr, 0.9)
-                    self.rec_discriminator_optimizer.param_groups[0]['lr'] = poly_lr(ep, self.max_num_epochs, self.discriminator_lr, 0.9)
+                    self.discriminator_optimizer.param_groups[0]['lr'] = poly_lr(ep, self.max_num_epochs, self.discriminator_lr, 0.9)
+                    #if self.unlabeled:
+                    #else:
+                    #    self.seg_discriminator_optimizer.param_groups[0]['lr'] = poly_lr(ep, self.max_num_epochs, self.discriminator_lr, 0.9)
+                    #    self.rec_discriminator_optimizer.param_groups[0]['lr'] = poly_lr(ep, self.max_num_epochs, self.discriminator_lr, 0.9)
 
         self.print_to_log_file("lr:", np.round(self.optimizer.param_groups[0]['lr'], decimals=6))
 
@@ -1239,11 +1797,11 @@ class nnMTLTrainerV2(nnUNetTrainer):
         super().on_epoch_end()
         continue_training = self.epoch < self.max_num_epochs
 
-        if self.config['progressive_similarity_growing']:
-            epoch_threshold = self.max_num_epochs / 20
-            if self.epoch + 1 <= epoch_threshold:
-                a = self.config['similarity_weight'] / epoch_threshold
-                self.loss_data['similarity'][0] = a * (self.epoch + 1)
+        #if self.config['progressive_similarity_growing']:
+        #    epoch_threshold = self.max_num_epochs / 20
+        #    if self.epoch + 1 <= epoch_threshold:
+        #        a = self.config['similarity_weight'] / epoch_threshold
+        #        self.loss_data['similarity'][0] = a * (self.epoch + 1)
 
 
         # it can rarely happen that the momentum of nnUNetTrainerV2 is too high for some dataset. If at epoch 100 the
@@ -1273,8 +1831,129 @@ class nnMTLTrainerV2(nnUNetTrainer):
         ret = super().run_training()
         self.network.do_ds = ds
         return ret
-    
 
+    
+    def run_training_unlabeled(self):
+        """
+        if we run with -c then we need to set the correct lr for the first epoch, otherwise it will run the first
+        continued epoch with self.initial_lr
+
+        we also need to make sure deep supervision in the network is enabled for training, thus the wrapper
+        :return:
+        """
+        self.maybe_update_lr(self.epoch)  # if we dont overwrite epoch then self.epoch+1 is used which is not what we
+        # want at the start of the training
+        ds = self.network.do_ds
+        self.network.do_ds = True
+        ret = self.training_unlabeled()
+        self.network.do_ds = ds
+        return ret
+
+
+    def training_unlabeled(self):
+        if not torch.cuda.is_available():
+            self.print_to_log_file("WARNING!!! You are attempting to run training on a CPU (torch.cuda.is_available() is False). This can be VERY slow!")
+
+        _ = self.tr_gen.next()
+        _ = self.val_gen.next()
+        _ = self.tr_un_gen.next()
+        _ = self.val_un_gen.next()
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        self._maybe_init_amp()
+
+        maybe_mkdir_p(self.output_folder)        
+        self.plot_network_architecture()
+
+        if cudnn.benchmark and cudnn.deterministic:
+            warn("torch.backends.cudnn.deterministic is True indicating a deterministic training is desired. "
+                 "But torch.backends.cudnn.benchmark is True as well and this will prevent deterministic training! "
+                 "If you want deterministic then set benchmark=False")
+
+        if not self.was_initialized:
+            self.initialize(True)
+
+        while self.epoch < self.max_num_epochs:
+            self.print_to_log_file("\nepoch: ", self.epoch)
+            epoch_start_time = time()
+            train_losses_epoch = []
+
+            # train one epoch
+            self.network.train()
+
+            if self.use_progress_bar:
+                with trange(self.num_batches_per_epoch) as tbar:
+                    for b in tbar:
+                        tbar.set_description("Epoch {}/{}".format(self.epoch+1, self.max_num_epochs))
+
+                        l = self.run_iteration_unlabeled(self.tr_gen, un_generator=self.tr_un_gen, do_backprop=True)
+
+                        tbar.set_postfix(loss=l)
+                        train_losses_epoch.append(l)
+            else:
+                for _ in range(self.num_batches_per_epoch):
+                    l = self.run_iteration_unlabeled(self.tr_gen, un_generator=self.tr_un_gen, do_backprop=True)
+                    train_losses_epoch.append(l)
+
+            self.all_tr_losses.append(np.mean(train_losses_epoch))
+            self.print_to_log_file("train loss : %.4f" % self.all_tr_losses[-1])
+
+            if self.epoch % self.config['epoch_log'] == 0:
+                with torch.no_grad():
+                    # validation with train=False
+                    self.network.eval()
+                    val_losses = []
+                    for b in range(self.num_val_batches_per_epoch):
+                        l = self.run_iteration_unlabeled(self.val_gen, un_generator=self.val_un_gen, do_backprop=False, run_online_evaluation=True)
+                        val_losses.append(l)
+                    self.all_val_losses.append(np.mean(val_losses))
+                    self.print_to_log_file("validation loss: %.4f" % self.all_val_losses[-1])
+
+                    if self.also_val_in_tr_mode:
+                        self.network.train()
+                        # validation with train=True
+                        val_losses = []
+                        for b in range(self.num_val_batches_per_epoch):
+                            l = self.run_iteration_unlabeled(self.val_gen, un_generator=self.val_un_gen, do_backprop=False)
+                            val_losses.append(l)
+                        self.all_val_losses_tr_mode.append(np.mean(val_losses))
+                        self.print_to_log_file("validation loss (train=True): %.4f" % self.all_val_losses_tr_mode[-1])
+                    
+                    self.finish_online_evaluation()
+            #self.update_train_loss_MA()  # needed for lr scheduler and stopping of training
+
+            continue_training = True
+            #continue_training = self.on_epoch_end()
+
+            self.maybe_update_lr()
+            self.maybe_save_checkpoint()
+
+            epoch_end_time = time()
+
+            if not continue_training:
+                # allows for early stopping
+                break
+
+            self.epoch += 1
+            self.print_to_log_file("This epoch took %f s\n" % (epoch_end_time - epoch_start_time))
+
+        self.epoch -= 1  # if we don't do this we can get a problem with loading model_final_checkpoint.
+
+        if self.save_final_checkpoint: self.save_checkpoint(join(self.output_folder, "model_final_checkpoint.model"))
+        # now we can delete latest as it will be identical with final
+        if isfile(join(self.output_folder, "model_latest.model")):
+            os.remove(join(self.output_folder, "model_latest.model"))
+        if isfile(join(self.output_folder, "model_latest.model.pkl")):
+            os.remove(join(self.output_folder, "model_latest.model.pkl"))
+
+    
+    def load_dataset(self):
+        self.dataset = load_dataset(self.folder_with_preprocessed_data)
+        if self.unlabeled:
+            self.unlabeled_dataset = load_unlabeled_dataset(self.folder_with_preprocessed_data)
+    
     def get_basic_generators(self):
         self.load_dataset()
         self.do_split()
@@ -1292,19 +1971,80 @@ class nnMTLTrainerV2(nnUNetTrainer):
             dl_val = DataLoader2D(self.dataset_val, self.patch_size, self.patch_size, self.batch_size,
                                 oversample_foreground_percent=self.oversample_foreground_percent,
                                 pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r', classification=self.classification)
-        return dl_tr, dl_val
+            if self.unlabeled:
+                dl_un_tr = DataLoader2DUnlabeled(self.dataset_un_tr, self.basic_generator_patch_size, self.patch_size, self.batch_size,
+                                            oversample_foreground_percent=self.oversample_foreground_percent,
+                                            pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r', classification=self.classification)
+                dl_un_val = DataLoader2DUnlabeled(self.dataset_un_val, self.basic_generator_patch_size, self.patch_size, self.batch_size,
+                                            oversample_foreground_percent=self.oversample_foreground_percent,
+                                            pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r', classification=self.classification)
+            else:
+                dl_un_tr = None
+                dl_un_val = None
+        return dl_tr, dl_val, dl_un_tr, dl_un_val
 
 
-    def get_adversarial_loss(self, discriminator, discriminator_optimizer, real, fake, iter_nb, do_backprop):
+    def learn_discriminator_unlabeled(self,  discriminator, discriminator_optimizer, real, fakes):
+        B, C, H, W = real.shape
+        label = torch.full((B, 1, H, W), 1, dtype=torch.float, device=real.device)
+        discriminator.zero_grad()
+        discriminator_optimizer.zero_grad()
+        output_real = discriminator(real)[0]
+        loss_real = self.adv_loss(output_real, label)
+        self.writer.add_scalar('Discriminator/real', output_real.mean(), self.iter_nb)
+        #loss_real.backward() #retain_graph if reuse output of discriminator for r1 penalty
+
+        r1_penalty = 0
+        #if iter_nb % self.r1_penalty_iteration == 0:
+        #    r1_penalty = logisticGradientPenalty(real, discriminator, weight=5)
+    
+        loss_real_r1 = loss_real + r1_penalty
+        loss_real_r1.backward()
+
+        label.fill_(0)
+        loss_fake = 0
+        log_output_fake = 0
+        for fake in fakes:
+            assert fake.size() == real.size()
+
+            output_fake = discriminator(fake.detach())[0]
+            log_output_fake += output_fake.mean()
+            current_loss_fake = self.adv_loss(output_fake, label).clone()
+            loss_fake = loss_fake + current_loss_fake
+        loss_fake = loss_fake / len(fakes)
+        self.writer.add_scalar('Discriminator/fake', log_output_fake / len(fakes), self.iter_nb)
+
+        loss_fake.backward()
+        discriminator_loss = loss_real + loss_fake + r1_penalty
+        discriminator_optimizer.step()
+        
+        return discriminator_loss
+    
+    def get_adversarial_loss_unlabeled(self, discriminator, fake):
+        B, C, H, W = fake.shape
+        label = torch.full((B, 1, H, W), 1, dtype=torch.float, device=fake.device)
+
+        output = discriminator(fake)
+        adversarial_loss = self.adv_loss(output[0], label)
+
+        w_list = []
+        for i in range(len(output)):
+            w = output[i].numel() * (output[i] / output[i].sum())
+            w_list.append(w)
+
+        return adversarial_loss, w_list
+
+    def get_adversarial_loss(self, discriminator, discriminator_optimizer, real, fake, do_backprop):
         discriminator_loss = None
         adversarial_loss = None
+        output_real = None
+        output_fake = None
         label = torch.full((self.batch_size,), 1, dtype=torch.float, device=real.device)
         if do_backprop:
             discriminator.zero_grad()
             discriminator_optimizer.zero_grad()
             output_real = discriminator(real).reshape(-1)
             loss_real = self.adv_loss(output_real, label)
-            #self.writer.add_scalar('Iteration/Discriminator real', output_real.mean(), iter_nb)
             #loss_real.backward() #retain_graph if reuse output of discriminator for r1 penalty
 
             r1_penalty = 0
@@ -1318,7 +2058,6 @@ class nnMTLTrainerV2(nnUNetTrainer):
             label.fill_(0)
             output_fake = discriminator(fake.detach()).view(-1)
             loss_fake = self.adv_loss(output_fake, label)
-            #self.writer.add_scalar('Iteration/Discriminator fake', output_fake.mean(), iter_nb)
             loss_fake.backward()
 
             discriminator_loss = loss_real + loss_fake + r1_penalty
@@ -1330,5 +2069,4 @@ class nnMTLTrainerV2(nnUNetTrainer):
         output = discriminator(fake).view(-1)
         adversarial_loss = self.adv_loss(output, label)
 
-        return adversarial_loss, discriminator_loss
-    
+        return adversarial_loss, discriminator_loss, output_real, output_fake

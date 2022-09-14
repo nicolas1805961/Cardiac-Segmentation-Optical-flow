@@ -88,6 +88,7 @@ def verify_contains_only_expected_labels(itk_img: str, valid_labels: (tuple, lis
 
 
 def verify_dataset_integrity(folder):
+    print(folder)
     """
     folder needs the imagesTr, imagesTs and labelsTr subfolders. There also needs to be a dataset.json
     checks if all training cases and labels are present
@@ -159,10 +160,10 @@ def verify_dataset_integrity(folder):
         nii_files_in_labelsTr.remove(os.path.basename(expected_label_file))
 
     # check for stragglers
-    assert len(
-        nii_files_in_imagesTr) == 0, "there are training cases in imagesTr that are not listed in dataset.json: %s" % nii_files_in_imagesTr
-    assert len(
-        nii_files_in_labelsTr) == 0, "there are training cases in labelsTr that are not listed in dataset.json: %s" % nii_files_in_labelsTr
+    #assert len(
+    #    nii_files_in_imagesTr) == 0, "there are training cases in imagesTr that are not listed in dataset.json: %s" % nii_files_in_imagesTr
+    #assert len(
+    #    nii_files_in_labelsTr) == 0, "there are training cases in labelsTr that are not listed in dataset.json: %s" % nii_files_in_labelsTr
 
     # verify that only properly declared values are present in the labels
     print("Verifying label values")
@@ -218,13 +219,14 @@ def verify_dataset_integrity(folder):
             # now remove checked files from the lists nii_files_in_imagesTr and nii_files_in_labelsTr
             for i in expected_image_files:
                 nii_files_in_imagesTs.remove(os.path.basename(i))
-        assert len(
-            nii_files_in_imagesTs) == 0, "there are training cases in imagesTs that are not listed in dataset.json: %s" % nii_files_in_imagesTr
+        #assert len(
+        #    nii_files_in_imagesTs) == 0, "there are training cases in imagesTs that are not listed in dataset.json: %s" % nii_files_in_imagesTr
 
     all_same, unique_orientations = verify_all_same_orientation(join(folder, "imagesTr"))
     if not all_same:
         print(
             "WARNING: Not all images in the dataset have the same axis ordering. We very strongly recommend you correct that by reorienting the data. fslreorient2std should do the trick")
+        print(unique_orientations)
     # save unique orientations to dataset.json
     if not geometries_OK:
         raise Warning("GEOMETRY MISMATCH FOUND! CHECK THE TEXT OUTPUT! This does not cause an error at this point  but you should definitely check whether your geometries are alright!")

@@ -705,7 +705,6 @@ class SegmentationNetwork(NeuralNetwork):
             for y in steps[1]:
                 lb_y = y
                 ub_y = y + patch_size[1]
-
                 predicted_patch = self._internal_maybe_mirror_and_pred_2D(
                     data[None, :, lb_x:ub_x, lb_y:ub_y], mirror_axes, do_mirroring,
                     gaussian_importance_map)[0]

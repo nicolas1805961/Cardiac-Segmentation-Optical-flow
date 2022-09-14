@@ -28,6 +28,8 @@ from nnunet.paths import *
 from nnunet.preprocessing.preprocessing import PreprocessorFor2D
 from nnunet.training.model_restore import recursive_find_python_class
 
+import sys
+
 
 class ExperimentPlanner2D(ExperimentPlanner):
     def __init__(self, folder_with_cropped_data, preprocessed_output_folder):

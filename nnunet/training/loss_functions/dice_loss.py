@@ -18,7 +18,7 @@ from nnunet.training.loss_functions.focal_loss import FocalLoss
 from nnunet.training.loss_functions.TopK_loss import TopKLoss
 from nnunet.training.loss_functions.crossentropy import RobustCrossEntropyLoss
 from nnunet.utilities.nd_softmax import softmax_helper
-from nnunet.utilities.tensor_utilities import sum_tensor
+from nnunet.utilities.tensor_utilities import sum_tensor, mean_tensor
 from torch import nn
 import numpy as np
 
@@ -152,6 +152,50 @@ def get_tp_fp_fn_tn(net_output, gt, axes=None, mask=None, square=False):
         tn = sum_tensor(tn, axes, keepdim=False)
 
     return tp, fp, fn, tn
+
+
+class SoftDiceLossWeighted(nn.Module):
+    def __init__(self, apply_nonlin=None, batch_dice=False, do_bg=True, smooth=1.):
+        """
+        """
+        super(SoftDiceLossWeighted, self).__init__()
+
+        self.do_bg = do_bg
+        self.batch_dice = batch_dice
+        self.apply_nonlin = apply_nonlin
+        self.smooth = smooth
+
+    def forward(self, x, y, weights, loss_mask=None):
+        shp_x = x.shape
+
+        if self.batch_dice:
+            axes = [0] + list(range(2, len(shp_x)))
+        else:
+            axes = list(range(2, len(shp_x)))
+
+        if self.apply_nonlin is not None:
+            x = self.apply_nonlin(x)
+
+        tp, fp, fn, _ = get_tp_fp_fn_tn(x, y, axes=[], mask=loss_mask, square=False)
+
+        nominator = 2 * tp + self.smooth
+        denominator = 2 * tp + fp + fn + self.smooth
+
+        dc = nominator / (denominator + 1e-8)
+
+        dc = dc * weights
+
+        if len(axes) > 0:
+            dc = mean_tensor(dc, axes, keepdim=False)
+
+        if not self.do_bg:
+            if self.batch_dice:
+                dc = dc[1:]
+            else:
+                dc = dc[:, 1:]
+        dc = dc.mean()
+
+        return 1 - dc
 
 
 class SoftDiceLoss(nn.Module):
@@ -374,6 +418,65 @@ class DC_and_CE_loss(nn.Module):
             dc_loss = -torch.log(-dc_loss)
 
         ce_loss = self.ce(net_output, target[:, 0].long()) if self.weight_ce != 0 else 0
+        if self.ignore_label is not None:
+            ce_loss *= mask[:, 0]
+            ce_loss = ce_loss.sum() / mask.sum()
+
+        if self.aggregate == "sum":
+            result = self.weight_ce * ce_loss + self.weight_dice * dc_loss
+        else:
+            raise NotImplementedError("nah son") # reserved for other stuff (later)
+        return result
+
+
+class DC_and_CE_loss_Weighted(nn.Module):
+    def __init__(self, soft_dice_kwargs, ce_kwargs, aggregate="sum", square_dice=False, weight_ce=1, weight_dice=1,
+                 log_dice=False, ignore_label=None):
+        """
+        CAREFUL. Weights for CE and Dice do not need to sum to one. You can set whatever you want.
+        :param soft_dice_kwargs:
+        :param ce_kwargs:
+        :param aggregate:
+        :param square_dice:
+        :param weight_ce:
+        :param weight_dice:
+        """
+        super(DC_and_CE_loss_Weighted, self).__init__()
+        ce_kwargs['reduction'] = 'none'
+        if ignore_label is not None:
+            assert not square_dice, 'not implemented'
+        self.log_dice = log_dice
+        self.weight_dice = weight_dice
+        self.weight_ce = weight_ce
+        self.aggregate = aggregate
+        self.ce = RobustCrossEntropyLoss(**ce_kwargs)
+
+        self.ignore_label = ignore_label
+
+        self.dc = SoftDiceLossWeighted(apply_nonlin=softmax_helper, **soft_dice_kwargs)
+
+    def forward(self, net_output, target, weights):
+        """
+        target must be b, c, x, y(, z) with c=1
+        :param net_output:
+        :param target:
+        :return:
+        """
+        if self.ignore_label is not None:
+            assert target.shape[1] == 1, 'not implemented for one hot encoding'
+            mask = target != self.ignore_label
+            target[~mask] = 0
+            mask = mask.float()
+        else:
+            mask = None
+
+        dc_loss = self.dc(net_output, target, weights=weights, loss_mask=mask) if self.weight_dice != 0 else 0
+        if self.log_dice:
+            dc_loss = -torch.log(-dc_loss)
+
+        ce_loss = self.ce(net_output, target[:, 0].long()) if self.weight_ce != 0 else 0
+        ce_loss = ce_loss * weights
+        ce_loss = ce_loss.mean()
         if self.ignore_label is not None:
             ce_loss *= mask[:, 0]
             ce_loss = ce_loss.sum() / mask.sum()

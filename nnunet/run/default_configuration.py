@@ -18,8 +18,6 @@ from nnunet.paths import network_training_output_dir, preprocessing_output_dir, 
 from batchgenerators.utilities.file_and_folder_operations import *
 from nnunet.experiment_planning.summarize_plans import summarize_plans
 from nnunet.training.model_restore import recursive_find_python_class
-from ..lib.training_utils import read_config
-from pathlib import Path
 import numpy as np
 
 
@@ -35,15 +33,13 @@ def get_configuration_from_output_folder(folder):
 
 
 
-def get_default_configuration(network, task, network_trainer, plans_identifier=default_plans_identifier,
+def get_default_configuration(network, task, network_trainer, config, plans_identifier=default_plans_identifier,
                               search_in=(nnunet.__path__[0], "training", "network_training"),
                               base_module='nnunet.training.network_training'):
     assert network in ['2d', '3d_lowres', '3d_fullres', '3d_cascade_fullres'], \
         "network can only be one of the following: \'2d\', \'3d_lowres\', \'3d_fullres\', \'3d_cascade_fullres\'"
 
     dataset_directory = join(preprocessing_output_dir, task)
-
-    config = read_config(os.path.join(Path.cwd(), 'adversarial_acdc.yaml'))
 
     if network == '2d':
         plans_file = join(preprocessing_output_dir, task, plans_identifier + "_plans_2D.pkl")
