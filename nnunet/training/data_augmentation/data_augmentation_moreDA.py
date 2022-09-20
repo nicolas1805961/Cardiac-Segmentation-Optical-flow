@@ -221,8 +221,6 @@ def get_moreDA_augmentation_mtl(dataloader_train, dataloader_val, dataloader_tra
                             use_nondetMultiThreadedAugmenter: bool = False):
     assert params.get('mirror') is None, "old version of params, use new keyword do_mirror"
 
-    print(params)
-
     tr_transforms = []
     un_tr_transforms = []
 

@@ -25,6 +25,7 @@ import argparse
 def collect_cv_niftis(cv_folder: str, output_folder: str, validation_folder_name: str = 'validation_raw',
                       folds: tuple = (0, 1, 2, 3, 4)):
     validation_raw_folders = [join(cv_folder, "fold_%d" % i, validation_folder_name) for i in folds]
+    print(validation_raw_folders)
     exist = [isdir(i) for i in validation_raw_folders]
 
     if not all(exist):

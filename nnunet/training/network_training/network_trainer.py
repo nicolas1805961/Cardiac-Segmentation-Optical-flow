@@ -483,7 +483,7 @@ class NetworkTrainer(object):
                     for b in tbar:
                         tbar.set_description("Epoch {}/{}".format(self.epoch+1, self.max_num_epochs))
 
-                        l = self.run_iteration(self.tr_gen, do_backprop=True)
+                        l = self.run_iteration(self.tr_gen, True)
 
                         tbar.set_postfix(loss=l)
                         train_losses_epoch.append(l)
@@ -495,36 +495,29 @@ class NetworkTrainer(object):
             self.all_tr_losses.append(np.mean(train_losses_epoch))
             self.print_to_log_file("train loss : %.4f" % self.all_tr_losses[-1])
 
-            if self.epoch % self.config['epoch_log'] == 0:
-                with torch.no_grad():
-                    # validation with train=False
-                    self.network.eval()
+            with torch.no_grad():
+                # validation with train=False
+                self.network.eval()
+                val_losses = []
+                for b in range(self.num_val_batches_per_epoch):
+                    l = self.run_iteration(self.val_gen, False, True)
+                    val_losses.append(l)
+                self.all_val_losses.append(np.mean(val_losses))
+                self.print_to_log_file("validation loss: %.4f" % self.all_val_losses[-1])
+
+                if self.also_val_in_tr_mode:
+                    self.network.train()
+                    # validation with train=True
                     val_losses = []
                     for b in range(self.num_val_batches_per_epoch):
-                        l = self.run_iteration(self.val_gen, do_backprop=False, run_online_evaluation=True)
+                        l = self.run_iteration(self.val_gen, False)
                         val_losses.append(l)
-                    self.all_val_losses.append(np.mean(val_losses))
-                    self.print_to_log_file("validation loss: %.4f" % self.all_val_losses[-1])
+                    self.all_val_losses_tr_mode.append(np.mean(val_losses))
+                    self.print_to_log_file("validation loss (train=True): %.4f" % self.all_val_losses_tr_mode[-1])
 
-                    if self.also_val_in_tr_mode:
-                        self.network.train()
-                        # validation with train=True
-                        val_losses = []
-                        for b in range(self.num_val_batches_per_epoch):
-                            l = self.run_iteration(self.val_gen, do_backprop=False)
-                            val_losses.append(l)
-                        self.all_val_losses_tr_mode.append(np.mean(val_losses))
-                        self.print_to_log_file("validation loss (train=True): %.4f" % self.all_val_losses_tr_mode[-1])
+            self.update_train_loss_MA()  # needed for lr scheduler and stopping of training
 
-                    self.finish_online_evaluation()
-
-            #self.update_train_loss_MA()  # needed for lr scheduler and stopping of training
-
-            continue_training = True
-            #continue_training = self.on_epoch_end()
-
-            self.maybe_update_lr()
-            self.maybe_save_checkpoint()
+            continue_training = self.on_epoch_end()
 
             epoch_end_time = time()
 

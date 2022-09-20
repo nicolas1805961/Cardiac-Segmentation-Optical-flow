@@ -18,6 +18,7 @@ from typing import Tuple
 
 import numpy as np
 import torch
+from copy import copy
 from nnunet.training.data_augmentation.data_augmentation_moreDA import get_moreDA_augmentation
 from nnunet.training.loss_functions.deep_supervision import MultipleOutputLoss2
 from nnunet.utilities.to_torch import maybe_to_torch, to_cuda
@@ -53,7 +54,8 @@ class nnUNetTrainerV2(nnUNetTrainer):
         self.ds_loss_weights = None
 
         timestr = strftime("%Y-%m-%d_%HH%M")
-        self.log_dir = os.path.join(self.output_folder, timestr)
+        self.log_dir = os.path.join(copy(self.output_folder), timestr)
+        self.output_folder = self.log_dir
 
         self.pin_memory = True
 
@@ -299,7 +301,15 @@ class nnUNetTrainerV2(nnUNetTrainer):
                 splits = []
                 all_keys_sorted = np.sort(list(self.dataset.keys()))
                 kfold = KFold(n_splits=5, shuffle=True, random_state=12345)
-                for i, (train_idx, test_idx) in enumerate(kfold.split(all_keys_sorted)):
+                to_split = np.arange(len(all_keys_sorted) / 2)
+                for i, (train_idx, test_idx) in enumerate(kfold.split(to_split)):
+                    train_idx = train_idx * 2
+                    test_idx = test_idx * 2
+                    train_idx = np.concatenate([train_idx, train_idx + 1])
+                    test_idx = np.concatenate([test_idx, test_idx + 1])
+                    train_idx = np.sort(train_idx)
+                    test_idx = np.sort(test_idx)
+                    assert len(train_idx) + len(test_idx) == len(all_keys_sorted)
                     train_keys = np.array(all_keys_sorted)[train_idx]
                     test_keys = np.array(all_keys_sorted)[test_idx]
                     splits.append(OrderedDict())
