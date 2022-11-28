@@ -102,7 +102,10 @@ class ExperimentPlanner2D(ExperimentPlanner):
         target_spacing = self.get_target_spacing()
         new_shapes = np.array([np.array(i) / target_spacing * np.array(j) for i, j in zip(spacings, sizes)])
 
-        max_spacing_axis = np.argmax(target_spacing)
+        if '28' in self.plans_fname:
+            max_spacing_axis = np.argmin(target_spacing)
+        else:
+            max_spacing_axis = np.argmax(target_spacing)
         remaining_axes = [i for i in list(range(3)) if i != max_spacing_axis]
         self.transpose_forward = [max_spacing_axis] + remaining_axes
         self.transpose_backward = [np.argwhere(np.array(self.transpose_forward) == i)[0][0] for i in range(3)]

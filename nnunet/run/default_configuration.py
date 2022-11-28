@@ -51,6 +51,7 @@ def get_default_configuration(network, task, network_trainer, config, plans_iden
 
     if plans_identifier == 'custom_experiment_planner':
         plans['plans_per_stage'][possible_stages[-1]]['batch_size'] = config['batch_size']
+        plans['plans_per_stage'][possible_stages[-1]]['patch_size'] = np.array(config['patch_size'])
         pickle_file = open(plans_file,'wb')
         pickle.dump(plans, pickle_file)
         pickle_file.close()

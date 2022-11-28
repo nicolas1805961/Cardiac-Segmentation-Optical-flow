@@ -20,6 +20,7 @@ import nibabel as nib
 import sys
 import pandas as pd
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 
 def get_labeled_frame_nb(df, external_code):
     ed = int(df['ED'][df['External code'] == external_code])
@@ -33,11 +34,17 @@ def switch_label(label):
     assert len(label.shape) == 3
     out = []
     for i in range(label.shape[-1]):
-        current_label = label[:, :, i]
-        current_label[current_label == 3] = 5
-        current_label[current_label == 1] = 3
-        current_label[current_label == 5] = 1
-        out.append(current_label)
+        out_img = np.zeros_like(label[:, :, i])
+        out_img[label[:, :, i] == 3] = 1
+        out_img[label[:, :, i] == 2] = 2
+        out_img[label[:, :, i] == 1] = 3
+
+        #fig, ax = plt.subplots(1, 2)
+        #ax[0].imshow(label[:, :, i], cmap='gray')
+        #ax[1].imshow(out_img, cmap='gray')
+        #plt.show()
+
+        out.append(out_img)
     out = np.stack(out, axis=-1)
     return out
 
@@ -90,7 +97,7 @@ if __name__ == "__main__":
             original_header = in_nib_img.header
             original_affine = in_nib_img.affine
             img = in_nib_img.get_fdata()
-            label = in_nib_img_gt.get_fdata()
+            label = in_nib_img_gt.get_fdata().astype(int)
             for i in range(img.shape[-1]):
                 if i in labeled_frame_indices:
                     label[:, :, :, i] = switch_label(label[:, :, :, i])

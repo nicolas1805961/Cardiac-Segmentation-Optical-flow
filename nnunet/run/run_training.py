@@ -34,6 +34,8 @@ import torch
 #torch.autograd.set_detect_anomaly(True)
 #warnings.filterwarnings("always", category=UserWarning)
 
+#os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -51,6 +53,10 @@ def main():
                         help="If you set use_compressed_data, the training cases will not be decompressed. Reading compressed data "
                              "is much more CPU and RAM intensive and should only be used if you know what you are "
                              "doing", required=False)
+    parser.add_argument("--middle", default=False, action="store_true",
+                        help="set to true if you want to use middle model", required=False)
+    parser.add_argument("--video", default=False, action="store_true",
+                        help="set to true if you want to use video model", required=False)
     parser.add_argument("--deterministic",
                         help="Makes training deterministic, but reduces training speed substantially. I (Fabian) think "
                              "this is not necessary. Deterministic training will make you overfit to some random seed. "
@@ -103,6 +109,8 @@ def main():
     args = parser.parse_args()
 
     task = args.task
+    middle = args.middle
+    video = args.video
     fold = args.fold
     network = args.network
     network_trainer = args.network_trainer
@@ -143,7 +151,12 @@ def main():
     # else:
     #     raise ValueError("force_separate_z must be None, True or False. Given: %s" % force_separate_z)
 
-    config = read_config(os.path.join(Path.cwd(), 'adversarial_acdc.yaml'))
+    if middle:
+        config = read_config(os.path.join(Path.cwd(), 'adversarial_acdc_middle.yaml'), middle)
+    elif video:
+        config = read_config(os.path.join(Path.cwd(), 'video.yaml'), middle)
+    else:
+        config = read_config(os.path.join(Path.cwd(), 'adversarial_acdc.yaml'), middle)
 
     plans_file, output_folder_name, dataset_directory, batch_dice, stage, \
         trainer_class = get_default_configuration(network, task, network_trainer, config, plans_identifier)
@@ -169,7 +182,7 @@ def main():
                           nnUNetTrainer), "network_trainer was found but is not derived from nnUNetTrainer"
 
     trainer = trainer_class(plans_file, fold, output_folder=output_folder_name, dataset_directory=dataset_directory,
-                            batch_dice=batch_dice, stage=stage, unpack_data=decompress_data,
+                            batch_dice=batch_dice, stage=stage, unpack_data=decompress_data, middle=middle, video=video,
                             deterministic=deterministic,
                             fp16=run_mixed_precision)
     if args.disable_saving:

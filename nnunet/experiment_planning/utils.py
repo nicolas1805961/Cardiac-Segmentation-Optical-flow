@@ -79,6 +79,17 @@ def split_4d(input_folder, num_processes=default_num_threads, overwrite_task_out
     shutil.copy(join(input_folder, "dataset.json"), output_folder)
 
 
+def get_original_path_list(base_folder_splitted):
+    out_list = []
+    json_file = join(base_folder_splitted, "dataset.json")
+    with open(json_file) as jsn:
+        d = json.load(jsn)
+        training_files = d['training']
+    for tr in training_files:
+        out_list.append(tr['original_path'])
+    return out_list
+
+
 def create_lists_from_splitted_dataset(base_folder_splitted):
     lists = []
 
@@ -135,7 +146,7 @@ def get_caseIDs_from_splitted_dataset_folder(folder):
     return files
 
 
-def crop(task_string, override=False, num_threads=default_num_threads):
+def crop(task_string, override=False, num_threads=default_num_threads, get_original_path=False):
     cropped_out_dir = join(nnUNet_cropped_data, task_string)
     maybe_mkdir_p(cropped_out_dir)
 
@@ -146,8 +157,13 @@ def crop(task_string, override=False, num_threads=default_num_threads):
     splitted_4d_output_dir_task = join(nnUNet_raw_data, task_string)
     lists, _ = create_lists_from_splitted_dataset(splitted_4d_output_dir_task)
 
+    if get_original_path:
+        original_path_list = get_original_path_list(splitted_4d_output_dir_task)
+    else:
+        original_path_list = None
+
     imgcrop = ImageCropper(num_threads, cropped_out_dir)
-    imgcrop.run_cropping(lists, overwrite_existing=override)
+    imgcrop.run_cropping(lists, overwrite_existing=override, original_path_list=original_path_list)
     shutil.copy(join(nnUNet_raw_data, task_string, "dataset.json"), cropped_out_dir)
 
 

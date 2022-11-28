@@ -37,6 +37,7 @@ from abc import abstractmethod
 from datetime import datetime
 from tqdm import trange
 from nnunet.utilities.to_torch import maybe_to_torch, to_cuda
+import random
 
 
 class NetworkTrainer(object):
@@ -60,15 +61,22 @@ class NetworkTrainer(object):
         self.amp_grad_scaler = None
 
         if deterministic:
+            random.seed(12345)
             np.random.seed(12345)
             torch.manual_seed(12345)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(12345)
-            cudnn.deterministic = True
-            torch.backends.cudnn.benchmark = False
-        else:
-            cudnn.deterministic = False
-            torch.backends.cudnn.benchmark = True
+        cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
+
+        #if deterministic:
+        #    np.random.seed(12345)
+        #    torch.manual_seed(12345)
+        #    if torch.cuda.is_available():
+        #        torch.cuda.manual_seed_all(12345)
+        #    cudnn.deterministic = True
+        #    torch.backends.cudnn.benchmark = False
+        #else:
+        #    cudnn.deterministic = False
+        #    torch.backends.cudnn.benchmark = True
 
         ################# SET THESE IN self.initialize() ###################################
         self.network: Tuple[SegmentationNetwork, nn.DataParallel] = None

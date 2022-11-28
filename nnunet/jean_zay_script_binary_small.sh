@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=gpu_mono          # nom du job
-##SBATCH -C v100-16g                  # reserver des GPU 16 Go seulement
+#SBATCH -C v100-16g                  # reserver des GPU 16 Go seulement
 ##SBATCH --partition=gpu_p2          # de-commente pour la partition gpu_p2
 #SBATCH --qos=qos_gpu-dev            # qos_gpu-t4 qos_gpu-dev qos_gpu-t3
 #SBATCH --nodes=1                    # on demande un noeud
@@ -28,6 +28,6 @@ export nnUNet_preprocessed="out/nnUNet_preprocessed"
 export RESULTS_FOLDER="out/nnUNet_trained_models"
 
 # execution du code
-#python run/run_training.py 2d nnMTLTrainerV2 Task026_MMs 0 -p custom_experiment_planner
-#python run/run_training.py 2d nnUNetTrainerV2 Task025_ACDC_nnUnet 0
-python run/run_training.py 2d nnMTLTrainerV2 Task027_ACDC 0 -p custom_experiment_planner
+#python run/run_training.py 2d nnMTLTrainerV2 Task026_MMs 0 -p custom_experiment_planner --deterministic
+#python run/run_training.py 2d nnMTLTrainerV2 Task027_ACDC 1 -p custom_experiment_planner --deterministic
+python run/run_training.py 2d nnMTLTrainerV2 Task028_Lib 0 -p custom_experiment_planner --deterministic

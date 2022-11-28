@@ -14,6 +14,9 @@
 
 
 from collections import OrderedDict
+from multiprocessing import Pool
+from nnunet.configuration import default_num_threads
+from pickle import NONE
 from traceback import print_tb
 from typing import Tuple
 import matplotlib
@@ -23,14 +26,14 @@ from tqdm import trange
 import torch.backends.cudnn as cudnn
 from _warnings import warn
 from sklearn.model_selection import train_test_split
+from scipy.signal import savgol_filter
 
-from torch.nn.functional import interpolate
+
 import psutil
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 import cv2 as cv
 import sys
-import matplotlib as mpl
 from matplotlib import cm
 import matplotlib.pyplot as plt
 from copy import copy
@@ -41,9 +44,8 @@ import torch
 from nnunet.torchinfo.torchinfo.torchinfo import summary
 from nnunet.lib.ssim import ssim
 from nnunet.utilities.tensor_utilities import sum_tensor
-from nnunet.training.data_augmentation.data_augmentation_noDA import get_no_augmentation_mtl
 from nnunet.training.data_augmentation.data_augmentation_moreDA import get_moreDA_augmentation_mtl
-from nnunet.training.data_augmentation.data_augmentation_mtl import get_moreDA_augmentation_middle
+from nnunet.training.data_augmentation.data_augmentation_mtl import get_moreDA_augmentation_middle, get_moreDA_augmentation_middle_unlabeled
 from nnunet.training.loss_functions.deep_supervision import MultipleOutputLoss2
 from nnunet.utilities.to_torch import maybe_to_torch, to_cuda
 from nnunet.network_architecture.generic_UNet import Generic_UNet
@@ -51,7 +53,7 @@ from nnunet.network_architecture.initialization import InitWeights_He
 from nnunet.network_architecture.neural_network import SegmentationNetwork
 from nnunet.training.data_augmentation.default_data_augmentation import default_2D_augmentation_params, \
     get_patch_size, default_3D_augmentation_params
-from nnunet.training.dataloading.dataset_loading import DataLoader2D, unpack_dataset
+from nnunet.training.dataloading.dataset_loading import DataLoader2D, DataLoader2DMiddleUnlabeled, unpack_dataset, DataLoaderVideo
 from nnunet.training.network_training.nnUNetTrainer import nnUNetTrainer
 from nnunet.utilities.nd_softmax import softmax_helper
 from sklearn.model_selection import KFold
@@ -59,23 +61,22 @@ from torch import nn
 from torch.cuda.amp import autocast
 from nnunet.training.learning_rate.poly_lr import poly_lr
 from batchgenerators.utilities.file_and_folder_operations import *
-from nnunet.lib.training_utils import build_2d_model, build_confidence_network, read_config, build_discriminator, build_discriminator
-from nnunet.lib.loss import DirectionalFieldLoss
-from nnunet.lib.dataset_utils import normalize_0_1
+from nnunet.lib.training_utils import build_2d_model, build_confidence_network, read_config, build_discriminator, build_discriminator, build_video_model
+from nnunet.lib.loss import DirectionalFieldLoss, MaximizeDistanceLoss, AverageDistanceLoss
 from pathlib import Path
 from monai.losses import DiceFocalLoss, DiceLoss
 from torch.utils.tensorboard import SummaryWriter
-from nnunet.lib.boundary_utils import simplex
 from nnunet.training.loss_functions.dice_loss import DC_and_CE_loss, DC_and_focal_loss, DC_and_topk_loss, DC_and_CE_loss_Weighted, SoftDiceLoss
 from nnunet.training.loss_functions.crossentropy import RobustCrossEntropyLoss, WeightedRobustCrossEntropyLoss
 from nnunet.training.dataloading.dataset_loading import DataLoader2DMiddle, DataLoader2DUnlabeled
 from nnunet.training.dataloading.dataset_loading import load_dataset, load_unlabeled_dataset
 from nnunet.network_architecture.MTL_model import ModelWrap
-
-from nnunet.lib.loss import logisticGradientPenalty
-
+from nnunet.lib.utils import RFR, ConvBlocks, Resblock
+from nnunet.lib.loss import SeparabilityLoss, ContrastiveLoss
 from nnunet.training.data_augmentation.cutmix import cutmix, batched_rand_bbox
-
+import shutil
+from nnunet.visualization.visualization import Visualizer
+from nnunet.training.network_training.processor import Processor
 
 class nnMTLTrainerV2(nnUNetTrainer):
     """
@@ -83,49 +84,91 @@ class nnMTLTrainerV2(nnUNetTrainer):
     """
 
     def __init__(self, plans_file, fold, output_folder=None, dataset_directory=None, batch_dice=True, stage=None,
-                 unpack_data=True, deterministic=True, fp16=False):
+                 unpack_data=True, deterministic=True, fp16=False, middle=False, video=False):
         super().__init__(plans_file, fold, output_folder, dataset_directory, batch_dice, stage, unpack_data,
                          deterministic, fp16)
-        self.config = read_config(os.path.join(Path.cwd(), 'adversarial_acdc.yaml'))
+        self.middle = middle
+        self.video = video
+
+        if self.middle:
+            self.config = read_config(os.path.join(Path.cwd(), 'adversarial_acdc_middle.yaml'), middle)
+        elif self.video:
+            self.cropper_config = read_config(os.path.join(Path.cwd(), 'adversarial_acdc.yaml'), middle)
+            self.config = read_config(os.path.join(Path.cwd(), 'video.yaml'), middle)
+            self.cropper_weights_path = self.config['cropper_weights_path']
+            self.video_length = self.config['video_length']
+            self.crop = self.config['crop']
+            self.feature_extractor = self.config['feature_extractor']
+            self.crop_size = self.config['crop_size']
+        else:
+            self.config = read_config(os.path.join(Path.cwd(), 'adversarial_acdc.yaml'), middle)
+        
+        self.image_size = self.config['patch_size'][0]
+        self.window_size = 7 if self.image_size == 224 else 9 if self.image_size == 288 else None
+
         self.max_num_epochs = self.config['max_num_epochs']
         self.initial_lr = self.config['initial_lr']
         self.weight_decay = self.config['weight_decay']
         self.deep_supervision_scales = None
         self.ds_loss_weights = None
         self.use_progress_bar=True
+        self.middle_classification = self.config['middle_classification']
         self.directional_field = self.config['directional_field']
         self.reconstruction = self.config['reconstruction']
         self.affinity = self.config['affinity']
+        self.separability = self.config['separability']
         self.unlabeled = self.config['unlabeled']
         self.simple_decoder = self.config['simple_decoder']
-        self.no_da = self.config['no_da']
         if self.unlabeled:
             self.unlabeled_loss_weight = self.config['unlabeled_loss_weight']
+        if self.middle:
+            self.past_percent = {}
+            self.cumulative_ema = 0
+            self.mix_residual = self.config['mix_residual']
+            self.registered_seg = self.config['registered_seg']
+            self.alpha_ema = self.config['alpha_ema']
+            self.one_vs_all = self.config['one_vs_all']
+            self.t1 = self.config['t1'] * (self.max_num_epochs * self.num_batches_per_epoch)
+            self.t2 = self.config['t2'] * (self.max_num_epochs * self.num_batches_per_epoch)
+            self.max_unlabeled_weight = self.config['max_unlabeled_weight']
+            self.middle_unlabeled = self.config['middle_unlabeled']
+            self.v1 = self.config['v1']
+        else:
+            self.registered_x = False
+            self.registered_seg = False
+            self.one_vs_all = True
+            self.interpolate = False
+            self.maximize_distance = False
+            self.middle_unlabeled = False
 
         self.deep_supervision = self.config['deep_supervision']
         self.classification = self.config['classification']
         self.adversarial_loss = self.config['adversarial_loss']
 
-        self.eval_images = self.initialize_image_data()
         self.iter_nb = 0
-        self.middle = self.config['middle']
-        self.vae = self.config['vae']
-        self.vq_vae = self.config['vq_vae']
-        self.similarity = self.config['similarity']
-        self.cutmix = self.config['cutmix']
 
         self.val_loss = []
         self.train_loss = []
         
-        self.image_size = 288 if '026' in dataset_directory else 224
-        self.window_size = 7 if self.image_size == 224 else 9
+        
         loss_weights = torch.tensor(self.config['224_loss_weights'], device=self.config['device'])
 
         timestr = strftime("%Y-%m-%d_%HH%M")
         self.log_dir = os.path.join(copy(self.output_folder), timestr)
         self.writer = SummaryWriter(log_dir=self.log_dir)
 
-        self.output_folder = self.log_dir
+        self.vis = Visualizer(unlabeled=self.unlabeled,
+                                adversarial_loss=self.adversarial_loss, 
+                                affinity=self.affinity, 
+                                middle_unlabeled=self.middle_unlabeled,
+                                middle=self.middle,
+                                registered_seg=self.registered_seg,
+                                writer=self.writer)
+
+        if output_folder.count(os.sep) < 2:
+            self.output_folder = output_folder
+        else:
+            self.output_folder = self.log_dir
 
         self.setup_loss_functions(loss_weights)
         
@@ -138,7 +181,57 @@ class nnMTLTrainerV2(nnUNetTrainer):
         self.reconstruction_ssim_list = []
         self.df_ssim_list = []
         self.sim_l2_list = []
+        self.corr_list = []
         self.aff_l2_list = []
+        self.motion_ssim_list = []
+        #self.sim_l2_md_list = []
+        self.table = self.initialize_table()
+
+        self.loss_data = self.setup_loss_data()
+
+    def get_slice_percent(self):
+        sorted_past_percent = dict(sorted(self.past_percent.items()))
+        new_d = {}
+        smooth = savgol_filter(list(sorted_past_percent.values()), len(sorted_past_percent), 3) # window size 50, polynomial order 3
+        for k, v in zip(sorted_past_percent.keys(), smooth):
+            new_d[k] = v
+        self.percent = min(new_d, key= lambda x: new_d[x])
+        self.writer.add_scalar('Epoch/Slice percent', self.percent, self.epoch)
+        plt.close()
+        plt.scatter(list(sorted_past_percent.keys()), list(sorted_past_percent.values()))
+        plt.plot(list(new_d.keys()), list(new_d.values()), color='red')
+        self.writer.add_figure('Epoch/Slice data', plt.gcf(), self.epoch)
+        self.print_to_log_file(f"Slice percent: {self.percent}", also_print_to_console=True)
+
+    def get_slice_percent_ova(self):
+        self.percent = {}
+        for i, (k, v) in enumerate(self.past_percent.items()):
+            sorted_past_percent = dict(sorted(self.past_percent[k].items()))
+            new_d = {}
+            polyorder = 3 if len(sorted_past_percent) > 3 else len(sorted_past_percent) - 1
+            smooth = savgol_filter(list(sorted_past_percent.values()), len(sorted_past_percent), polyorder) # window size 50, polynomial order 3
+            for k2, v2 in zip(sorted_past_percent.keys(), smooth):
+                new_d[k2] = v2
+            percent = min(new_d, key= lambda x: new_d[x])
+            self.percent[k] = percent
+
+            if i == 0:
+                self.writer.add_scalar(f'Epoch/Slice {i} percent', percent, self.epoch)
+                plt.close()
+                plt.scatter(list(sorted_past_percent.keys()), list(sorted_past_percent.values()))
+                plt.plot(list(sorted_past_percent.keys()), list(new_d.values()), color='red')
+                self.writer.add_figure('Epoch/Slice data', plt.gcf(), self.epoch)
+
+        plt.close()
+        sorted_percent = dict(sorted(self.percent.items()))
+        smooth = savgol_filter(list(sorted_percent.values()), len(sorted_percent), 3)
+        new_d = {}
+        for k3, v3 in zip(sorted_percent.keys(), smooth):
+            new_d[k3] = v3
+        plt.scatter(list(sorted_percent.keys()), list(sorted_percent.values()))
+        plt.plot(list(new_d.keys()), list(new_d.values()), color='red')
+        self.writer.add_figure('Epoch/Slice percent', plt.gcf(), self.epoch)
+        self.percent = new_d
 
     def setup_loss_data(self):
         loss_data = {'segmentation': [1.0, float('nan')]}
@@ -156,8 +249,19 @@ class nnMTLTrainerV2(nnUNetTrainer):
         if self.config['affinity']:
             loss_data['affinity'] = [self.config['affinity_loss_weight'], float('nan')]
 
+        if self.middle:
+            #loss_data['heatmap'] = [self.config['heatmap_loss_weight'], float('nan')]
+            #loss_data['contrastive'] = [self.config['contrastive_loss_weight'], float('nan')]
+            if not self.middle_unlabeled:
+                loss_data['similarity'] = [self.config['similarity_loss_weight'], float('nan')]
+            if self.registered_seg:
+                loss_data['motion_estimation_seg'] = [self.config['seg_motion_estimation_loss_weight'], float('nan')]
+        
+        if self.config['separability']:
+            loss_data['separability'] = [self.config['separability_loss_weight'], float('nan')]
+
         if self.adversarial_loss:
-            loss_data['adversarial'] = [self.config['adversarial_weight'], float('nan')]
+            loss_data['adversarial'] = [self.config['adversarial_loss_weight'], float('nan')]
             if self.unlabeled:
                 loss_data['confidence'] = [1.0, float('nan')]
             #else:
@@ -166,6 +270,9 @@ class nnMTLTrainerV2(nnUNetTrainer):
         
         if self.classification:
             loss_data['classification'] = [self.config['classification_weight'], float('nan')]
+        
+        if self.middle_classification:
+            loss_data['middle_classification'] = [self.config['middle_classification_weight'], float('nan')]
         
         if self.directional_field:
             loss_data['directional_field'] = [self.config['directional_field_weight'], float('nan')]
@@ -184,9 +291,31 @@ class nnMTLTrainerV2(nnUNetTrainer):
         
         if self.config['affinity']:
             self.affinity_loss = nn.L1Loss()
+
+        if self.middle:
+
+            if self.one_vs_all:
+                self.mse_loss = nn.MSELoss()
+                if self.registered_seg:
+                    self.motion_estimation_loss_seg = DC_and_CE_loss({'batch_dice': True, 'smooth': 1e-5, 'do_bg': False}, {})
+                #self.contrastive_loss = ContrastiveLoss(temp=self.temp)
+            #else:
+            #    self.motion_estimation_loss_x = nn.MSELoss(reduction='none')
+            #    self.middle_seg_loss = DC_and_CE_loss({'batch_dice': self.batch_dice, 'smooth': 1e-5, 'do_bg': False}, {'reduction': 'none'})
+            #    self.motion_estimation_loss_seg = DC_and_CE_loss({'batch_dice': self.batch_dice, 'smooth': 1e-5, 'do_bg': False}, {'reduction': 'none'})
+            #    self.relation_loss = nn.MSELoss(reduction='none')
+            #    if self.interpolate:
+            #        self.inter_seg_loss = DC_and_CE_loss({'batch_dice': self.batch_dice, 'smooth': 1e-5, 'do_bg': False}, {'reduction': 'none'})
+            
+        
+        if self.config['separability']:
+            self.separability_loss = SeparabilityLoss()
         
         if self.classification:
             self.classification_loss = nn.CrossEntropyLoss()
+        
+        if self.middle_classification:
+            self.middle_classification_loss = nn.BCELoss()
         
         if self.directional_field:
             self.directional_field_loss = DirectionalFieldLoss(weights=loss_weights, writer=self.writer)
@@ -202,76 +331,24 @@ class nnMTLTrainerV2(nnUNetTrainer):
             elif self.config['loss'] == 'topk_and_dice':
                 self.segmentation_loss = DC_and_topk_loss({'batch_dice': self.batch_dice, 'smooth': 1e-5, 'do_bg': False}, {'k': 10}, ce_weight=0.5, dc_weight=0.5)
             elif self.config['loss'] == 'ce_and_dice':
-                self.segmentation_loss = DC_and_CE_loss({'batch_dice': self.batch_dice, 'smooth': 1e-5, 'do_bg': False}, {})
-                #self.segmentation_loss = DC_and_CE_loss({'batch_dice': self.batch_dice, 'smooth': 1e-5, 'do_bg': False}, {'weight': loss_weights}, weight_ce=0.5, weight_dice=0.5)
+                if self.middle:
+                    self.segmentation_loss = DC_and_CE_loss({'batch_dice': False, 'smooth': 1e-5, 'do_bg': False}, {'reduction': 'none'})
+                else:
+                    self.segmentation_loss = DC_and_CE_loss({'batch_dice': True, 'smooth': 1e-5, 'do_bg': False}, {})
             elif self.config['loss'] == 'ce':
                 self.segmentation_loss = RobustCrossEntropyLoss(weight=loss_weights)
 
-    def initialize_image_data(self):
 
-        log_images_nb = 8
-        eval_images = {'rec': None,
-                        'sim': None,
-                        'df': None,
-                        'seg': None}
-        
-        if self.unlabeled and self.adversarial_loss:
-            eval_images['confidence'] = None
-        if self.affinity:
-            eval_images['affinity'] = None
+    def initialize_table(self):
 
-        for key in eval_images.keys():
-            data = []
-            scores = []
-            if key == 'rec':
-                payload = {'input': None,
-                            'reconstruction': None}
-                score = -1
-                data.append(payload)
-                scores.append(score)
-            elif key == 'sim':
-                for i in range(log_images_nb):
-                    payload = {'input': None,
-                                'decoder_sm': None,
-                                'reconstruction_sm': None}
-                    score = float('inf')
-                    data.append(payload)
-                    scores.append(score)
-            elif key == 'df':
-                for i in range(log_images_nb):
-                    payload = {'input': None,
-                                'gt_df': None,
-                                'pred_df': None}
-                    score = -1
-                    data.append(payload)
-                    scores.append(score)
-            elif key == 'seg':
-                for i in range(log_images_nb):
-                    payload = {'input': None,
-                                'pred': None,
-                                'gt': None}
-                    score = 1
-                    data.append(payload)
-                    scores.append(score)
-            elif key == 'confidence':
-                for i in range(log_images_nb):
-                    payload = {'input': None,
-                                'pred': None,
-                                'confidence': None}
-                    score = 0
-                    data.append(payload)
-                    scores.append(score)
-            elif key == 'affinity':
-                for i in range(log_images_nb):
-                    payload = {'input': None,
-                                'seg_aff': None,
-                                'aff': None}
-                    score = 0
-                    data.append(payload)
-                    scores.append(score)
-            eval_images[key] = np.stack([np.array(data), np.array(scores)], axis=0)
+        table = {}
+        table['seg'] = {'foreground_dc': [], 'tp': [], 'fp': [], 'fn': []}
+
+        if self.middle and self.registered_seg:
+            table['forward_motion'] = {'foreground_dc': [], 'tp': [], 'fp': [], 'fn': []}
+            table['backward_motion'] = {'foreground_dc': [], 'tp': [], 'fp': [], 'fn': []}
     
-        return eval_images
+        return table
     
     #def initialize_image_data(self):
     #    log_images_nb = 8
@@ -356,6 +433,9 @@ class nnMTLTrainerV2(nnUNetTrainer):
 
             if self.deep_supervision:
                 self.segmentation_loss = MultipleOutputLoss2(self.segmentation_loss, seg_weights)
+                if self.middle:
+                    if self.interpolate:
+                        self.inter_seg_loss = MultipleOutputLoss2(self.inter_seg_loss, seg_weights)
                 if self.unlabeled and self.adversarial_loss:
                     self.confidence_loss = MultipleOutputLoss2(self.confidence_loss, seg_weights)
             if self.reconstruction:
@@ -380,19 +460,18 @@ class nnMTLTrainerV2(nnUNetTrainer):
                         "INFO: Not unpacking data! Training may be slow due to that. Pray you are not using 2d or you "
                         "will wait all winter for your model to finish!")
 
-                if not self.middle:
-                    
-                    if self.no_da:
-                        self.data_aug_params['do_mirror'] = False
-                        self.tr_gen, self.val_gen, self.tr_un_gen, self.val_un_gen = get_no_augmentation_mtl(
-                            self.dl_tr, self.dl_val, self.dl_un_tr, self.dl_un_val,
-                            self.data_aug_params[
-                                'patch_size_for_spatialtransform'],
-                            directional_field=self.directional_field,
-                            params=self.data_aug_params,
-                            deep_supervision_scales=self.deep_supervision_scales
+                if self.video:
+                    self.tr_gen, self.val_gen = get_moreDA_augmentation_middle_unlabeled(
+                        self.dl_tr, self.dl_val,
+                        self.data_aug_params[
+                            'patch_size_for_spatialtransform'],
+                        params=self.data_aug_params,
+                        deep_supervision_scales=self.deep_supervision_scales,
+                        pin_memory=self.pin_memory,
+                        use_nondetMultiThreadedAugmenter=False
                         )
-                    else:
+                else:
+                    if not self.middle:
                         self.tr_gen, self.val_gen, self.tr_un_gen, self.val_un_gen = get_moreDA_augmentation_mtl(
                         self.dl_tr, self.dl_val, self.dl_un_tr, self.dl_un_val,
                         self.data_aug_params[
@@ -403,22 +482,32 @@ class nnMTLTrainerV2(nnUNetTrainer):
                         pin_memory=self.pin_memory,
                         use_nondetMultiThreadedAugmenter=False
                         )
-                else:
-                    self.tr_gen, self.val_gen = get_moreDA_augmentation_middle(
-                        self.dl_tr, self.dl_val,
-                        self.data_aug_params[
-                            'patch_size_for_spatialtransform'],
-                        directional_field=self.directional_field,
-                        params=self.data_aug_params,
-                        deep_supervision_scales=self.deep_supervision_scales,
-                        pin_memory=self.pin_memory,
-                        use_nondetMultiThreadedAugmenter=False
-                    )
+                    else:
+                        if self.middle_unlabeled:
+                            self.tr_gen, self.val_gen = get_moreDA_augmentation_middle_unlabeled(
+                            self.dl_tr, self.dl_val,
+                            self.data_aug_params[
+                                'patch_size_for_spatialtransform'],
+                            params=self.data_aug_params,
+                            deep_supervision_scales=self.deep_supervision_scales,
+                            pin_memory=self.pin_memory,
+                            use_nondetMultiThreadedAugmenter=False
+                            )
+                        else:
+                            self.tr_gen, self.val_gen = get_moreDA_augmentation_middle(
+                                self.dl_tr, self.dl_val,
+                                self.data_aug_params[
+                                    'patch_size_for_spatialtransform'],
+                                params=self.data_aug_params,
+                                deep_supervision_scales=self.deep_supervision_scales,
+                                pin_memory=self.pin_memory,
+                                use_nondetMultiThreadedAugmenter=False
+                                )
                 self.print_to_log_file("TRAINING KEYS:\n %s" % (str(self.dataset_tr.keys())),
                                        also_print_to_console=False)
                 self.print_to_log_file("VALIDATION KEYS:\n %s" % (str(self.dataset_val.keys())),
                                        also_print_to_console=False)
-                if self.unlabeled:
+                if self.unlabeled or self.middle_unlabeled:
                     self.print_to_log_file("UNLABELED TRAINING KEYS:\n %s" % (str(self.dataset_un_tr.keys())),
                                        also_print_to_console=False)
                     self.print_to_log_file("UNLABELED VALIDATION KEYS:\n %s" % (str(self.dataset_un_val.keys())),
@@ -473,6 +562,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
         self.print_to_log_file(yaml.safe_dump(config, default_flow_style=None, sort_keys=False), also_print_to_console=False)
         for k, v in models.items():
             nb_params =  sum(p.numel() for p in v[0].parameters() if p.requires_grad)
+            self.print_to_log_file(f"{k} has {nb_params:,} parameters")
             params_sum += nb_params
 
             model_stats = summary(v[0], input_data=v[1], 
@@ -482,7 +572,16 @@ class nnMTLTrainerV2(nnUNetTrainer):
             model_stats.formatting.verbose = 1
             self.print_to_log_file(model_stats, also_print_to_console=False)
         
-        self.print_to_log_file("The model has", "{:,}".format(params_sum), "parameters")
+        self.print_to_log_file("The Whole model has", "{:,}".format(params_sum), "parameters")
+    
+    def get_conv_layer(self, config):
+        if config['conv_layer'] == 'RFR':
+            conv_layer = RFR
+        elif config['conv_layer'] == 'resblock':
+            conv_layer = Resblock
+        else:
+            conv_layer = ConvBlocks
+        return conv_layer
 
     def initialize_network(self):
         """
@@ -497,7 +596,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
         """
         models = {}
         
-
+        conv_layer = self.get_conv_layer(self.config)
         if self.unlabeled:
             if self.adversarial_loss:
                 self.discriminator = build_confidence_network(self.config, alpha=self.config['alpha_discriminator'], image_size=self.image_size, window_size=self.window_size)
@@ -506,8 +605,8 @@ class nnMTLTrainerV2(nnUNetTrainer):
                 discriminator_input = torch.randn(self.config['batch_size'], 4, self.image_size, self.image_size)
                 models['discriminator'] = (self.discriminator, discriminator_input)
 
-            net1 = build_2d_model(self.config, norm=getattr(torch.nn, self.config['norm']), log_function=self.print_to_log_file, image_size=self.image_size, window_size=self.window_size)
-            net2 = build_2d_model(self.config, norm=getattr(torch.nn, self.config['norm']), log_function=self.print_to_log_file, image_size=self.image_size, window_size=self.window_size)
+            net1 = build_2d_model(self.config, conv_layer=conv_layer, norm=getattr(torch.nn, self.config['norm']), log_function=self.print_to_log_file, image_size=self.image_size, window_size=self.window_size)
+            net2 = build_2d_model(self.config, conv_layer=conv_layer, norm=getattr(torch.nn, self.config['norm']), log_function=self.print_to_log_file, image_size=self.image_size, window_size=self.window_size)
             self.network = ModelWrap(net1, net2, do_ds=self.config['deep_supervision'])
 
             model_input_data = torch.randn(self.config['batch_size'], 1, self.image_size, self.image_size)
@@ -516,10 +615,10 @@ class nnMTLTrainerV2(nnUNetTrainer):
             self.count_parameters(self.config, models)
         else:
             if self.adversarial_loss:
-                self.discriminator = build_discriminator(self.config, alpha=self.config['alpha_discriminator'], use_swin_discriminator=False, in_channel=5, image_size=self.image_size, window_size=self.window_size)
+                self.discriminator = build_discriminator(self.config, conv_layer=conv_layer, alpha=self.config['alpha_discriminator'], in_channel=4, image_size=self.image_size)
                 if torch.cuda.is_available():
                     self.discriminator.cuda()
-                discriminator_input = torch.randn(self.config['batch_size'], 5, self.image_size, self.image_size)
+                discriminator_input = torch.randn(self.config['batch_size'], 4, self.image_size, self.image_size)
                 models['discriminator'] = (self.discriminator, discriminator_input)
 
                 #self.rec_discriminator = build_discriminator(self.config, alpha=0.125, use_swin_discriminator=False, in_channel=1)
@@ -527,11 +626,36 @@ class nnMTLTrainerV2(nnUNetTrainer):
                 #    self.rec_discriminator.cuda()
                 #discriminator_input = torch.randn(self.config['batch_size'], 1, self.image_size, self.image_size)
                 #models['rec_discriminator'] = (self.rec_discriminator, discriminator_input)
+            if self.video:
+                in_shape_crop = torch.randn(self.config['batch_size'], 1, self.image_size, self.image_size)
+                cropping_conv_layer = self.get_conv_layer(self.cropper_config)
+                cropping_network = build_2d_model(self.cropper_config, conv_layer=cropping_conv_layer, norm=getattr(torch.nn, self.cropper_config['norm']), log_function=self.print_to_log_file, image_size=self.image_size, window_size=self.window_size, middle=False)
+                cropping_network.load_state_dict(torch.load(self.cropper_weights_path)['state_dict'])
+                cropping_network.eval()
+                cropping_network.do_ds = False
+                models['cropping_model'] = (cropping_network, in_shape_crop)
 
-            self.network = build_2d_model(self.config, norm=getattr(torch.nn, self.config['norm']), log_function=self.print_to_log_file, image_size=self.image_size, window_size=self.window_size)
+                in_shape_temporal = torch.randn(self.config['batch_size'], 1, self.crop_size, self.crop_size)
+                self.network = build_video_model(self.config, conv_layer=conv_layer, norm=getattr(torch.nn, self.config['norm']), log_function=self.print_to_log_file, image_size=self.crop_size, window_size=8, middle=self.middle)
+                model_input_data = {'labeled_data': [in_shape_temporal] * self.video_length}
+                models['temporal_model'] = (self.network, [model_input_data])
 
-            model_input_data = torch.randn(self.config['batch_size'], 1, self.image_size, self.image_size)
-            models['model'] = (self.network, model_input_data)
+                self.processor = Processor(crop_size=self.crop_size, image_size=self.image_size, cropping_network=cropping_network)
+            else:
+                in_shape = torch.randn(self.config['batch_size'], 1, self.image_size, self.image_size)
+                self.network = build_2d_model(self.config, conv_layer=conv_layer, norm=getattr(torch.nn, self.config['norm']), log_function=self.print_to_log_file, image_size=self.image_size, window_size=self.window_size, middle=self.middle)
+
+                if self.middle:
+                    model_input_data = {'l1': in_shape, 'l2': in_shape}
+                    if self.middle_unlabeled:
+                        model_input_data['u1'] = in_shape
+                        if self.v1:
+                            model_input_data['u2'] = in_shape
+                    model_input_data = [model_input_data]
+                else:
+                    model_input_data = in_shape
+                models['model'] = (self.network, model_input_data)
+
             self.count_parameters(self.config, models)
 
         #nb_inputs = 2 if self.middle else 1
@@ -542,10 +666,18 @@ class nnMTLTrainerV2(nnUNetTrainer):
         self.network.inference_apply_nonlin = softmax_helper
 
     def get_optimizer_scheduler(self, net, lr, decay):
+        if self.video and self.feature_extractor:
+            params_to_update = []
+            for name, param in net.named_parameters():
+                if param.requires_grad == True:
+                    params_to_update.append(param)
+        else:
+            params_to_update = net.parameters()
+
         if self.config['optimizer'] == 'sgd':
-            optimizer = torch.optim.SGD(net.parameters(), lr, weight_decay=decay, momentum=0.99, nesterov=True)
+            optimizer = torch.optim.SGD(params_to_update, lr, weight_decay=decay, momentum=0.99, nesterov=True)
         elif self.config['optimizer'] == 'adam':
-            optimizer = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=decay)
+            optimizer = torch.optim.AdamW(params_to_update, lr=lr, weight_decay=decay)
 
         if self.config['scheduler'] == 'cosine':
             lr_scheduler = CosineAnnealingLR(optimizer, T_max=self.max_num_epochs)
@@ -567,217 +699,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
             #    self.seg_discriminator_optimizer, self.seg_discriminator_scheduler = self.get_optimizer_scheduler(net=self.seg_discriminator, lr=self.discriminator_lr, decay=self.discriminator_decay)
             #    self.rec_discriminator_optimizer, self.rec_discriminator_scheduler = self.get_optimizer_scheduler(net=self.rec_discriminator, lr=self.discriminator_lr, decay=self.discriminator_decay)
 
-    def get_images_ready_for_display(self, image, colormap):
-        if colormap is not None:
-            if np.count_nonzero(image) > 0:
-                image = normalize_0_1(image)
-            image = colormap(image)[:, :, :-1]
-        image = cv.normalize(image, None, alpha=0, beta=255, norm_type=cv.NORM_MINMAX).astype(np.uint8)
-        if len(image.shape) < 3:
-            image = image[:, :, None]
-        return image
-    
-    def get_seg_images_ready_for_display(self, image, colormap, norm):
-        image = norm(image)
-        image = colormap(image)[:, :, :-1]
-        image = cv.normalize(image, None, alpha=0, beta=255, norm_type=cv.NORM_MINMAX).astype(np.uint8)
-        if len(image.shape) < 3:
-            image = image[:, :, None]
-        return image
-
-    def log_rec_images(self):
-        input_image = self.eval_images['rec'][0, 0]['input']
-        input_image = self.get_images_ready_for_display(input_image, colormap=None)
-
-        reconstruction = self.eval_images['rec'][0, 0]['reconstruction']
-        reconstruction = self.get_images_ready_for_display(reconstruction, colormap=None)
-
-        self.writer.add_image(os.path.join('Reconstruction', 'input').replace('\\', '/'), input_image, self.epoch, dataformats='HWC')
-        self.writer.add_image(os.path.join('Reconstruction', 'reconstruction').replace('\\', '/'), reconstruction, self.epoch, dataformats='HWC')
-    
-    def log_sim_images(self, colormap):
-        input_list = [x['input'] for x in self.eval_images['sim'][0]]
-        input_list = [self.get_images_ready_for_display(x, colormap=None) for x in input_list]
-        input_list = np.stack(input_list, axis=0)
-
-        decoder_sm_list = [x['decoder_sm'] for x in self.eval_images['sim'][0]]
-        decoder_sm_list = [self.get_images_ready_for_display(x, colormap) for x in decoder_sm_list]
-        decoder_sm_list = np.stack(decoder_sm_list, axis=0)
-
-        reconstruction_sm_list = [x['reconstruction_sm'] for x in self.eval_images['sim'][0]]
-        reconstruction_sm_list = [self.get_images_ready_for_display(x, colormap) for x in reconstruction_sm_list]
-        reconstruction_sm_list = np.stack(reconstruction_sm_list, axis=0)
-
-        self.writer.add_images(os.path.join('Similarity', 'input').replace('\\', '/'), input_list, self.epoch, dataformats='NHWC')
-        self.writer.add_images(os.path.join('Similarity', 'decoder_similarity').replace('\\', '/'), decoder_sm_list, self.epoch, dataformats='NHWC')
-        self.writer.add_images(os.path.join('Similarity', 'reconstruction_similarity').replace('\\', '/'), reconstruction_sm_list, self.epoch, dataformats='NHWC')
-    
-    def log_aff_images(self, colormap):
-        input_list = [x['input'] for x in self.eval_images['affinity'][0]]
-        input_list = [self.get_images_ready_for_display(x, colormap=None) for x in input_list]
-        input_list = np.stack(input_list, axis=0)
-
-        aff_list = [x['aff'] for x in self.eval_images['affinity'][0]]
-        aff_list = [self.get_images_ready_for_display(x, colormap) for x in aff_list]
-        aff_list = np.stack(aff_list, axis=0)
-
-        seg_aff_list = [x['seg_aff'] for x in self.eval_images['affinity'][0]]
-        seg_aff_list = [self.get_images_ready_for_display(x, colormap) for x in seg_aff_list]
-        seg_aff_list = np.stack(seg_aff_list, axis=0)
-
-        self.writer.add_images(os.path.join('Affinity', 'input').replace('\\', '/'), input_list, self.epoch, dataformats='NHWC')
-        self.writer.add_images(os.path.join('Affinity', 'affinity').replace('\\', '/'), aff_list, self.epoch, dataformats='NHWC')
-        self.writer.add_images(os.path.join('Affinity', 'segmentation_affinity').replace('\\', '/'), seg_aff_list, self.epoch, dataformats='NHWC')
-
-    def log_df_images(self, colormap):
-        input_list = [x['input'] for x in self.eval_images['df'][0]]
-        input_list = [self.get_images_ready_for_display(x, colormap=None) for x in input_list]
-        input_list = np.stack(input_list, axis=0)
-
-        gt_df_list = [x['gt_df'] for x in self.eval_images['df'][0]]
-        gt_df_list = [self.get_images_ready_for_display(x, colormap) for x in gt_df_list]
-        gt_df_list = np.stack(gt_df_list, axis=0)
-
-        pred_df_list = [x['pred_df'] for x in self.eval_images['df'][0]]
-        pred_df_list = [self.get_images_ready_for_display(x, colormap) for x in pred_df_list]
-        pred_df_list = np.stack(pred_df_list, axis=0)
-
-        self.writer.add_images(os.path.join('Directional_field', 'input').replace('\\', '/'), input_list, self.epoch, dataformats='NHWC')
-        self.writer.add_images(os.path.join('Directional_field', 'ground_truth_directional_field').replace('\\', '/'), gt_df_list, self.epoch, dataformats='NHWC')
-        self.writer.add_images(os.path.join('Directional_field', 'predicted_directional_field').replace('\\', '/'), pred_df_list, self.epoch, dataformats='NHWC')
-    
-    def log_seg_images(self, colormap, norm):
-        input_list = [x['input'] for x in self.eval_images['seg'][0]]
-        input_list = [self.get_images_ready_for_display(x, colormap=None) for x in input_list]
-        input_list = np.stack(input_list, axis=0)
-
-        gt_list = [x['gt'] for x in self.eval_images['seg'][0]]
-        gt_list = [self.get_seg_images_ready_for_display(x, colormap, norm) for x in gt_list]
-        gt_list = np.stack(gt_list, axis=0)
-
-        pred_list = [x['pred'] for x in self.eval_images['seg'][0]]
-        pred_list = [self.get_seg_images_ready_for_display(x, colormap, norm) for x in pred_list]
-        pred_list = np.stack(pred_list, axis=0)
-
-        self.writer.add_images(os.path.join('Segmentation', 'input').replace('\\', '/'), input_list, self.epoch, dataformats='NHWC')
-        self.writer.add_images(os.path.join('Segmentation', 'ground_truth').replace('\\', '/'), gt_list, self.epoch, dataformats='NHWC')
-        self.writer.add_images(os.path.join('Segmentation', 'prediction').replace('\\', '/'), pred_list, self.epoch, dataformats='NHWC')
-    
-    def log_confidence_images(self, colormap, colormap_seg, norm):
-        input_list = [x['input'] for x in self.eval_images['confidence'][0]]
-        input_list = [self.get_images_ready_for_display(x, colormap=None) for x in input_list]
-        input_list = np.stack(input_list, axis=0)
-
-        confidence_list = [x['confidence'] for x in self.eval_images['confidence'][0]]
-        confidence_list = [self.get_images_ready_for_display(x, colormap) for x in confidence_list]
-        confidence_list = np.stack(confidence_list, axis=0)
-
-        pred_list = [x['pred'] for x in self.eval_images['confidence'][0]]
-        pred_list = [self.get_seg_images_ready_for_display(x, colormap_seg, norm) for x in pred_list]
-        pred_list = np.stack(pred_list, axis=0)
-
-        self.writer.add_images(os.path.join('Confidence', 'input').replace('\\', '/'), input_list, self.epoch, dataformats='NHWC')
-        self.writer.add_images(os.path.join('Confidence', 'confidence_map').replace('\\', '/'), confidence_list, self.epoch, dataformats='NHWC')
-        self.writer.add_images(os.path.join('Confidence', 'prediction').replace('\\', '/'), pred_list, self.epoch, dataformats='NHWC')
-    
-    def set_up_image_seg(self, seg_dice, gt, pred, x):
-        seg_dice = seg_dice.cpu().numpy()
-        gt = gt.cpu().numpy()
-        pred = pred.cpu().numpy()
-        x = x.cpu().numpy()
-
-        if self.eval_images['seg'][1, -1] > seg_dice:
-
-            self.eval_images['seg'][0, -1]['gt'] = gt.astype(np.float32)
-            self.eval_images['seg'][0, -1]['pred'] = pred.astype(np.float32)
-            self.eval_images['seg'][0, -1]['input'] = x.astype(np.float32)
-            self.eval_images['seg'][1, -1] = seg_dice
-
-            sorted_indices = self.eval_images['seg'][1, :].argsort()
-            self.eval_images['seg'] = self.eval_images['seg'][:, sorted_indices]
-    
-    def set_up_image_aff(self, seg_dice,  aff, seg_aff, x):
-        seg_dice = seg_dice.cpu().numpy()
-        aff = aff.cpu().numpy()
-        seg_aff = seg_aff.cpu().numpy()
-        x = x.cpu().numpy()
-
-        if self.eval_images['affinity'][1, 0] < seg_dice:
-
-            self.eval_images['affinity'][0, 0]['aff'] = aff.astype(np.float32)
-            self.eval_images['affinity'][0, 0]['seg_aff'] = seg_aff.astype(np.float32)
-            self.eval_images['affinity'][0, 0]['input'] = x.astype(np.float32)
-            self.eval_images['affinity'][1, 0] = seg_dice
-
-            sorted_indices = self.eval_images['affinity'][1, :].argsort()
-            self.eval_images['affinity'] = self.eval_images['affinity'][:, sorted_indices]
-        
-    def set_up_image_confidence(self, seg_dice, confidence, pred, x):
-        seg_dice = seg_dice.cpu().numpy()
-        confidence = confidence.cpu().numpy()
-        pred = pred.cpu().numpy()
-        x = x.cpu().numpy()
-
-        if self.eval_images['confidence'][1, 0] < seg_dice:
-
-            self.eval_images['confidence'][0, 0]['confidence'] = confidence.astype(np.float32)
-            self.eval_images['confidence'][0, 0]['pred'] = pred.astype(np.float32)
-            self.eval_images['confidence'][0, 0]['input'] = x.astype(np.float32)
-            self.eval_images['confidence'][1, 0] = seg_dice
-
-            sorted_indices = self.eval_images['confidence'][1, :].argsort()
-            self.eval_images['confidence'] = self.eval_images['confidence'][:, sorted_indices]
-
-    def set_up_image_df(self, df_ssim, gt_df, pred_df, x):
-        df_ssim = df_ssim.cpu().numpy()
-        gt_df = gt_df.cpu().numpy()
-        pred_df = pred_df.cpu().numpy()
-        x = x.cpu().numpy()
-
-        if self.eval_images['df'][1, 0] < df_ssim:
-
-            self.eval_images['df'][0, 0]['gt_df'] = gt_df.astype(np.float32)
-            self.eval_images['df'][0, 0]['pred_df'] = pred_df.astype(np.float32)
-            self.eval_images['df'][0, 0]['input'] = x.astype(np.float32)
-            self.eval_images['df'][1, 0] = df_ssim
-
-            self.eval_images['df'] = self.eval_images['df'][:, self.eval_images['df'][1, :].argsort()]
-    
-    def set_up_image_sim(self, sim_l2, rec_sim, dec_sim, x):
-        sim_l2 = sim_l2.cpu().numpy()
-        rec_sim = rec_sim.cpu().numpy()
-        dec_sim = dec_sim.cpu().numpy()
-        x = x.cpu().numpy()
-
-        if self.eval_images['sim'][1, -1] > sim_l2:
-
-            self.eval_images['sim'][0, -1]['decoder_sm'] = dec_sim.astype(np.float32)
-            self.eval_images['sim'][0, -1]['reconstruction_sm'] = rec_sim.astype(np.float32)
-            self.eval_images['sim'][0, -1]['input'] = x.astype(np.float32)
-            self.eval_images['sim'][1, -1] = sim_l2
-
-            self.eval_images['sim'] = self.eval_images['sim'][:, self.eval_images['sim'][1, :].argsort()]
-    
-    def set_up_image_rec(self, rec_ssim, reconstructed, x):
-        rec_ssim = rec_ssim.cpu().numpy()
-        reconstructed = reconstructed.cpu().numpy()
-        x = x.cpu().numpy()
-
-        if self.eval_images['rec'][1] < rec_ssim:
-            self.eval_images['rec'][0, 0]['reconstruction'] = reconstructed.astype(np.float32)
-            self.eval_images['rec'][0, 0]['input'] = x.astype(np.float32)
-            self.eval_images['rec'][1, 0] = rec_ssim
-
-    def get_similarity_ready(self, sim):
-        view_size = int(self.image_size / self.similarity_downscale)
-        sim = sim[0].view(view_size, view_size)[None, None, :, :]
-        min_sim = sim.min()
-        max_sim = sim.max()
-        sim = interpolate(input=sim, scale_factor=self.similarity_downscale, mode='bicubic', antialias=True).squeeze()
-        sim = torch.clamp(sim, min_sim, max_sim)
-        return sim
-
-    def compute_dice(self, target, num_classes, output_seg):
+    def compute_dice(self, target, num_classes, output_seg, key):
         axes = tuple(range(1, len(target.shape)))
         tp_hard = torch.zeros((target.shape[0], num_classes - 1)).to(output_seg.device.index)
         fp_hard = torch.zeros((target.shape[0], num_classes - 1)).to(output_seg.device.index)
@@ -793,32 +715,27 @@ class nnMTLTrainerV2(nnUNetTrainer):
         fp_hard = fp_hard.sum(0, keepdim=False).detach().cpu().numpy()
         fn_hard = fn_hard.sum(0, keepdim=False).detach().cpu().numpy()
 
-        self.online_eval_foreground_dc.append(list((2 * tp_hard) / (2 * tp_hard + fp_hard + fn_hard + 1e-8)))
-        self.online_eval_tp.append(list(tp_hard))
-        self.online_eval_fp.append(list(fp_hard))
-        self.online_eval_fn.append(list(fn_hard))
+        self.table[key]['foreground_dc'].append(list((2 * tp_hard) / (2 * tp_hard + fp_hard + fn_hard + 1e-8)))
+        self.table[key]['tp'].append(list(tp_hard))
+        self.table[key]['fp'].append(list(fp_hard))
+        self.table[key]['fn'].append(list(fn_hard))
+
+        #self.online_eval_foreground_dc.append(list((2 * tp_hard) / (2 * tp_hard + fp_hard + fn_hard + 1e-8)))
+        #self.online_eval_tp.append(list(tp_hard))
+        #self.online_eval_fp.append(list(fp_hard))
+        #self.online_eval_fn.append(list(fn_hard))
             
         return seg_dice
 
 
-    def start_online_evaluation(self, pred, pred_df, reconstructed, x, target, gt_df, rec_sim, dec_sim, classification_pred, classification_gt, confidence, aff, seg_aff):
+    def start_online_evaluation(self, pred, reconstructed, x, target, gt_df, classification_pred, classification_gt, confidence, aff, seg_aff):
 
         with torch.no_grad():
             num_classes = pred.shape[1]
             output_softmax = softmax_helper(pred)
             output_seg = output_softmax.argmax(1)
             target = target[:, 0]
-            seg_dice = self.compute_dice(target, num_classes, output_seg)
-            #axes = tuple(range(1, len(target.shape)))
-            #tp_hard = torch.zeros((target.shape[0], num_classes - 1)).to(output_seg.device.index)
-            #fp_hard = torch.zeros((target.shape[0], num_classes - 1)).to(output_seg.device.index)
-            #fn_hard = torch.zeros((target.shape[0], num_classes - 1)).to(output_seg.device.index)
-            #for c in range(1, num_classes):
-            #    tp_hard[:, c - 1] = sum_tensor((output_seg == c).float() * (target == c).float(), axes=axes)
-            #    fp_hard[:, c - 1] = sum_tensor((output_seg == c).float() * (target != c).float(), axes=axes)
-            #    fn_hard[:, c - 1] = sum_tensor((output_seg != c).float() * (target == c).float(), axes=axes)
-#
-            #seg_dice = ((2 * tp_hard) / (2 * tp_hard + fp_hard + fn_hard + 1e-8))
+            seg_dice = self.compute_dice(target, num_classes, output_seg, key='seg')
 
             if self.classification:
                 acc = accuracy_score(y_true=classification_gt.cpu(), y_pred=classification_pred.cpu())
@@ -832,22 +749,14 @@ class nnMTLTrainerV2(nnUNetTrainer):
                     current_seg_aff = seg_aff[t]
                     current_aff = self.get_similarity_ready(current_aff)
                     current_seg_aff = self.get_similarity_ready(current_seg_aff)
-                    self.set_up_image_aff(seg_dice=seg_dice[t].mean(), aff=current_aff, seg_aff=current_seg_aff, x=current_x)
+                    self.vis.set_up_image_aff(seg_dice=seg_dice[t].mean(), aff=current_aff, seg_aff=current_seg_aff, x=current_x)
                     aff_l2 = torch.linalg.norm(current_aff.type(torch.float32) - current_seg_aff.type(torch.float32), ord=2)
                     self.aff_l2_list.append(aff_l2)
                 if self.reconstruction:
                     current_reconstructed = reconstructed[t, 0]
                     rec_ssim = ssim(current_x.type(torch.float32)[None, None, :, :], current_reconstructed.type(torch.float32)[None, None, :, :])
                     self.reconstruction_ssim_list.append(rec_ssim)
-                    self.set_up_image_rec(rec_ssim=rec_ssim, reconstructed=current_reconstructed, x=current_x)
-                    if self.similarity:
-                        current_rec_sim = rec_sim[t]
-                        current_dec_sim = dec_sim[t]
-                        sim_l2 = torch.linalg.norm(current_rec_sim.type(torch.float32) - current_dec_sim.type(torch.float32), ord=2)
-                        self.sim_l2_list.append(sim_l2)
-                        current_rec_sim = self.get_similarity_ready(current_rec_sim)
-                        current_dec_sim = self.get_similarity_ready(current_dec_sim)
-                        self.set_up_image_sim(sim_l2=sim_l2, rec_sim=current_rec_sim, dec_sim=current_dec_sim, x=current_x)
+                    self.vis.set_up_image_rec(rec_ssim=rec_ssim, reconstructed=current_reconstructed, x=current_x)
 
                 if self.directional_field:
                     current_pred_df = pred_df[t]
@@ -856,15 +765,15 @@ class nnMTLTrainerV2(nnUNetTrainer):
                     self.df_ssim_list.append(df_ssim)
                     current_gt_df = current_gt_df[0]
                     current_pred_df = current_pred_df[0]
-                    self.set_up_image_df(df_ssim=df_ssim, gt_df=current_gt_df, pred_df=current_pred_df, x=current_x)
+                    self.vis.set_up_image_df(df_ssim=df_ssim, gt_df=current_gt_df, pred_df=current_pred_df, x=current_x)
 
                 current_pred = torch.argmax(output_softmax[t], dim=0)
                 if self.adversarial_loss and self.unlabeled:
-                    self.set_up_image_confidence(seg_dice=seg_dice[t].mean(), confidence=confidence[t, 0], pred=current_pred, x=current_x)
+                    self.vis.set_up_image_confidence(seg_dice=seg_dice[t].mean(), confidence=confidence[t, 0], pred=current_pred, x=current_x)
 
                 current_target = target[t]
 
-                self.set_up_image_seg(seg_dice=seg_dice[t].mean(), gt=current_target, pred=current_pred, x=current_x)
+                self.vis.set_up_image_seg(seg_dice=seg_dice[t].mean(), gt=current_target, pred=current_pred, x=current_x)
                 
                 #with autocast():
 
@@ -877,77 +786,159 @@ class nnMTLTrainerV2(nnUNetTrainer):
             #self.online_eval_fp.append(list(fp_hard))
             #self.online_eval_fn.append(list(fn_hard))
 
-    def get_custom_colormap(self, colormap):
-        # extract all colors from the .jet map
-        cmaplist = [colormap(i) for i in range(colormap.N)]
+    
+    def start_online_evaluation_middle(self, pred, x, target_list, forward_registered_seg, backward_registered_seg, forward_motion, backward_motion, pseudo_label, cross_sim, middle_pred):
 
-        cmaplist[0] = (0, 0, 0, 1.0)
+        with torch.no_grad():
+            num_classes = pred.shape[1]
+            output_softmax = softmax_helper(pred)
+            output_softmax_middle = softmax_helper(middle_pred)
+            output_seg = output_softmax.argmax(1)
+            output_middle_seg = output_softmax_middle.argmax(1)
+            seg_dice = self.compute_dice(target_list[0][:, 0], num_classes, output_seg, key='seg')
 
-        # create the new map
-        cmap = mpl.colors.LinearSegmentedColormap.from_list('Custom cmap', cmaplist, colormap.N)
+            if self.registered_seg:
+                forward_registered_output_softmax = softmax_helper(forward_registered_seg)
+                backward_registered_output_softmax = softmax_helper(backward_registered_seg)
+                output_registered_seg_forward = forward_registered_output_softmax.argmax(1)
+                output_registered_seg_backward = backward_registered_output_softmax.argmax(1)
+                _ = self.compute_dice(target_list[1][:, 0], num_classes, output_registered_seg_forward, key='forward_motion')
+                _ = self.compute_dice(target_list[0][:, 0], num_classes, output_registered_seg_backward, key='backward_motion')
 
-        # define the bins and normalize
-        bounds = np.linspace(0, 4, 5)
-        norm = mpl.colors.BoundaryNorm(bounds, cmap.N)
+            #w1 = self.vis.get_weights_ready(w1, self.similarity_downscale)
+            #w2 = self.vis.get_weights_ready(w2, self.similarity_downscale)
+            for t in range(len(target_list[0][:, 0])):
+                current_x = x[0][t, 0]
+                current_middle = x[1][t, 0]
 
-        return cmap, norm
-        
-    def finish_online_evaluation(self):
-        self.online_eval_tp = np.sum(self.online_eval_tp, 0)
-        self.online_eval_fp = np.sum(self.online_eval_fp, 0)
-        self.online_eval_fn = np.sum(self.online_eval_fn, 0)
+                #current_cross_sim = cross_sim[t]
+                #self.corr_list.append(current_cross_sim.mean())
+                #self.vis.set_up_image_corr(seg_dice=seg_dice[t].mean(), corr=current_cross_sim)
+                #self.vis.set_up_image_pseudo_label(seg_dice=seg_dice[t].mean(), pred=pseudo_label[t, 0], unlabeled_input=current_middle)
+
+                if self.registered_seg:
+                    current_forward_motion = forward_motion[t, 0]
+                    current_backward_motion = backward_motion[t, 0]
+                    current_forward_registered_seg = output_registered_seg_forward[t]
+                    current_backward_registered_seg = output_registered_seg_backward[t]
+                    self.vis.set_up_image_motion(seg_dice=seg_dice[t].mean(), moving=output_seg[t], registered=current_forward_registered_seg, fixed=target_list[1][t, 0], motion=current_forward_motion, name='forward_motion')
+                    self.vis.set_up_image_motion(seg_dice=seg_dice[t].mean(), moving=output_middle_seg[t], registered=current_backward_registered_seg, fixed=target_list[0][t, 0], motion=current_backward_motion, name='backward_motion')
+
+                current_pred = torch.argmax(output_softmax[t], dim=0)
+                current_target = target_list[0][t, 0]
+                self.vis.set_up_image_seg(seg_dice=seg_dice[t].mean(), gt=current_target, pred=current_pred, x=current_x)
+
+    def start_online_evaluation_video(self, pred, x, target):
+
+        with torch.no_grad():
+            num_classes = pred.shape[1]
+            output_softmax = softmax_helper(pred)
+            output_seg = output_softmax.argmax(1)
+            seg_dice = self.compute_dice(target[:, 0], num_classes, output_seg, key='seg')
+
+            for t in range(len(target[:, 0])):
+                current_x = x[t, 0]
+
+                current_pred = torch.argmax(output_softmax[t], dim=0)
+                current_target = target[t, 0]
+                self.vis.set_up_image_seg(seg_dice=seg_dice[t].mean(), gt=current_target, pred=current_pred, x=current_x)
+    
+    def get_dc_per_class(self, key):
+        self.table[key]['tp'] = np.sum(self.table[key]['tp'], 0)
+        self.table[key]['fp'] = np.sum(self.table[key]['fp'], 0)
+        self.table[key]['fn'] = np.sum(self.table[key]['fn'], 0)
 
         global_dc_per_class = [i for i in [2 * i / (2 * i + j + k) for i, j, k in
-                                           zip(self.online_eval_tp, self.online_eval_fp, self.online_eval_fn)]
+                                           zip(self.table[key]['tp'], self.table[key]['fp'], self.table[key]['fn'])]
                                if not np.isnan(i)]
-        self.all_val_eval_metrics.append(np.mean(global_dc_per_class))
+        
+        return global_dc_per_class
 
+        
+    def finish_online_evaluation(self):
+        #self.online_eval_tp = np.sum(self.online_eval_tp, 0)
+        #self.online_eval_fp = np.sum(self.online_eval_fp, 0)
+        #self.online_eval_fn = np.sum(self.online_eval_fn, 0)
+
+        #global_dc_per_class = [i for i in [2 * i / (2 * i + j + k) for i, j, k in
+        #                                   zip(self.online_eval_tp, self.online_eval_fp, self.online_eval_fn)]
+        #                       if not np.isnan(i)]
+            
+        global_dc_per_class_seg = self.get_dc_per_class('seg')
+        self.writer.add_scalar('Epoch/Dice', torch.tensor(global_dc_per_class_seg).mean().item(), self.epoch)
+        self.all_val_eval_metrics.append(np.mean(global_dc_per_class_seg))
         self.print_to_log_file("(interpret this as an estimate for the Dice of the different classes. This is not exact.)")
-        self.print_to_log_file("Average global foreground Dice:", [np.round(i, 4) for i in global_dc_per_class])
+        self.print_to_log_file("Average global foreground Dice:", [np.round(i, 4) for i in global_dc_per_class_seg])
 
+        class_dice = {'RV': global_dc_per_class_seg[0], 'MYO': global_dc_per_class_seg[1], 'LV': global_dc_per_class_seg[2]}
+        overfit_data = {'Train': torch.tensor(self.train_loss).mean().item(), 'Val': torch.tensor(self.val_loss).mean().item()}
+        self.writer.add_scalars('Epoch/Train_vs_val_loss', overfit_data, self.epoch)
+        self.writer.add_scalars('Epoch/Class dice', class_dice, self.epoch)            
+
+        cmap, norm = self.vis.get_custom_colormap()
         if self.classification:
             self.print_to_log_file("Classification accuracy:", torch.tensor(self.classification_accuracy_list).mean().item())
             self.writer.add_scalar('Epoch/Classification accuracy', torch.tensor(self.classification_accuracy_list).mean().item(), self.epoch)
 
+        if self.middle:
+            #self.vis.log_pseudo_label_images(colormap_seg=cmap, norm=norm, epoch=self.epoch)
+            if self.registered_seg:
+                global_dc_per_class_forward_motion = self.get_dc_per_class('forward_motion')
+                global_dc_per_class_backward_motion = self.get_dc_per_class('backward_motion')
+                motion_dice = [(x1 + x2) / 2 for (x1, x2) in zip(global_dc_per_class_forward_motion, global_dc_per_class_backward_motion)]
+                data_dict = {'forward': torch.tensor(global_dc_per_class_forward_motion).mean().item(),
+                            'backward': torch.tensor(global_dc_per_class_backward_motion).mean().item()}
+                self.writer.add_scalars('Epoch/Motion estimation dice', data_dict, self.epoch)
+                self.print_to_log_file("Registered seg dice:", [np.round(i, 4) for i in motion_dice])
+                self.vis.log_motion_images(colormap_seg=cmap, colormap=cm.plasma, norm=norm, epoch=self.epoch, name='forward_motion')
+                self.vis.log_motion_images(colormap_seg=cmap, colormap=cm.plasma, norm=norm, epoch=self.epoch, name='backward_motion')
+            
+            #self.print_to_log_file("Average correlation:", torch.tensor(self.corr_list).mean().item())
+            #self.writer.add_scalar('Epoch/Correlation', torch.tensor(self.corr_list).mean().item(), self.epoch)
+            #self.vis.log_corr_images(colormap=cm.plasma, epoch=self.epoch)
+
+            #self.print_to_log_file("Average similarity L2 distance:", torch.tensor(self.sim_l2_list).mean().item())
+            #self.writer.add_scalar('Epoch/Similarity L2 distance', torch.tensor(self.sim_l2_list).mean().item(), self.epoch)
+            #self.vis.log_sim_images(colormap=cm.plasma, epoch=self.epoch)
+            #if not self.middle_unlabeled or self.v1:
+            #    self.print_to_log_file("Average correlation:", torch.tensor(self.corr_list).mean().item())
+            #    self.writer.add_scalar('Epoch/Correlation', torch.tensor(self.corr_list).mean().item(), self.epoch)
+            #    self.vis.log_corr_images(colormap=cm.plasma, epoch=self.epoch)
+            #self.vis.log_weights_images(colormap=cm.plasma, epoch=self.epoch)
+
         if self.reconstruction:
             self.print_to_log_file("Average reconstruction ssim:", torch.tensor(self.reconstruction_ssim_list).mean().item())
             self.writer.add_scalar('Epoch/Reconstruction ssim', torch.tensor(self.reconstruction_ssim_list).mean().item(), self.epoch)
-            self.log_rec_images()
-            if self.similarity:
-                self.print_to_log_file("Average similarity L2 distance:", torch.tensor(self.sim_l2_list).mean().item())
-                self.writer.add_scalar('Epoch/Similarity L2 distance', torch.tensor(self.sim_l2_list).mean().item(), self.epoch)
-                self.log_sim_images(colormap=cm.plasma)
-
-        class_dice = {'RV': global_dc_per_class[0], 'MYO': global_dc_per_class[1], 'LV': global_dc_per_class[2]}
-        overfit_data = {'Train': torch.tensor(self.train_loss).mean().item(), 'Val': torch.tensor(self.val_loss).mean().item()}
-        self.writer.add_scalars('Epoch/Train_vs_val_loss', overfit_data, self.epoch)
-        self.writer.add_scalars('Epoch/Class dice', class_dice, self.epoch)
-        self.writer.add_scalar('Epoch/Dice', torch.tensor(global_dc_per_class).mean().item(), self.epoch)
+            self.vis.log_rec_images(epoch=self.epoch)
 
         if self.directional_field:
             self.print_to_log_file("Average df ssim:", torch.tensor(self.df_ssim_list).mean().item())
             self.writer.add_scalar('Epoch/Directional field ssim', torch.tensor(self.df_ssim_list).mean().item(), self.epoch)
-            self.log_df_images(colormap=cm.viridis)
+            self.vis.log_df_images(colormap=cm.viridis, epoch=self.epoch)
 
         if self.affinity:
             self.print_to_log_file("Average affinity L2 distance:", torch.tensor(self.aff_l2_list).mean().item())
             self.writer.add_scalar('Epoch/Affinity L2 distance', torch.tensor(self.aff_l2_list).mean().item(), self.epoch)
-            self.log_aff_images(colormap=cm.plasma)
+            self.vis.log_aff_images(colormap=cm.plasma, epoch=self.epoch)
 
-        cmap, norm = self.get_custom_colormap(colormap=cm.jet)
-        self.log_seg_images(colormap=cmap, norm=norm)
+        self.vis.log_seg_images(colormap=cmap, norm=norm, epoch=self.epoch)
         if self.unlabeled and self.adversarial_loss:
-            self.log_confidence_images(colormap=cm.plasma, colormap_seg=cmap, norm=norm)
+            self.vis.log_confidence_images(colormap=cm.plasma, colormap_seg=cmap, norm=norm, epoch=self.epoch)
 
-        self.online_eval_foreground_dc = []
-        self.online_eval_tp = []
-        self.online_eval_fp = []
-        self.online_eval_fn = []
+        #self.online_eval_foreground_dc = []
+        #self.online_eval_tp = []
+        #self.online_eval_fp = []
+        #self.online_eval_fn = []
+        self.table = self.initialize_table()
+        self.vis.reset()
         self.reconstruction_ssim_list = []
         self.df_ssim_list = []
         self.sim_l2_list = []
+        self.corr_list = []
         self.val_loss = []
+        self.motion_ssim_list = []
         self.train_loss = []
+        #self.sim_l2_md_list = []
 
         if self.unlabeled:
             self.pseudo_online_eval_foreground_dc = []
@@ -955,7 +946,6 @@ class nnMTLTrainerV2(nnUNetTrainer):
             self.pseudo_online_eval_fp = []
             self.pseudo_online_eval_fn = []
 
-        self.eval_images = self.initialize_image_data()
 
     def run_online_evaluation(self, data, target, output, gt_df, classification_gt, confidence):
         """
@@ -966,17 +956,12 @@ class nnMTLTrainerV2(nnUNetTrainer):
         :return:
         """
 
-        pred = output['pred'][0]
-        pred_df = output['directional_field']
+        pred = self.select_deep_supervision(output['pred'])
 
         if self.reconstruction:
-            reconstructed = output['reconstructed'][0]
-            rec_sim = output['reconstruction_sm']
-            dec_sim = output['decoder_sm']
+            reconstructed = self.select_deep_supervision(output['reconstructed'])
         else:
             reconstructed = None
-            rec_sim = None
-            dec_sim = None
         
         if self.classification:
             classification_pred = output['classification']
@@ -992,16 +977,13 @@ class nnMTLTrainerV2(nnUNetTrainer):
             seg_aff = None
             aff = None
 
-        x = data[0]
-        target = target[0]
-        return self.start_online_evaluation(pred=pred, 
-                                            pred_df=pred_df, 
+        x = self.select_deep_supervision(data)
+        target = self.select_deep_supervision(target)
+        return self.start_online_evaluation(pred=pred,
                                             reconstructed=reconstructed, 
                                             x=x, 
                                             target=target, 
-                                            gt_df=gt_df, 
-                                            rec_sim=rec_sim, 
-                                            dec_sim=dec_sim,
+                                            gt_df=gt_df,
                                             classification_pred=classification_pred,
                                             classification_gt=classification_gt,
                                             confidence=confidence,
@@ -1009,26 +991,84 @@ class nnMTLTrainerV2(nnUNetTrainer):
                                             aff=aff)
         #return super().run_online_evaluation(output, target)
 
+
+    def run_online_evaluation_middle(self, data, target, output):
+        """
+        due to deep supervision the return value and the reference are now lists of tensors. We only need the full
+        resolution output because this is what we are interested in in the end. The others are ignored
+        :param output:
+        :param target:
+        :return:
+        """
+        pseudo_label = None
+        registered_seg = None
+
+        x = data
+        target = target
+        pred = self.select_deep_supervision(output['pred_l_1'])
+        forward_motion = output['forward_motion']
+        backward_motion = output['backward_motion']
+        middle_pred = self.select_deep_supervision(output['pred_l_2'])
+        if self.registered_seg:
+            forward_registered_seg = output['registered_seg_1']
+            backward_registered_seg = output['registered_seg_2']
+        cross_sim = output['cross_sim_l_1']
+
+        return self.start_online_evaluation_middle(pred=pred,
+                                                    x=x, 
+                                                    target_list=target,
+                                                    forward_motion=forward_motion,
+                                                    backward_motion=backward_motion,
+                                                    forward_registered_seg=forward_registered_seg,
+                                                    backward_registered_seg=backward_registered_seg,
+                                                    pseudo_label=pseudo_label,
+                                                    cross_sim=cross_sim,
+                                                    middle_pred=middle_pred)
+    
+    def run_online_evaluation_video(self, x, target, pred):
+        """
+        due to deep supervision the return value and the reference are now lists of tensors. We only need the full
+        resolution output because this is what we are interested in in the end. The others are ignored
+        :param output:
+        :param target:
+        :return:
+        """
+
+        return self.start_online_evaluation_video(pred=pred,
+                                                    x=x, 
+                                                    target=target)
+
     def validate(self, do_mirroring: bool = True, use_sliding_window: bool = True,
                  step_size: float = 0.5, save_softmax: bool = True, use_gaussian: bool = True, overwrite: bool = True,
                  validation_folder_name: str = 'validation_raw', debug: bool = False, all_in_gpu: bool = False,
                  segmentation_export_kwargs: dict = None, run_postprocessing_on_folds: bool = True):
         """
         We need to wrap this because we need to enforce self.network.do_ds = False for prediction
-        """
-        if self.config['no_da']:
-            do_mirroring = False
-            
+        """ 
         ds = self.network.do_ds
         self.network.do_ds = False
-        ret = super().validate(log_function=self.print_to_log_file, do_mirroring=do_mirroring, use_sliding_window=use_sliding_window, step_size=step_size,
+        if self.video:
+            ret = super().validate_video(processor=self.processor, log_function=self.print_to_log_file, do_mirroring=do_mirroring, use_sliding_window=use_sliding_window, step_size=step_size,
                                save_softmax=save_softmax, use_gaussian=use_gaussian,
                                overwrite=overwrite, validation_folder_name=validation_folder_name, debug=debug,
                                all_in_gpu=all_in_gpu, segmentation_export_kwargs=segmentation_export_kwargs,
                                run_postprocessing_on_folds=run_postprocessing_on_folds)
+        elif self.middle_unlabeled and not self.v1:
+            ret = super().validate_middle_unlabeled(log_function=self.print_to_log_file, do_mirroring=do_mirroring, use_sliding_window=use_sliding_window, step_size=step_size,
+                               save_softmax=save_softmax, use_gaussian=use_gaussian,
+                               overwrite=overwrite, validation_folder_name=validation_folder_name, debug=debug,
+                               all_in_gpu=all_in_gpu, segmentation_export_kwargs=segmentation_export_kwargs,
+                               run_postprocessing_on_folds=run_postprocessing_on_folds)
+        else:
+            ret = super().validate(log_function=self.print_to_log_file, do_mirroring=do_mirroring, use_sliding_window=use_sliding_window, step_size=step_size,
+                                save_softmax=save_softmax, use_gaussian=use_gaussian,
+                                overwrite=overwrite, validation_folder_name=validation_folder_name, debug=debug,
+                                all_in_gpu=all_in_gpu, segmentation_export_kwargs=segmentation_export_kwargs,
+                                run_postprocessing_on_folds=run_postprocessing_on_folds)
 
         self.network.do_ds = ds
         return ret
+
 
     def predict_preprocessed_data_return_seg_and_softmax(self, data: np.ndarray, do_mirroring: bool = True,
                                                          mirror_axes: Tuple[int] = None,
@@ -1054,17 +1094,14 @@ class nnMTLTrainerV2(nnUNetTrainer):
         return ret
 
     def compute_losses(self, x, output, target, do_backprop, gt_df=None, gt_classification=None):
-        loss_data = self.setup_loss_data()
-
-        for t in target:
-            assert t.shape[1] == 1
+        #loss_data = self.setup_loss_data()
 
         pred = output['pred']
         if self.reconstruction:
             if self.vae:
-                loss_data['vae'][1] = output['vq_loss']
+                self.loss_data['vae'][1] = output['vq_loss']
             elif self.vq_vae:
-                loss_data['vq_vae'][1] = output['vq_loss']
+                self.loss_data['vq_vae'][1] = output['vq_loss']
             reconstructed = output['reconstructed']
             decoder_sm = output['decoder_sm']
             reconstruction_sm = output['reconstruction_sm']
@@ -1077,7 +1114,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
 
         if self.classification:
             classification_loss = self.classification_loss(output['classification'], gt_classification)
-            loss_data['classification'][1] = classification_loss
+            self.loss_data['classification'][1] = classification_loss
 
         #print(x[0].dtype)
         #print(reconstructed[0].dtype)
@@ -1088,26 +1125,28 @@ class nnMTLTrainerV2(nnUNetTrainer):
         if self.directional_field:
             df_pred = output['directional_field']
             directional_field_loss = self.directional_field_loss(pred=df_pred, y_df=gt_df, y_seg=target[0].squeeze(1), iter_nb=self.iter_nb, do_backprop=do_backprop)
-            loss_data['directional_field'][1] = directional_field_loss
+            self.loss_data['directional_field'][1] = directional_field_loss
         
         if self.affinity:
-            loss_data['affinity'][1] = self.affinity_loss(output['affinity'], output['seg_affinity'])
+            self.loss_data['affinity'][1] = self.affinity_loss(output['affinity'], output['seg_affinity'])
+        if self.separability:
+            self.loss_data['separability'][1] = self.separability_loss(output['separability'])
+
         
         sim_loss = 0
         rec_loss = 0
         if self.reconstruction:
-
             #a = (self.end_similarity - self.start_similarity) / self.total_nb_of_iterations
             #b = self.start_similarity
             #self.current_similarity_weight = a * iter_nb + b
-            #loss_data['similarity'][0] = self.current_similarity_weight
+            #self.loss_data['similarity'][0] = self.current_similarity_weight
             rec_loss = self.reconstruction_loss(reconstructed, x)
-            loss_data['reconstruction'][1] = rec_loss
+            self.loss_data['reconstruction'][1] = rec_loss
 
             if self.similarity:
                 assert decoder_sm.shape == reconstruction_sm.shape
                 sim_loss = self.similarity_loss(decoder_sm, reconstruction_sm)
-                loss_data['similarity'][1] = sim_loss
+                self.loss_data['similarity'][1] = sim_loss
 
         if self.adversarial_loss:
             if not self.unlabeled:
@@ -1127,14 +1166,14 @@ class nnMTLTrainerV2(nnUNetTrainer):
 
                 assert fake.shape == real.shape
 
-                loss_data['adversarial'][1], discriminator_loss, output_real, output_fake = self.get_adversarial_loss(self.discriminator, 
+                self.loss_data['adversarial'][1], discriminator_loss, output_real, output_fake = self.get_adversarial_loss(self.discriminator, 
                                                                         self.discriminator_optimizer,
                                                                         real=real, 
                                                                         fake=fake,
                                                                         do_backprop=do_backprop)
 
                 
-                #loss_data['rec_adversarial'][1], rec_discriminator_loss, rec_output_real, rec_output_fake = self.get_adversarial_loss(self.rec_discriminator, 
+                #self.loss_data['rec_adversarial'][1], rec_discriminator_loss, rec_output_real, rec_output_fake = self.get_adversarial_loss(self.rec_discriminator, 
                 #                                                        self.rec_discriminator_optimizer,
                 #                                                        real=x[0], 
                 #                                                        fake=reconstructed[0],
@@ -1148,14 +1187,57 @@ class nnMTLTrainerV2(nnUNetTrainer):
                     #self.writer.add_scalar('Discriminator/Rec discriminator fake', rec_output_fake.mean(), self.iter_nb)
                     #self.writer.add_scalar('Discriminator/rec_discriminator_loss', rec_discriminator_loss, self.iter_nb)
             else:
-                loss_data['adversarial'][1] = 0
-                loss_data['confidence'][1] = 0
-            
+                self.loss_data['adversarial'][1] = 0
+                self.loss_data['confidence'][1] = 0
+        
         seg_loss = self.segmentation_loss(pred, target)
-        loss_data['segmentation'][1] = seg_loss
+        assert seg_loss.numel() == 1
+        self.loss_data['segmentation'][1] = seg_loss
 
-        return loss_data
+    def get_unlabeled_loss_weight(self):
+        if self.iter_nb < self.t1:
+            return 0
+        elif self.iter_nb >= self.t1 and self.iter_nb < self.t2:
+            return self.max_unlabeled_weight * ((self.iter_nb - self.t1) / (self.t2 - self.t1))
+        else:
+            return self.max_unlabeled_weight
 
+    def compute_losses_video(self, output, target):
+        seg_loss = 0
+        nb_frames = len(output['labeled_data'])
+        assert nb_frames == len(target)
+        for i in range(nb_frames):
+            seg_loss += self.segmentation_loss(output['labeled_data'][i], target[i])
+        self.loss_data['segmentation'][1] = seg_loss / nb_frames
+
+
+    def compute_losses_middle(self, output, target_list):
+        seg_loss_l_1 = self.segmentation_loss(output['pred_l_1'], target_list[0])
+        seg_loss_l_2 = self.segmentation_loss(output['pred_l_2'], target_list[1])
+        seg_loss_l = (seg_loss_l_1 + seg_loss_l_2) / 2
+        self.loss_data['segmentation'][1] = seg_loss_l
+
+        if self.registered_seg:
+            motion_loss_seg_1 = self.motion_estimation_loss_seg(output['registered_seg_1'], self.select_deep_supervision(target_list[1]))
+            motion_loss_seg_2 = self.motion_estimation_loss_seg(output['registered_seg_2'], self.select_deep_supervision(target_list[0]))
+            self.loss_data['motion_estimation_seg'][1] = (motion_loss_seg_1 + motion_loss_seg_2) / 2
+
+        if not self.middle_unlabeled:
+            self.loss_data['similarity'][1] = (output['cross_sim_l_1'].mean() + output['cross_sim_l_2'].mean()) / 2
+            #else:
+            #    similarity_loss = 1 - output['cross_sim_1'].mean()
+            #    self.loss_data['similarity'][1] = similarity_loss
+
+        #if self.adversarial_loss:
+        #    fake = torch.nn.functional.one_hot(output['pseudo_label'].squeeze(1).long(), num_classes=4).permute(0, 3, 1, 2).float()
+        #    self.loss_data['adversarial'][1] = self.get_adversarial_loss(fake)
+#
+        #if self.middle_classification:
+        #    gt1 = torch.full(size=(self.batch_size,), fill_value=0.0, device='cuda:0')
+        #    gt2 = torch.full(size=(self.batch_size,), fill_value=1.0, device='cuda:0')
+        #    mcl1 = self.middle_classification_loss(torch.sigmoid(output['classification_pred1']), gt1)
+        #    mcl2 = self.middle_classification_loss(torch.sigmoid(output['classification_pred2']), gt2)
+        #    self.loss_data['middle_classification'][1] = (mcl1 + mcl2) / 2
 
 
     def compute_losses_unlabeled(self, x, output, target, fake):
@@ -1214,6 +1296,205 @@ class nnMTLTrainerV2(nnUNetTrainer):
 
         return loss_data
 
+    def select_deep_supervision(self, x):
+        if self.deep_supervision:
+            return x[0]
+        else:
+            return x
+    
+
+    def run_iteration_video(self, data_generator, do_backprop=True, run_online_evaluation=False):
+        """
+        gradient clipping improves training stability
+
+        :param data_generator:
+        :param do_backprop:
+        :param run_online_evaluation:
+        :return:
+        """
+        data_dict = next(data_generator)
+        data_list = data_dict['data']
+        target_list = data_dict['target']
+
+        for i, data in enumerate(data_list):
+            data = maybe_to_torch(data)
+            if torch.cuda.is_available():
+                data = to_cuda(data)
+            data_list[i] = data
+        
+        for i, target in enumerate(target_list):
+            target = maybe_to_torch(target)
+            if torch.cuda.is_available():
+                target = to_cuda(target)
+            target_list[i] = target
+
+        #matplotlib.use('QtAgg')
+        #fig, ax = plt.subplots(len(data_list), 2)
+        #for i in range(len(data_list)):
+        #    ax[i, 0].imshow(data_list[i][0, 0].cpu(), cmap='gray')
+        #    if i < 2:
+        #        ax[i, 1].imshow(target_list[i][0, 0].cpu(), cmap='gray')
+        #plt.show()
+
+        data_list = [self.select_deep_supervision(d) for d in data_list]
+        if self.crop:
+            with torch.no_grad():
+                network_input, padding_need, translation_dists = self.processor.preprocess(data_list=data_list, idx=data_dict['registered_idx'])
+            self.optimizer.zero_grad()
+
+            #matplotlib.use('QtAgg')
+            #fig, ax = plt.subplots(self.batch_size, self.video_length)
+            #ax[0].imshow(network_input['labeled_data'][0][0, 0].cpu(), cmap='gray')
+            #ax[1].imshow(network_input['labeled_data'][1][0, 0].cpu(), cmap='gray')
+            #ax[2].imshow(network_input['labeled_data'][2][0, 0].cpu(), cmap='gray')
+            #plt.show()
+
+            #matplotlib.use('QtAgg')
+            #fig, ax = plt.subplots(1, 2)
+            #ax[0].imshow(data_list[0][0, 0].cpu(), cmap='gray')
+            #ax[1].imshow(network_input['labeled_data'][0][0, 0].cpu(), cmap='gray')
+            #ax[0].axis('off')
+            #ax[1].axis('off')
+            #plt.show()
+
+
+            output = self.network(network_input)
+            output = self.processor.uncrop(output, padding_need, translation_dists)
+            assert output.shape[-1] == self.image_size, print(output.shape[-1])
+            output = {'labeled_data': [output[:, i] for i in range(output.shape[1])]}
+
+            #fig, ax = plt.subplots(self.batch_size, 6)
+            #ax[0].imshow(torch.argmax(torch.softmax(output.detach().cpu(), dim=2), dim=2)[0, 0], cmap='gray')
+            #ax[1].imshow(torch.argmax(torch.softmax(output.detach().cpu(), dim=2), dim=2)[0, 1], cmap='gray')
+            #test = self.uncrop(network_input, padding_need, translation_dists)
+            #for i in range(self.batch_size):
+            #    ax[2].imshow(test[i, 0, 0].cpu(), cmap='gray')
+            #    ax[3].imshow(test[i, 1, 0].cpu(), cmap='gray')
+            #    ax[4].imshow(data_volume[i, 0, 0].cpu(), cmap='gray')
+            #    ax[5].imshow(data_volume[i, 1, 0].cpu(), cmap='gray')
+            #plt.show()
+        else:
+            self.optimizer.zero_grad()
+            network_input = {'labeled_data': data_list}
+            output = self.network(network_input)
+
+        self.compute_losses_video(output=output, target=target_list)
+        
+        l = self.consolidate_only_one_loss_data(self.loss_data, log=do_backprop)
+        #del loss_data
+
+        if not do_backprop:
+            self.val_loss.append(l.mean().detach().cpu())
+        else:
+            self.train_loss.append(l.mean().detach().cpu())
+            l.mean().backward()
+            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+            self.optimizer.step()
+
+        if run_online_evaluation:
+            target_list = [self.select_deep_supervision(t) for t in target_list]
+            idx = data_dict['idx']
+            self.run_online_evaluation_video(x=network_input['labeled_data'][idx], target=target_list[idx], pred=output['labeled_data'][idx])
+        del data_list, target_list, network_input
+
+        if do_backprop:
+            self.iter_nb += 1
+
+        return l.mean().detach().cpu().numpy()
+    
+    def run_iteration_middle(self, data_generator, do_backprop=True, run_online_evaluation=False):
+        """
+        gradient clipping improves training stability
+
+        :param data_generator:
+        :param do_backprop:
+        :param run_online_evaluation:
+        :return:
+        """
+        data_dict = next(data_generator)
+        data_list = data_dict['data']
+        target_list = data_dict['target']
+
+        for i, data in enumerate(data_list):
+            data = maybe_to_torch(data)
+            if torch.cuda.is_available():
+                data = to_cuda(data)
+            data_list[i] = data
+        
+        for i, target in enumerate(target_list):
+            target = maybe_to_torch(target)
+            if torch.cuda.is_available():
+                target = to_cuda(target)
+            target_list[i] = target
+
+        #matplotlib.use('QtAgg')
+        #fig, ax = plt.subplots(len(data_list), 2)
+        #for i in range(len(data_list)):
+        #    ax[i, 0].imshow(data_list[i][0, 0].cpu(), cmap='gray')
+        #    if i < 2:
+        #        ax[i, 1].imshow(target_list[i][0, 0].cpu(), cmap='gray')
+        #plt.show()
+
+        self.optimizer.zero_grad()
+
+        if self.adversarial_loss and do_backprop:
+            self.discriminator.train()
+        elif self.adversarial_loss:
+            self.discriminator.eval()
+
+        data_list = [self.select_deep_supervision(d) for d in data_list]
+        network_input = {'labeled_data': [data_list[0], data_list[1]]}
+        if self.middle_unlabeled:
+            network_input = {'unlabeled_data': [data_list[2]]}
+            if self.v1:
+                network_input['unlabeled_data'].append(data_list[3])
+
+        output = self.network(network_input)
+        self.compute_losses_middle(output=output, target_list=target_list)
+
+        #if self.middle and do_backprop and not self.middle_unlabeled:
+        #    #self.cumulative_average = (self.loss_data['segmentation'][1].mean() + self.iter_nb * self.cumulative_average) / (self.iter_nb + 1)
+        #    self.cumulative_ema = self.alpha_ema * self.loss_data['segmentation'][1].mean().detach().cpu() + (1 - self.alpha_ema) * self.cumulative_ema
+        #    if self.one_vs_all:
+        #        for i in range(len(data_dict['slice_distance'])):
+        #            if data_dict['slice_distance'][i] not in self.past_percent:
+        #                s_0 = 0
+        #            else:
+        #                s_0 = self.past_percent[data_dict['slice_distance'][i]]
+        #            slice_loss = self.loss_data['segmentation'][1][i] / self.cumulative_ema
+        #            self.past_percent[data_dict['slice_distance'][i]] = self.alpha_ema * slice_loss.detach().cpu() + (1 - self.alpha_ema) * s_0
+        #    else:
+        #        for i in range(len(data_dict['middle_slice_percent'])):
+        #            if data_dict['middle_slice_percent'][i] not in self.past_percent:
+        #                s_0 = 0
+        #            else:
+        #                s_0 = self.past_percent[data_dict['middle_slice_percent'][i]]
+        #            slice_loss = self.loss_data['segmentation'][1][i]
+        #            self.past_percent[data_dict['middle_slice_percent'][i]] = self.alpha_ema * slice_loss.detach().cpu() + (1 - self.alpha_ema) * s_0
+        
+        l = self.consolidate_only_one_loss_data(self.loss_data, log=do_backprop)
+        #del loss_data
+
+        if not do_backprop:
+            self.val_loss.append(l.mean().detach().cpu())
+        else:
+            self.train_loss.append(l.mean().detach().cpu())
+            l.mean().backward()
+            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+            self.optimizer.step()
+
+            if self.adversarial_loss:
+                self.train_discriminator(target, output2['pseudo_label'])
+
+        if run_online_evaluation:
+            target_list = [self.select_deep_supervision(t) for t in target_list]
+            self.run_online_evaluation_middle(data=data_list, target=target_list, output=output)
+        del data_list, target_list, network_input
+
+        if do_backprop:
+            self.iter_nb += 1
+
+        return l.mean().detach().cpu().numpy()
 
     def run_iteration(self, data_generator, do_backprop=True, run_online_evaluation=False):
         """
@@ -1236,19 +1517,11 @@ class nnMTLTrainerV2(nnUNetTrainer):
         else:
             gt_classification = None
 
-        if self.middle:
-            middle = data_dict['middle']
-            middle = maybe_to_torch(middle)
-            if torch.cuda.is_available():
-                middle = to_cuda(middle)
-        else:
-            middle = None
 
         #matplotlib.use('QtAgg')
-        #fig, ax = plt.subplots(1, 3)
+        #fig, ax = plt.subplots(1, 2)
         #ax[0].imshow(data[0][0, 0], cmap='gray')
-        #ax[1].imshow(data_dict['middle'][0, 0], cmap='gray')
-        #ax[2].imshow(target[0][0, 0], cmap='gray')
+        #ax[1].imshow(target[0][0, 0], cmap='gray')
         #plt.show()
 
         if self.directional_field:
@@ -1274,76 +1547,31 @@ class nnMTLTrainerV2(nnUNetTrainer):
 
         self.optimizer.zero_grad()
 
-        #output = self.network(data[0], middle=middle)
-
-        output = self.network(data[0])
+        output = self.network(self.select_deep_supervision(data))
+        self.compute_losses(x=data, output=output, target=target, gt_df=gt_df, do_backprop=do_backprop, gt_classification=gt_classification)
         
-        loss_data = self.compute_losses(x=data, output=output, target=target, gt_df=gt_df, do_backprop=do_backprop, gt_classification=gt_classification)
-        l = self.consolidate_only_one_loss_data(loss_data, log=do_backprop)
+        l = self.consolidate_only_one_loss_data(self.loss_data, log=do_backprop)
         #del loss_data
 
         if not do_backprop:
-            self.val_loss.append(l.detach().cpu())
+            self.val_loss.append(l.mean().detach().cpu())
         else:
-            if self.vq_vae:
-                self.writer.add_scalar('Iteration/Perplexity', output['perplexity'], self.iter_nb)
-            self.train_loss.append(l.detach().cpu())
-            l.backward()
+            self.train_loss.append(l.mean().detach().cpu())
+            l.mean().backward()
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.optimizer.step()
 
-        #if self.fp16 and not self.vq_vae and not self.adversarial_loss:
-        #    with autocast():
-#
-        #        #matplotlib.use('QtAgg')
-        #        #plt.imshow(data[0][0, 0].detach().cpu(), cmap='gray')
-        #        #plt.show()
-#
-        #        output = self.network(data[0], middle=middle)
-#
-        #        l = self.compute_losses(x=data, output=output, target=target, gt_df=gt_df, do_backprop=do_backprop)
-#
-        #        if not do_backprop:
-        #            self.val_loss.append(l.detach().cpu())
-        #        else:
-        #            self.train_loss.append(l.detach().cpu())
-        #        #del data
-#
-        #        #l = self.loss(output, target)
-#
-        #    if do_backprop:
-        #        self.amp_grad_scaler.scale(l).backward()
-        #        self.amp_grad_scaler.unscale_(self.optimizer)
-        #        torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-        #        self.amp_grad_scaler.step(self.optimizer)
-        #        self.amp_grad_scaler.update()
-        #else:
-        #    output = self.network(data[0], middle=middle)
-        #    l = self.compute_losses(x=data, output=output, target=target, gt_df=gt_df, do_backprop=do_backprop)
-#
-        #    if not do_backprop:
-        #        self.val_loss.append(l.detach().cpu())
-        #    else:
-        #        if self.vq_vae:
-        #            self.writer.add_scalar('Iteration/Perplexity', output['perplexity'], self.iter_nb)
-        #        self.train_loss.append(l.detach().cpu())
-        #    #l = self.loss(output, target)
-#
-        #    if do_backprop:
-        #        l.backward()
-        #        torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-        #        self.optimizer.step()
+            if self.adversarial_loss:
+                self.train_discriminator(target, output2['pseudo_label'])
 
         if run_online_evaluation:
             self.run_online_evaluation(data=data, target=target, output=output, gt_df=gt_df, classification_gt=gt_classification, confidence=None)
-        del data
-
-        del target
+        del data, target
 
         if do_backprop:
             self.iter_nb += 1
 
-        return l.detach().cpu().numpy()
+        return l.mean().detach().cpu().numpy()
     
 
     def get_middle_ready(self, tr_data_dict, un_data_dict):
@@ -1490,14 +1718,15 @@ class nnMTLTrainerV2(nnUNetTrainer):
             return confidence
 
     def consolidate_only_one_loss_data(self, loss_data, log):
-        loss = 0
+        loss = 0.0
         for key, value in loss_data.items():
             if log:
-                self.writer.add_scalar('Iteration/' + key + ' loss', value[1], self.iter_nb)
-            loss += value[0] * value[1]
+                self.writer.add_scalar('Iteration/' + key + ' loss', value[1].mean(), self.iter_nb)
+            loss += value[0] * value[1].mean()
+            assert loss.numel() == 1
         if log:
             self.writer.add_scalars('Iteration/loss weights', {key:value[0] for key, value in loss_data.items()}, self.iter_nb)
-            self.writer.add_scalar('Iteration/Training loss', loss, self.iter_nb)
+            self.writer.add_scalar('Iteration/Training loss', loss.mean(), self.iter_nb)
         return loss
 
     def consolidate_loss_data(self, loss_data1, loss_data2, log, description=None, w1=1, w2=1):
@@ -1657,6 +1886,14 @@ class nnMTLTrainerV2(nnUNetTrainer):
             else:
                 train_indices.append(idx)
         return train_indices, test_indices
+    
+    def split_folders(self, all_keys_sorted):
+        out = {'RACINE': [], 'cholcoeur': [], 'desktop': []}
+        for k in all_keys_sorted:
+            properties = load_pickle(self.dataset[k]['properties_file'])
+            folder_name = properties['original_path'].split('\\')[1]
+            out[folder_name].append(k)
+        return out
 
     def do_split(self):
         """
@@ -1672,8 +1909,6 @@ class nnMTLTrainerV2(nnUNetTrainer):
         if self.fold == "all":
             # if fold==all then we use all images for training and validation
             tr_keys = val_keys = list(self.dataset.keys())
-            if self.unlabeled:
-                un_tr_keys, un_val_keys= list(self.unlabeled_dataset.keys())
         else:
             splits_file = join(self.dataset_directory, "splits_final.pkl")
 
@@ -1689,6 +1924,31 @@ class nnMTLTrainerV2(nnUNetTrainer):
                     test_keys = np.array(all_keys_sorted)[test_idx]
                     splits[-1]['train'] = train_keys
                     splits[-1]['val'] = test_keys
+                elif '028' in self.dataset_directory:
+                    self.print_to_log_file("Creating new 5-fold cross-validation split...")
+                    all_keys_sorted = np.sort(list(self.dataset.keys()))
+                    folder_dict = self.split_folders(all_keys_sorted)
+                    payload_dict = {'train': {'RACINE': [], 'cholcoeur': [], 'desktop': []},
+                                     'val': {'RACINE': [], 'cholcoeur': [], 'desktop': []}}
+                    for k in folder_dict.keys():
+                        kf = KFold(n_splits=5, shuffle=True, random_state=12345)
+                        patients = np.unique([i[:10] for i in folder_dict[k]])
+                        for tr, val in kf.split(patients):
+                            tr_patients = patients[tr]
+                            payload_dict['train'][k].append(np.array([i for i in folder_dict[k] if i[:10] in tr_patients]))
+                            val_patients = patients[val]
+                            payload_dict['val'][k].append(np.array([i for i in folder_dict[k] if i[:10] in val_patients]))
+                    splits = [OrderedDict()] * 5
+                    for j in range(5):
+                        current_folder_data_train = payload_dict['train']
+                        current_folder_data_val = payload_dict['val']
+                        train_list = []
+                        val_list = []
+                        for k in current_folder_data_train.keys():
+                            train_list.append(current_folder_data_train[k][j])
+                            val_list.append(current_folder_data_val[k][j])
+                        splits[j]['train'] = np.concatenate(train_list)
+                        splits[j]['val'] = np.concatenate(val_list)
                 else:
                     self.print_to_log_file("Creating new 5-fold cross-validation split...")
                     all_keys_sorted = np.sort(list(self.dataset.keys()))
@@ -1713,24 +1973,24 @@ class nnMTLTrainerV2(nnUNetTrainer):
                 splits = load_pickle(splits_file)
                 self.print_to_log_file("The split file contains %d splits." % len(splits))
             
-            if self.unlabeled:
-                un_splits_file = join(self.dataset_directory, "unlabeled_splits_final.pkl")
-                if not isfile(un_splits_file):
-                    self.print_to_log_file("Creating new unlabeled train test split...")
-                    un_tr_keys, un_val_keys = train_test_split(list(self.unlabeled_dataset.keys()), test_size=int(len(all_keys_sorted) / 5), random_state=12345, shuffle=True)
-                    un_train_test_split = OrderedDict()
-                    un_train_test_split['un_train'] = un_tr_keys
-                    un_train_test_split['un_val'] = un_val_keys
-                    save_pickle(un_train_test_split, un_splits_file)
-                else:
-                    self.print_to_log_file("Using splits from existing unlabeled train test split file:", un_splits_file)
-                    un_train_test_split = load_pickle(un_splits_file)
-
-            if self.unlabeled:
-                un_tr_keys = un_train_test_split['un_train']
-                un_val_keys = un_train_test_split['un_val']
-                self.print_to_log_file("This unlabeled train test split has %d training and %d validation cases."
-                                       % (len(un_tr_keys), len(un_val_keys)))
+            #if self.unlabeled:
+            #    un_splits_file = join(self.dataset_directory, "unlabeled_splits_final.pkl")
+            #    if not isfile(un_splits_file):
+            #        self.print_to_log_file("Creating new unlabeled train test split...")
+            #        un_tr_keys, un_val_keys = train_test_split(list(self.unlabeled_dataset.keys()), test_size=int(len(all_keys_sorted) / 5), random_state=12345, shuffle=True)
+            #        un_train_test_split = OrderedDict()
+            #        un_train_test_split['un_train'] = un_tr_keys
+            #        un_train_test_split['un_val'] = un_val_keys
+            #        save_pickle(un_train_test_split, un_splits_file)
+            #    else:
+            #        self.print_to_log_file("Using splits from existing unlabeled train test split file:", un_splits_file)
+            #        un_train_test_split = load_pickle(un_splits_file)
+#
+            #if self.unlabeled:
+            #    un_tr_keys = un_train_test_split['un_train']
+            #    un_val_keys = un_train_test_split['un_val']
+            #    self.print_to_log_file("This unlabeled train test split has %d training and %d validation cases."
+            #                           % (len(un_tr_keys), len(un_val_keys)))
 
             self.print_to_log_file("Desired fold for training: %d" % self.fold)
             if self.fold < len(splits):
@@ -1761,7 +2021,12 @@ class nnMTLTrainerV2(nnUNetTrainer):
         for i in val_keys:
             self.dataset_val[i] = self.dataset[i]
         
-        if self.unlabeled:
+        
+        if self.unlabeled or self.middle_unlabeled:
+            tr_patient_id = np.unique([x[:10] for x in tr_keys])
+            val_patient_id = np.unique([x[:10] for x in val_keys])
+            un_tr_keys = [x for x in self.unlabeled_dataset.keys() if x[:10] in tr_patient_id]
+            un_val_keys = [x for x in self.unlabeled_dataset.keys() if x[:10] in val_patient_id]
             un_tr_keys.sort()
             un_val_keys.sort()
             self.dataset_un_tr = OrderedDict()
@@ -1770,6 +2035,9 @@ class nnMTLTrainerV2(nnUNetTrainer):
             self.dataset_un_val = OrderedDict()
             for i in un_val_keys:
                 self.dataset_un_val[i] = self.unlabeled_dataset[i]
+        else:
+            self.dataset_un_val = None
+            self.dataset_un_tr = None
 
     def setup_DA_params(self):
         """
@@ -1779,8 +2047,9 @@ class nnMTLTrainerV2(nnUNetTrainer):
 
         :return:
         """
-        self.deep_supervision_scales = [[1, 1, 1]] + list(list(i) for i in 1 / np.cumprod(
-            np.vstack(self.net_num_pool_op_kernel_sizes), axis=0))[:-1]
+        if self.deep_supervision:
+            self.deep_supervision_scales = [[1, 1, 1]] + list(list(i) for i in 1 / np.cumprod(
+                np.vstack(self.net_num_pool_op_kernel_sizes), axis=0))[:-1]
 
         if self.threeD:
             self.data_aug_params = default_3D_augmentation_params
@@ -1908,8 +2177,8 @@ class nnMTLTrainerV2(nnUNetTrainer):
         if not torch.cuda.is_available():
             self.print_to_log_file("WARNING!!! You are attempting to run training on a CPU (torch.cuda.is_available() is False). This can be VERY slow!")
 
-        _ = self.tr_gen.next()
-        _ = self.val_gen.next()
+        #_ = self.tr_gen.next()
+        #_ = self.val_gen.next()
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -2003,6 +2272,213 @@ class nnMTLTrainerV2(nnUNetTrainer):
             os.remove(join(self.output_folder, "model_latest.model"))
         if isfile(join(self.output_folder, "model_latest.model.pkl")):
             os.remove(join(self.output_folder, "model_latest.model.pkl"))
+    
+    def run_training_mtl_middle(self):
+        if not torch.cuda.is_available():
+            self.print_to_log_file("WARNING!!! You are attempting to run training on a CPU (torch.cuda.is_available() is False). This can be VERY slow!")
+
+        #_ = self.tr_gen.next()
+        #_ = self.val_gen.next()
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        self._maybe_init_amp()
+
+        maybe_mkdir_p(self.output_folder)        
+        self.plot_network_architecture()
+
+        if cudnn.benchmark and cudnn.deterministic:
+            warn("torch.backends.cudnn.deterministic is True indicating a deterministic training is desired. "
+                 "But torch.backends.cudnn.benchmark is True as well and this will prevent deterministic training! "
+                 "If you want deterministic then set benchmark=False")
+
+        if not self.was_initialized:
+            self.initialize(True)
+
+        while self.epoch < self.max_num_epochs:
+            self.print_to_log_file("\nepoch: ", self.epoch)
+            epoch_start_time = time()
+            train_losses_epoch = []
+
+            # train one epoch
+            self.network.train()
+
+            if self.use_progress_bar:
+                with trange(self.num_batches_per_epoch) as tbar:
+                    for b in tbar:
+                        tbar.set_description("Epoch {}/{}".format(self.epoch+1, self.max_num_epochs))
+
+                        l = self.run_iteration_middle(self.tr_gen, do_backprop=True)
+
+                        tbar.set_postfix(loss=l)
+                        train_losses_epoch.append(l)
+            else:
+                for _ in range(self.num_batches_per_epoch):
+                    l = self.run_iteration_middle(self.tr_gen, True)
+                    train_losses_epoch.append(l)
+
+            self.all_tr_losses.append(np.mean(train_losses_epoch))
+            self.print_to_log_file("train loss : %.4f" % self.all_tr_losses[-1])
+
+            if self.epoch % self.config['epoch_log'] == 0:
+                #if self.middle and not self.middle_unlabeled:
+                #    self.get_slice_percent()
+                #    self.dl_val.percent = self.percent
+                with torch.no_grad():
+                    # validation with train=False
+                    self.network.eval()
+                    val_losses = []
+                    for b in range(self.num_val_batches_per_epoch):
+                        l = self.run_iteration_middle(self.val_gen, do_backprop=False, run_online_evaluation=True)
+                        val_losses.append(l)
+                    self.all_val_losses.append(np.mean(val_losses))
+                    self.print_to_log_file("validation loss: %.4f" % self.all_val_losses[-1])
+
+                    if self.also_val_in_tr_mode:
+                        self.network.train()
+                        # validation with train=True
+                        val_losses = []
+                        for b in range(self.num_val_batches_per_epoch):
+                            l = self.run_iteration_middle(self.val_gen, do_backprop=False)
+                            val_losses.append(l)
+                        self.all_val_losses_tr_mode.append(np.mean(val_losses))
+                        self.print_to_log_file("validation loss (train=True): %.4f" % self.all_val_losses_tr_mode[-1])
+
+                    self.finish_online_evaluation()
+                    max_memory_allocated = torch.cuda.max_memory_allocated(device=self.network.get_device())
+                    self.print_to_log_file("Max GPU Memory allocated:", max_memory_allocated / 10e8, "Gb")
+                    self.print_to_log_file("Max CPU Memory allocated:", psutil.Process(os.getpid()).memory_info().rss / 10e8, "Gb")
+
+            #self.update_train_loss_MA()  # needed for lr scheduler and stopping of training
+
+            continue_training = True
+            #continue_training = self.on_epoch_end()
+
+            self.maybe_update_lr()
+            self.maybe_save_checkpoint()
+
+            epoch_end_time = time()
+
+            if not continue_training:
+                # allows for early stopping
+                break
+
+            self.epoch += 1
+            self.print_to_log_file("This epoch took %f s\n" % (epoch_end_time - epoch_start_time))
+        
+        #if self.middle and not self.middle_unlabeled:
+        #    self.get_slice_percent()
+        #    self.network.percent = self.percent
+
+        self.epoch -= 1  # if we don't do this we can get a problem with loading model_final_checkpoint.
+
+        if self.save_final_checkpoint: self.save_checkpoint(join(self.output_folder, "model_final_checkpoint.model"))
+        # now we can delete latest as it will be identical with final
+        if isfile(join(self.output_folder, "model_latest.model")):
+            os.remove(join(self.output_folder, "model_latest.model"))
+        if isfile(join(self.output_folder, "model_latest.model.pkl")):
+            os.remove(join(self.output_folder, "model_latest.model.pkl"))
+    
+    def run_training_mtl_video(self):
+        if not torch.cuda.is_available():
+            self.print_to_log_file("WARNING!!! You are attempting to run training on a CPU (torch.cuda.is_available() is False). This can be VERY slow!")
+
+        #_ = self.tr_gen.next()
+        #_ = self.val_gen.next()
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        self._maybe_init_amp()
+
+        maybe_mkdir_p(self.output_folder)        
+        self.plot_network_architecture()
+
+        if cudnn.benchmark and cudnn.deterministic:
+            warn("torch.backends.cudnn.deterministic is True indicating a deterministic training is desired. "
+                 "But torch.backends.cudnn.benchmark is True as well and this will prevent deterministic training! "
+                 "If you want deterministic then set benchmark=False")
+
+        if not self.was_initialized:
+            self.initialize(True)
+
+        while self.epoch < self.max_num_epochs:
+            self.print_to_log_file("\nepoch: ", self.epoch)
+            epoch_start_time = time()
+            train_losses_epoch = []
+
+            # train one epoch
+            self.network.train()
+
+            if self.use_progress_bar:
+                with trange(self.num_batches_per_epoch) as tbar:
+                    for b in tbar:
+                        tbar.set_description("Epoch {}/{}".format(self.epoch+1, self.max_num_epochs))
+
+                        l = self.run_iteration_video(self.tr_gen, do_backprop=True)
+
+                        tbar.set_postfix(loss=l)
+                        train_losses_epoch.append(l)
+            else:
+                for _ in range(self.num_batches_per_epoch):
+                    l = self.run_iteration_video(self.tr_gen, True)
+                    train_losses_epoch.append(l)
+
+            self.all_tr_losses.append(np.mean(train_losses_epoch))
+            self.print_to_log_file("train loss : %.4f" % self.all_tr_losses[-1])
+
+            if self.epoch % self.config['epoch_log'] == 0:
+                with torch.no_grad():
+                    # validation with train=False
+                    self.network.eval()
+                    val_losses = []
+                    for b in range(self.num_val_batches_per_epoch):
+                        l = self.run_iteration_video(self.val_gen, do_backprop=False, run_online_evaluation=True)
+                        val_losses.append(l)
+                    self.all_val_losses.append(np.mean(val_losses))
+                    self.print_to_log_file("validation loss: %.4f" % self.all_val_losses[-1])
+
+                    if self.also_val_in_tr_mode:
+                        self.network.train()
+                        # validation with train=True
+                        val_losses = []
+                        for b in range(self.num_val_batches_per_epoch):
+                            l = self.run_iteration_video(self.val_gen, do_backprop=False)
+                            val_losses.append(l)
+                        self.all_val_losses_tr_mode.append(np.mean(val_losses))
+                        self.print_to_log_file("validation loss (train=True): %.4f" % self.all_val_losses_tr_mode[-1])
+
+                    self.finish_online_evaluation()
+                    max_memory_allocated = torch.cuda.max_memory_allocated(device=self.network.get_device())
+                    self.print_to_log_file("Max GPU Memory allocated:", max_memory_allocated / 10e8, "Gb")
+                    self.print_to_log_file("Max CPU Memory allocated:", psutil.Process(os.getpid()).memory_info().rss / 10e8, "Gb")
+
+            #self.update_train_loss_MA()  # needed for lr scheduler and stopping of training
+
+            continue_training = True
+            #continue_training = self.on_epoch_end()
+
+            self.maybe_update_lr()
+            self.maybe_save_checkpoint()
+
+            epoch_end_time = time()
+
+            if not continue_training:
+                # allows for early stopping
+                break
+
+            self.epoch += 1
+            self.print_to_log_file("This epoch took %f s\n" % (epoch_end_time - epoch_start_time))
+
+        self.epoch -= 1  # if we don't do this we can get a problem with loading model_final_checkpoint.
+
+        if self.save_final_checkpoint: self.save_checkpoint(join(self.output_folder, "model_final_checkpoint.model"))
+        # now we can delete latest as it will be identical with final
+        if isfile(join(self.output_folder, "model_latest.model")):
+            os.remove(join(self.output_folder, "model_latest.model"))
+        if isfile(join(self.output_folder, "model_latest.model.pkl")):
+            os.remove(join(self.output_folder, "model_latest.model.pkl"))
 
     def run_training(self):
         """
@@ -2015,9 +2491,14 @@ class nnMTLTrainerV2(nnUNetTrainer):
         self.maybe_update_lr(self.epoch)  # if we dont overwrite epoch then self.epoch+1 is used which is not what we
         # want at the start of the training
         ds = self.network.do_ds
-        self.network.do_ds = True
+        #self.network.do_ds = True
         self.save_debug_information()
-        ret = self.run_training_mtl()
+        if self.middle:
+            ret = self.run_training_mtl_middle()
+        elif self.video:
+            ret = self.run_training_mtl_video()
+        else:
+            ret = self.run_training_mtl()
         self.network.do_ds = ds
         return ret
 
@@ -2117,8 +2598,6 @@ class nnMTLTrainerV2(nnUNetTrainer):
                     self.print_to_log_file("Max CPU Memory allocated:", psutil.Process(os.getpid()).memory_info().rss / 10e8, "Gb")
             #self.update_train_loss_MA()  # needed for lr scheduler and stopping of training
 
-            
-
             continue_training = True
             #continue_training = self.on_epoch_end()
 
@@ -2146,19 +2625,36 @@ class nnMTLTrainerV2(nnUNetTrainer):
     
     def load_dataset(self):
         self.dataset = load_dataset(self.folder_with_preprocessed_data)
-        if self.unlabeled:
+        if self.unlabeled or self.middle_unlabeled:
             self.unlabeled_dataset = load_unlabeled_dataset(self.folder_with_preprocessed_data)
     
     def get_basic_generators(self):
         self.load_dataset()
         self.do_split()
-        if self.middle:
-            dl_tr = DataLoader2DMiddle(self.dataset_tr, self.basic_generator_patch_size, self.patch_size, self.batch_size,
-                                    oversample_foreground_percent=self.oversample_foreground_percent,
-                                    pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
-            dl_val = DataLoader2DMiddle(self.dataset_val, self.patch_size, self.patch_size, self.batch_size,
-                                    oversample_foreground_percent=self.oversample_foreground_percent,
-                                    pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
+        dl_un_tr = None
+        dl_un_val = None
+        if self.video:
+            dl_tr = DataLoaderVideo(self.dataset_tr, self.basic_generator_patch_size, self.patch_size, self.batch_size, is_val=False, video_length=self.video_length,
+                                        oversample_foreground_percent=self.oversample_foreground_percent,
+                                        pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
+            dl_val = DataLoaderVideo(self.dataset_val, self.patch_size, self.patch_size, self.batch_size, is_val=True, video_length=self.video_length,
+                                        oversample_foreground_percent=self.oversample_foreground_percent,
+                                        pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
+        elif self.middle:
+            if self.middle_unlabeled:
+                dl_tr = DataLoader2DMiddleUnlabeled(self.dataset_tr, self.basic_generator_patch_size, self.patch_size, self.batch_size, v1=self.v1, unlabeled_dataset=self.dataset_un_tr, is_val=False, one_vs_all=self.one_vs_all,
+                                        oversample_foreground_percent=self.oversample_foreground_percent,
+                                        pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
+                dl_val = DataLoader2DMiddleUnlabeled(self.dataset_val, self.patch_size, self.patch_size, self.batch_size, v1=self.v1, unlabeled_dataset=self.dataset_un_val, is_val=True, one_vs_all=self.one_vs_all,
+                                        oversample_foreground_percent=self.oversample_foreground_percent,
+                                        pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
+            else:
+                dl_tr = DataLoader2DMiddle(self.dataset_tr, self.basic_generator_patch_size, self.patch_size, self.batch_size, is_val=False, one_vs_all=self.one_vs_all,
+                                        oversample_foreground_percent=self.oversample_foreground_percent,
+                                        pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
+                dl_val = DataLoader2DMiddle(self.dataset_val, self.patch_size, self.patch_size, self.batch_size, is_val=True, one_vs_all=self.one_vs_all,
+                                        oversample_foreground_percent=self.oversample_foreground_percent,
+                                        pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
         else:
             dl_tr = DataLoader2D(self.dataset_tr, self.basic_generator_patch_size, self.patch_size, self.batch_size,
                                 oversample_foreground_percent=self.oversample_foreground_percent,
@@ -2173,9 +2669,6 @@ class nnMTLTrainerV2(nnUNetTrainer):
                 dl_un_val = DataLoader2DUnlabeled(self.dataset_un_val, self.basic_generator_patch_size, self.patch_size, self.batch_size,
                                             oversample_foreground_percent=self.oversample_foreground_percent,
                                             pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r', classification=self.classification)
-            else:
-                dl_un_tr = None
-                dl_un_val = None
         return dl_tr, dl_val, dl_un_tr, dl_un_val
 
 
@@ -2229,39 +2722,81 @@ class nnMTLTrainerV2(nnUNetTrainer):
 
         return adversarial_loss, w_list
 
-    def get_adversarial_loss(self, discriminator, discriminator_optimizer, real, fake, do_backprop):
-        discriminator_loss = None
-        adversarial_loss = None
-        output_real = None
-        output_fake = None
-        label = torch.full((self.batch_size,), 1, dtype=torch.float, device=real.device)
-        if do_backprop:
-            discriminator.zero_grad()
-            discriminator_optimizer.zero_grad()
-            output_real = discriminator(real).reshape(-1)
-            loss_real = self.adv_loss(output_real, label)
-            #loss_real.backward() #retain_graph if reuse output of discriminator for r1 penalty
+    #def get_adversarial_loss(self, discriminator, discriminator_optimizer, real, fake, do_backprop):
+    #    discriminator_loss = None
+    #    adversarial_loss = None
+    #    output_real = None
+    #    output_fake = None
+    #    label = torch.full((self.batch_size,), 1, dtype=torch.float, device=real.device)
+    #    if do_backprop:
+    #        discriminator.zero_grad()
+    #        discriminator_optimizer.zero_grad()
+    #        output_real = discriminator(real).reshape(-1)
+    #        loss_real = self.adv_loss(output_real, label)
+    #        #loss_real.backward() #retain_graph if reuse output of discriminator for r1 penalty
+#
+    #        r1_penalty = 0
+    #        #if iter_nb % self.r1_penalty_iteration == 0:
+    #        #    r1_penalty = logisticGradientPenalty(real, discriminator, weight=5)
+    #    
+    #        loss_real_r1 = loss_real + r1_penalty
+    #        loss_real_r1.backward()
+#
+    #        assert fake.size() == real.size()
+    #        label.fill_(0)
+    #        output_fake = discriminator(fake.detach()).view(-1)
+    #        loss_fake = self.adv_loss(output_fake, label)
+    #        loss_fake.backward()
+#
+    #        discriminator_loss = loss_real + loss_fake + r1_penalty
+    #        discriminator_optimizer.step()
+    #        #discriminator_scheduler.step()
 
-            r1_penalty = 0
-            #if iter_nb % self.r1_penalty_iteration == 0:
-            #    r1_penalty = logisticGradientPenalty(real, discriminator, weight=5)
-        
-            loss_real_r1 = loss_real + r1_penalty
-            loss_real_r1.backward()
+        ##self.model.reconstruction.zero_grad()
+        #label.fill_(1)
+        #output = discriminator(fake).view(-1)
+        #adversarial_loss = self.adv_loss(output, label)
+#
+        #return adversarial_loss, discriminator_loss, output_real, output_fake
 
-            assert fake.size() == real.size()
-            label.fill_(0)
-            output_fake = discriminator(fake.detach()).view(-1)
-            loss_fake = self.adv_loss(output_fake, label)
-            loss_fake.backward()
-
-            discriminator_loss = loss_real + loss_fake + r1_penalty
-            discriminator_optimizer.step()
-            #discriminator_scheduler.step()
-
-        #self.model.reconstruction.zero_grad()
-        label.fill_(1)
-        output = discriminator(fake).view(-1)
+    def get_adversarial_loss(self, fake):
+        label = torch.full((self.batch_size,), 1, dtype=torch.float, device=fake.device)
+        output = self.discriminator(fake).view(-1)
         adversarial_loss = self.adv_loss(output, label)
+        return adversarial_loss
+    
+    def get_discriminator_loss(self, real, fake):
+        label = torch.full((self.batch_size,), 1, dtype=torch.float, device=real.device)
+        output_real = self.discriminator(real).reshape(-1)
+        loss_real = self.adv_loss(output_real, label)
+        #loss_real.backward() #retain_graph if reuse output of discriminator for r1 penalty
 
-        return adversarial_loss, discriminator_loss, output_real, output_fake
+        r1_penalty = 0
+        #if iter_nb % self.r1_penalty_iteration == 0:
+        #    r1_penalty = logisticGradientPenalty(real, discriminator, weight=5)
+    
+        loss_real_r1 = loss_real + r1_penalty
+        loss_real_r1.backward()
+
+        assert fake.size() == real.size()
+        label.fill_(0)
+        output_fake = self.discriminator(fake.detach()).view(-1)
+        loss_fake = self.adv_loss(output_fake, label)
+        loss_fake.backward()
+
+        discriminator_loss = loss_real + loss_fake + r1_penalty
+        return discriminator_loss, output_real, output_fake
+    
+    def train_discriminator(self, target, pseudo_label):
+        self.discriminator.zero_grad()
+        self.discriminator_optimizer.zero_grad()
+        real = torch.nn.functional.one_hot(target.squeeze(1).long(), num_classes=4).permute(0, 3, 1, 2).float()
+        fake = torch.nn.functional.one_hot(pseudo_label.squeeze(1).long(), num_classes=4).permute(0, 3, 1, 2).float()
+
+        discriminator_loss, output_real, output_fake = self.get_discriminator_loss(real, fake)
+
+        self.writer.add_scalar('Discriminator/Real', output_real.mean(), self.iter_nb)
+        self.writer.add_scalar('Discriminator/Fake', output_fake.mean(), self.iter_nb)
+        self.writer.add_scalar('Discriminator/Loss', discriminator_loss, self.iter_nb)
+
+        self.discriminator_optimizer.step()

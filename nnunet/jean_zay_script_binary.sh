@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=gpu_mono          # nom du job
-##SBATCH -C v100-16g                  # reserver des GPU 16 Go seulement
+#SBATCH -C v100-16g                  # reserver des GPU 16 Go seulement
 ##SBATCH --partition=gpu_p2          # de-commente pour la partition gpu_p2
 #SBATCH --qos=qos_gpu-t3            # qos_gpu-t4 qos_gpu-dev qos_gpu-t3
 #SBATCH --nodes=1                    # on demande un noeud

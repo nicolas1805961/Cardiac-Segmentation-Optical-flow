@@ -15,13 +15,43 @@
 from collections import OrderedDict
 import numpy as np
 from multiprocessing import Pool
+from math import ceil, floor
+from scipy.signal import savgol_filter
+from numpy.lib.stride_tricks import sliding_window_view
 
 from batchgenerators.dataloading.data_loader import SlimDataLoaderBase
 
 from nnunet.configuration import default_num_threads
 from nnunet.paths import preprocessing_output_dir
 from batchgenerators.utilities.file_and_folder_operations import *
+import matplotlib
+import matplotlib.pyplot as plt
+from copy import copy
 
+def get_slice_nb_one_vs_all(random_slice):
+    if random_slice >= 1:
+        middle_slice = random_slice - 1
+    else:
+        middle_slice = 1
+    return random_slice, middle_slice
+
+def select_idx(nb_slices, random_slice, keys):
+    random_percent = random_slice / nb_slices
+    min_d = 100
+    for i in range(len(keys)):
+        d = abs(keys[i] - random_percent)
+        if d < min_d:
+            min_d = d
+            idx = i
+    if get_idx(keys[idx] * nb_slices) >= nb_slices:
+        idx = idx - 1
+    return keys[idx]
+
+def get_idx(x):
+    if x % 1 > 0.5:
+        return int(ceil(x))
+    else:
+        return int(floor(x))
 
 def get_case_identifiers(folder):
     case_identifiers = [i[:-4] for i in os.listdir(folder) if i.endswith("npz") and (i.find("segFromPrevStage") == -1)]
@@ -849,7 +879,7 @@ class DataLoader2DUnlabeled(SlimDataLoaderBase):
 
 
 class DataLoader2DMiddle(SlimDataLoaderBase):
-    def __init__(self, data, patch_size, final_patch_size, batch_size, oversample_foreground_percent=0.0,
+    def __init__(self, data, patch_size, final_patch_size, batch_size, is_val, one_vs_all, oversample_foreground_percent=0.0,
                  memmap_mode="r", pseudo_3d_slices=1, pad_mode="edge",
                  pad_kwargs_data=None, pad_sides=None):
         """
@@ -880,6 +910,7 @@ class DataLoader2DMiddle(SlimDataLoaderBase):
         if pad_kwargs_data is None:
             pad_kwargs_data = OrderedDict()
         self.pad_kwargs_data = pad_kwargs_data
+        self.is_val = is_val
         self.pad_mode = pad_mode
         self.pseudo_3d_slices = pseudo_3d_slices
         self.oversample_foreground_percent = oversample_foreground_percent
@@ -888,6 +919,8 @@ class DataLoader2DMiddle(SlimDataLoaderBase):
         self.list_of_keys = list(self._data.keys())
         self.need_to_pad = np.array(patch_size) - np.array(final_patch_size)
         self.memmap_mode = memmap_mode
+        self.one_vs_all = one_vs_all
+        self.percent = None
         if pad_sides is not None:
             if not isinstance(pad_sides, np.ndarray):
                 pad_sides = np.array(pad_sides)
@@ -917,6 +950,8 @@ class DataLoader2DMiddle(SlimDataLoaderBase):
         data = np.zeros(self.data_shape, dtype=np.float32)
         seg = np.zeros(self.seg_shape, dtype=np.float32)
         middle = np.zeros(self.data_shape, dtype=np.float32)
+        middle_seg = np.zeros(self.seg_shape, dtype=np.float32)
+        batched_slice_distance = np.zeros(shape=(self.batch_size,), dtype=np.float32)
 
         case_properties = []
         for j, i in enumerate(selected_keys):
@@ -925,11 +960,6 @@ class DataLoader2DMiddle(SlimDataLoaderBase):
             else:
                 properties = load_pickle(self._data[i]['properties_file'])
             case_properties.append(properties)
-
-            if self.get_do_oversample(j):
-                force_fg = True
-            else:
-                force_fg = False
 
             if not isfile(self._data[i]['data_file'][:-4] + ".npy"):
                 # lets hope you know what you're doing
@@ -942,33 +972,65 @@ class DataLoader2DMiddle(SlimDataLoaderBase):
                 case_all_data = case_all_data[:, None]
 
             # first select a slice. This can be either random (no force fg) or guaranteed to contain some class
-            if not force_fg:
-                random_slice = np.random.choice(case_all_data.shape[1])
-                selected_class = None
-            else:
-                # these values should have been precomputed
-                if 'class_locations' not in properties.keys():
-                    raise RuntimeError("Please rerun the preprocessing with the newest version of nnU-Net!")
-
-                foreground_classes = np.array(
-                    [i for i in properties['class_locations'].keys() if len(properties['class_locations'][i]) != 0])
-                foreground_classes = foreground_classes[foreground_classes > 0]
-                if len(foreground_classes) == 0:
-                    selected_class = None
-                    random_slice = np.random.choice(case_all_data.shape[1])
-                    print('case does not contain any foreground classes', i)
+            if self.is_val:
+                if self.one_vs_all:
+                    random_slice = np.random.choice(case_all_data.shape[1]) 
+                    random_slice, middle_slice = get_slice_nb_one_vs_all(random_slice=random_slice)
                 else:
-                    selected_class = np.random.choice(foreground_classes)
-
-                    voxels_of_that_class = properties['class_locations'][selected_class]
-                    valid_slices = np.unique(voxels_of_that_class[:, 0])
-                    random_slice = np.random.choice(valid_slices)
-                    voxels_of_that_class = voxels_of_that_class[voxels_of_that_class[:, 0] == random_slice]
-                    voxels_of_that_class = voxels_of_that_class[:, 1:]
-            #middle_slice = case_all_data.shape[1] // 2
-            middle_slice = random_slice - 1 if random_slice > 0 else case_all_data.shape[1] - 1
-            if middle_slice == random_slice:
-                middle_slice = random_slice - 1
+                    #middle_slice = get_idx(case_all_data.shape[1] * 0.33)
+                    middle_slice = get_idx(case_all_data.shape[1] * self.percent)
+                    p_non_middle = np.full(shape=(case_all_data.shape[1],), fill_value=1 / case_all_data.shape[1])
+                    #p_non_middle = np.full(shape=(case_all_data.shape[1],), fill_value=1 / (case_all_data.shape[1] - 1)).astype(float)
+                    #p_non_middle[middle_slice] = 0.0
+                    random_slice = np.random.choice(case_all_data.shape[1], p=p_non_middle)
+                batched_slice_distance = None
+            else:
+                if self.one_vs_all:
+                    random_slice = np.random.choice(case_all_data.shape[1])
+                    if random_slice == 0:
+                        middle_slice = 1
+                    elif random_slice == case_all_data.shape[1] - 1:
+                        middle_slice = case_all_data.shape[1] - 2
+                    else:
+                        p_middle = np.full(shape=(case_all_data.shape[1],), fill_value=0.0)
+                        p_middle[random_slice + 1] = 0.5
+                        p_middle[random_slice - 1] = 0.5
+                        middle_slice = np.random.choice(case_all_data.shape[1], p=p_middle)
+                    #p_middle = np.full(shape=(case_all_data.shape[1],), fill_value=1 / (case_all_data.shape[1] - 1))
+                    #p_middle[random_slice] = 0
+                    #middle_slice = np.random.choice(case_all_data.shape[1], p=p_middle)
+                    #assert middle_slice != random_slice
+                    #slice_distance = abs(middle_slice - random_slice) / case_all_data.shape[1]
+                    #batched_slice_distance[j] = slice_distance
+                else:
+                    quart1 = case_all_data.shape[1] * 0.056
+                    quart2 = case_all_data.shape[1] * 0.56
+                    idx1 = get_idx(quart1)
+                    idx2 = get_idx(quart2)
+                    p = np.zeros(shape=(case_all_data.shape[1],))
+                    p_middle = np.copy(p)
+                    p_non_middle = np.copy(p)
+                    middle_nb = idx2 - idx1
+                    non_middle_nb = case_all_data.shape[1] - middle_nb
+                    p_middle[idx1:idx2] = 1 / middle_nb
+                    middle_slice = np.random.choice(case_all_data.shape[1], p=p_middle)
+                    p_non_middle[p_middle == 0] = 1 / non_middle_nb
+                    if middle_slice == 0:
+                        middle_slice_percent[j] = 0.49 / case_all_data.shape[1]
+                    else:
+                        middle_slice_percent[j] = middle_slice / case_all_data.shape[1]
+                    random_slice = np.random.choice(case_all_data.shape[1], p=p_non_middle)
+                    random_slice_percent = None
+                    if self.interpolate:
+                        p_non_middle[middle_slice + 1] = 0
+                        p_non_middle[middle_slice - 1] = 0
+                        p_non_middle[p_non_middle != 0] = 1 / np.count_nonzero(p_non_middle)
+                        random_slice = np.random.choice(case_all_data.shape[1], p=p_non_middle)
+                        inter_slice = (random_slice + middle_slice) // 2
+                        assert inter_slice != random_slice and inter_slice != middle_slice
+                        #print(middle_slice)
+                        #print(inter_slice)
+                        #print(random_slice)
 
             # now crop case_all_data to contain just the slice of interest. If we want additional slice above and
             # below the current slice, here is where we get them. We stack those as additional color channels
@@ -1021,16 +1083,8 @@ class DataLoader2DMiddle(SlimDataLoaderBase):
 
             # if not force_fg then we can just sample the bbox randomly from lb and ub. Else we need to make sure we get
             # at least one of the foreground classes in the patch
-            if not force_fg or selected_class is None:
-                bbox_x_lb = np.random.randint(lb_x, ub_x + 1)
-                bbox_y_lb = np.random.randint(lb_y, ub_y + 1)
-            else:
-                # this saves us a np.unique. Preprocessing already did that for all cases. Neat.
-                selected_voxel = voxels_of_that_class[np.random.choice(len(voxels_of_that_class))]
-                # selected voxel is center voxel. Subtract half the patch size to get lower bbox voxel.
-                # Make sure it is within the bounds of lb and ub
-                bbox_x_lb = max(lb_x, selected_voxel[0] - self.patch_size[0] // 2)
-                bbox_y_lb = max(lb_y, selected_voxel[1] - self.patch_size[1] // 2)
+            bbox_x_lb = np.random.randint(lb_x, ub_x + 1)
+            bbox_y_lb = np.random.randint(lb_y, ub_y + 1)
 
             bbox_x_ub = bbox_x_lb + self.patch_size[0]
             bbox_y_ub = bbox_y_lb + self.patch_size[1]
@@ -1056,8 +1110,14 @@ class DataLoader2DMiddle(SlimDataLoaderBase):
                                                             (-min(0, bbox_x_lb), max(bbox_x_ub - shape[0], 0)),
                                                             (-min(0, bbox_y_lb), max(bbox_y_ub - shape[1], 0))),
                                         self.pad_mode, **self.pad_kwargs_data)
+            
+            middle_data_segonly = np.pad(middle_data[-1:], ((0, 0),
+                                                                (-min(0, bbox_x_lb), max(bbox_x_ub - shape[0], 0)),
+                                                                (-min(0, bbox_y_lb), max(bbox_y_ub - shape[1], 0))),
+                                           'constant', **{'constant_values': -1})
                 
             middle[j] = middle_data_donly
+            middle_seg[j] = middle_data_segonly
 
             case_all_data = case_all_data[:, valid_bbox_x_lb:valid_bbox_x_ub,
                             valid_bbox_y_lb:valid_bbox_y_ub]
@@ -1076,8 +1136,546 @@ class DataLoader2DMiddle(SlimDataLoaderBase):
             seg[j] = case_all_data_segonly
 
         keys = selected_keys
-        return {'data': data, 'seg': seg, 'properties': case_properties, "keys": keys, "middle": middle}
+        return {'data': [data, middle], 'seg': [seg, middle_seg], 'properties': case_properties, "keys": keys, "slice_distance": batched_slice_distance}
 
+
+class DataLoader2DMiddleUnlabeled(SlimDataLoaderBase):
+    def __init__(self, data, patch_size, final_patch_size, batch_size, is_val, v1, one_vs_all, unlabeled_dataset, oversample_foreground_percent=0.0,
+                 memmap_mode="r", pseudo_3d_slices=1, pad_mode="edge",
+                 pad_kwargs_data=None, pad_sides=None):
+        """
+        This is the basic data loader for 2D networks. It uses preprocessed data as produced by my (Fabian) preprocessing.
+        You can load the data with load_dataset(folder) where folder is the folder where the npz files are located. If there
+        are only npz files present in that folder, the data loader will unpack them on the fly. This may take a while
+        and increase CPU usage. Therefore, I advise you to call unpack_dataset(folder) first, which will unpack all npz
+        to npy. Don't forget to call delete_npy(folder) after you are done with training?
+        Why all the hassle? Well the decathlon dataset is huge. Using npy for everything will consume >1 TB and that is uncool
+        given that I (Fabian) will have to store that permanently on /datasets and my local computer. With this strategy all
+        data is stored in a compressed format (factor 10 smaller) and only unpacked when needed.
+        :param data: get this with load_dataset(folder, stage=0). Plug the return value in here and you are g2g (good to go)
+        :param patch_size: what patch size will this data loader return? it is common practice to first load larger
+        patches so that a central crop after data augmentation can be done to reduce border artifacts. If unsure, use
+        get_patch_size() from data_augmentation.default_data_augmentation
+        :param final_patch_size: what will the patch finally be cropped to (after data augmentation)? this is the patch
+        size that goes into your network. We need this here because we will pad patients in here so that patches at the
+        border of patients are sampled properly
+        :param batch_size:
+        :param num_batches: how many batches will the data loader produce before stopping? None=endless
+        :param seed:
+        :param stage: ignore this (Fabian only)
+        :param transpose: ignore this
+        :param random: sample randomly; CAREFUL! non-random sampling requires batch_size=1, otherwise you will iterate batch_size times over the dataset
+        :param pseudo_3d_slices: 7 = 3 below and 3 above the center slice
+        """
+        super(DataLoader2DMiddleUnlabeled, self).__init__(data, batch_size, None)
+        if pad_kwargs_data is None:
+            pad_kwargs_data = OrderedDict()
+        self.pad_kwargs_data = pad_kwargs_data
+        self.is_val = is_val
+        self.pad_mode = pad_mode
+        self.v1 = v1
+        self.pseudo_3d_slices = pseudo_3d_slices
+        self.oversample_foreground_percent = oversample_foreground_percent
+        self.final_patch_size = final_patch_size
+        self.patch_size = patch_size
+        self.list_of_keys = list(self._data.keys())
+        self.un_list_of_keys = list(unlabeled_dataset.keys())
+        self.need_to_pad = np.array(patch_size) - np.array(final_patch_size)
+        self.memmap_mode = memmap_mode
+        self.one_vs_all = one_vs_all
+        self.percent = None
+        if pad_sides is not None:
+            if not isinstance(pad_sides, np.ndarray):
+                pad_sides = np.array(pad_sides)
+            self.need_to_pad += pad_sides
+        self.pad_sides = pad_sides
+        self.data_shape, self.seg_shape = self.determine_shapes()
+        self.un_data = unlabeled_dataset
+
+    def determine_shapes(self):
+        num_seg = 1
+
+        k = list(self._data.keys())[0]
+        if isfile(self._data[k]['data_file'][:-4] + ".npy"):
+            case_all_data = np.load(self._data[k]['data_file'][:-4] + ".npy", self.memmap_mode)
+        else:
+            case_all_data = np.load(self._data[k]['data_file'])['data']
+        num_color_channels = case_all_data.shape[0] - num_seg
+        data_shape = (self.batch_size, num_color_channels, *self.patch_size)
+        seg_shape = (self.batch_size, num_seg, *self.patch_size)
+        return data_shape, seg_shape
+
+    def get_do_oversample(self, batch_idx):
+        return not batch_idx < round(self.batch_size * (1 - self.oversample_foreground_percent))
+    
+    def get_slice_nb(self, random_slice, case_all_data):
+        if random_slice == 0:
+            middle_slice = 1
+        else:
+            middle_slice = random_slice - 1
+        #if self.v1:
+        #    if random_slice == 0:
+        #        middle_slice = 1
+        #    else:
+        #        middle_slice = random_slice - 1
+        #else:
+        #    if self.is_val:
+        #        if random_slice == 0:
+        #            middle_slice = 1
+        #        else:
+        #            middle_slice = random_slice - 1
+        #    else:
+        #        if random_slice == 0:
+        #            middle_slice = 1
+        #        elif random_slice == case_all_data.shape[1] - 1:
+        #            middle_slice = case_all_data.shape[1] - 2
+        #        else:
+        #            p_middle = np.full(shape=(case_all_data.shape[1],), fill_value=0.0)
+        #            p_middle[random_slice + 1] = 0.5
+        #            p_middle[random_slice - 1] = 0.5
+        #            middle_slice = np.random.choice(case_all_data.shape[1], p=p_middle)
+        return middle_slice
+
+    def generate_train_batch(self):
+        selected_keys = np.random.choice(self.list_of_keys, self.batch_size, True, None)
+        three_lists = []
+        for i in range(len(selected_keys)):
+            if self.v1:
+                key_l_1 = key_l_2 = selected_keys[i]
+                patient_id = key_l_1[:10]
+                filtered = self.un_list_of_keys + self.list_of_keys
+                filtered.remove(key_l_1)
+                filtered = [x for x in filtered if x[:10] in patient_id]
+                key_u = np.random.choice(filtered)
+                three_lists.append([key_l_1, key_l_2, key_u, key_u])
+            else:
+                key_l_1 = selected_keys[i]
+                patient_id = key_l_1[:10]
+                key_l_2 = [x for x in self.list_of_keys if x[:10] in patient_id and x != key_l_1][0]
+                if self.is_val:
+                    key_u_1 = min(key_l_1, key_l_2, key=lambda x: int(x[-2:]))
+                else:
+                    filtered = [x for x in self.un_list_of_keys if x[:10] in patient_id]
+                    key_u_1 = np.random.choice(filtered)
+                three_lists.append([key_l_1, key_l_2, key_u_1])
+
+        data_l_1 = np.zeros(self.data_shape, dtype=np.float32)
+        data_l_2 = np.zeros(self.data_shape, dtype=np.float32)
+        data_u_1 = np.zeros(self.data_shape, dtype=np.float32)
+        if self.v1:
+            data_u_2 = np.zeros(self.data_shape, dtype=np.float32)
+        seg_1 = np.zeros(self.seg_shape, dtype=np.float32)
+        seg_2 = np.zeros(self.seg_shape, dtype=np.float32)
+
+        case_properties = []
+        for j, three_list in enumerate(three_lists):
+            key_l_1 = three_list[0]
+            key_l_2 = three_list[1]
+            key_u_1 = three_list[2]
+            if self.v1:
+                key_u_2 = three_list[3]
+
+            if 'properties' in self._data[key_l_1].keys():
+                properties = self._data[key_l_1]['properties']
+            else:
+                properties = load_pickle(self._data[key_l_1]['properties_file'])
+            case_properties.append(properties)
+
+            if not isfile(self._data[key_l_1]['data_file'][:-4] + ".npy"):
+                # lets hope you know what you're doing
+                case_all_data_1 = np.load(self._data[key_l_1]['data_file'][:-4] + ".npz")['data']
+                case_all_data_2 = np.load(self._data[key_l_2]['data_file'][:-4] + ".npz")['data']
+                if '_u' in key_u_1:
+                    case_all_data_un_1 = np.load(self.un_data[key_u_1]['data_file'][:-4] + ".npz")['data']
+                else:
+                    case_all_data_un_1 = np.load(self._data[key_u_1]['data_file'][:-4] + ".npz")['data']
+                if self.v1:
+                    if '_u' in key_u_2:
+                        case_all_data_un_2 = np.load(self.un_data[key_u_2]['data_file'][:-4] + ".npz")['data']
+                    else:
+                        case_all_data_un_2 = np.load(self._data[key_u_2]['data_file'][:-4] + ".npz")['data']
+            else:
+                case_all_data_1 = np.load(self._data[key_l_1]['data_file'][:-4] + ".npy", self.memmap_mode)
+                case_all_data_2 = np.load(self._data[key_l_2]['data_file'][:-4] + ".npy", self.memmap_mode)
+                if '_u' in key_u_1:
+                    case_all_data_un_1 = np.load(self.un_data[key_u_1]['data_file'][:-4] + ".npy", self.memmap_mode)
+                else:
+                    case_all_data_un_1 = np.load(self._data[key_u_1]['data_file'][:-4] + ".npy", self.memmap_mode)
+                if self.v1:
+                    if '_u' in key_u_2:
+                        case_all_data_un_2 = np.load(self.un_data[key_u_2]['data_file'][:-4] + ".npy", self.memmap_mode)
+                    else:
+                        case_all_data_un_2 = np.load(self._data[key_u_2]['data_file'][:-4] + ".npy", self.memmap_mode)
+
+            # this is for when there is just a 2d slice in case_all_data (2d support)
+            if len(case_all_data_1.shape) == 3:
+                case_all_data_1 = case_all_data_1[:, None]
+                case_all_data_2 = case_all_data_2[:, None]
+                case_all_data_un_1 = case_all_data_un_1[:, None]
+                if self.v1:
+                    case_all_data_un_2 = case_all_data_un_2[:, None]
+            
+            assert case_all_data_1.shape[1:] == case_all_data_2.shape[1:] == case_all_data_un_1.shape[1:]
+
+            # first select a slice. This can be either random (no force fg) or guaranteed to contain some class
+            random_slice = np.random.choice(case_all_data_1.shape[1])
+            middle_slice = self.get_slice_nb(random_slice, case_all_data_1)
+            if self.v1:
+                random_slice2 = np.random.choice(case_all_data_un_1.shape[1])
+                middle_slice2 = self.get_slice_nb(random_slice2, case_all_data_un_1)
+
+            # now crop case_all_data to contain just the slice of interest. If we want additional slice above and
+            # below the current slice, here is where we get them. We stack those as additional color channels
+            if self.pseudo_3d_slices == 1:
+                if self.v1:
+                    case_all_data_1 = case_all_data_1[:, random_slice]
+                    case_all_data_2 = case_all_data_2[:, middle_slice]
+                    case_all_data_un_1 = case_all_data_un_1[:, random_slice2]
+                    case_all_data_un_2 = case_all_data_un_2[:, middle_slice2]
+                    
+                else:
+                    case_all_data_1 = case_all_data_1[:, random_slice]
+                    case_all_data_2 = case_all_data_2[:, random_slice]
+                    case_all_data_un_1 = case_all_data_un_1[:, middle_slice]
+            else:
+                # this is very deprecated and will probably not work anymore. If you intend to use this you need to
+                # check this!
+                mn = random_slice - (self.pseudo_3d_slices - 1) // 2
+                mx = random_slice + (self.pseudo_3d_slices - 1) // 2 + 1
+                valid_mn = max(mn, 0)
+                valid_mx = min(mx, case_all_data.shape[1])
+                case_all_seg = case_all_data[-1:]
+                case_all_data = case_all_data[:-1]
+                case_all_data = case_all_data[:, valid_mn:valid_mx]
+                case_all_seg = case_all_seg[:, random_slice]
+                need_to_pad_below = valid_mn - mn
+                need_to_pad_above = mx - valid_mx
+                if need_to_pad_below > 0:
+                    shp_for_pad = np.array(case_all_data.shape)
+                    shp_for_pad[1] = need_to_pad_below
+                    case_all_data = np.concatenate((np.zeros(shp_for_pad), case_all_data), 1)
+                if need_to_pad_above > 0:
+                    shp_for_pad = np.array(case_all_data.shape)
+                    shp_for_pad[1] = need_to_pad_above
+                    case_all_data = np.concatenate((case_all_data, np.zeros(shp_for_pad)), 1)
+                case_all_data = case_all_data.reshape((-1, case_all_data.shape[-2], case_all_data.shape[-1]))
+                case_all_data = np.concatenate((case_all_data, case_all_seg), 0)
+
+            # case all data should now be (c, x, y)
+            assert len(case_all_data_1.shape) == 3
+            assert len(case_all_data_2.shape) == 3
+            assert len(case_all_data_un_1.shape) == 3
+
+            # we can now choose the bbox from -need_to_pad // 2 to shape - patch_size + need_to_pad // 2. Here we
+            # define what the upper and lower bound can be to then sample from them with np.random.randint
+
+            need_to_pad = self.need_to_pad.copy()
+            for d in range(2):
+                # if case_all_data.shape + need_to_pad is still < patch size we need to pad more! We pad on both sides
+                # always
+                if need_to_pad[d] + case_all_data_1.shape[d + 1] < self.patch_size[d]:
+                    need_to_pad[d] = self.patch_size[d] - case_all_data_1.shape[d + 1]
+
+            shape = case_all_data_1.shape[1:]
+            lb_x = - need_to_pad[0] // 2
+            ub_x = shape[0] + need_to_pad[0] // 2 + need_to_pad[0] % 2 - self.patch_size[0]
+            lb_y = - need_to_pad[1] // 2
+            ub_y = shape[1] + need_to_pad[1] // 2 + need_to_pad[1] % 2 - self.patch_size[1]
+
+            # if not force_fg then we can just sample the bbox randomly from lb and ub. Else we need to make sure we get
+            # at least one of the foreground classes in the patch
+            bbox_x_lb = np.random.randint(lb_x, ub_x + 1)
+            bbox_y_lb = np.random.randint(lb_y, ub_y + 1)
+
+            bbox_x_ub = bbox_x_lb + self.patch_size[0]
+            bbox_y_ub = bbox_y_lb + self.patch_size[1]
+
+            # whoever wrote this knew what he was doing (hint: it was me). We first crop the data to the region of the
+            # bbox that actually lies within the data. This will result in a smaller array which is then faster to pad.
+            # valid_bbox is just the coord that lied within the data cube. It will be padded to match the patch size
+            # later
+            valid_bbox_x_lb = max(0, bbox_x_lb)
+            valid_bbox_x_ub = min(shape[0], bbox_x_ub)
+            valid_bbox_y_lb = max(0, bbox_y_lb)
+            valid_bbox_y_ub = min(shape[1], bbox_y_ub)
+
+            # At this point you might ask yourself why we would treat seg differently from seg_from_previous_stage.
+            # Why not just concatenate them here and forget about the if statements? Well that's because segneeds to
+            # be padded with -1 constant whereas seg_from_previous_stage needs to be padded with 0s (we could also
+            # remove label -1 in the data augmentation but this way it is less error prone)
+
+            case_all_data_un_1 = case_all_data_un_1[:, valid_bbox_x_lb:valid_bbox_x_ub,
+                        valid_bbox_y_lb:valid_bbox_y_ub]
+
+            if len(case_all_data_un_1) > 1:
+                case_all_data_un_1 = case_all_data_un_1[:-1]
+                
+            case_all_data_un_1_donly = np.pad(case_all_data_un_1, ((0, 0),
+                                                            (-min(0, bbox_x_lb), max(bbox_x_ub - shape[0], 0)),
+                                                            (-min(0, bbox_y_lb), max(bbox_y_ub - shape[1], 0))),
+                                        self.pad_mode, **self.pad_kwargs_data)
+            
+            data_u_1[j] = case_all_data_un_1_donly
+
+            if self.v1:
+                case_all_data_un_2 = case_all_data_un_2[:, valid_bbox_x_lb:valid_bbox_x_ub,
+                            valid_bbox_y_lb:valid_bbox_y_ub]
+
+                if len(case_all_data_un_2) > 1:
+                    case_all_data_un_2 = case_all_data_un_2[:-1]
+
+                case_all_data_un_2_donly = np.pad(case_all_data_un_2, ((0, 0),
+                                                            (-min(0, bbox_x_lb), max(bbox_x_ub - shape[0], 0)),
+                                                            (-min(0, bbox_y_lb), max(bbox_y_ub - shape[1], 0))),
+                                        self.pad_mode, **self.pad_kwargs_data)
+
+                data_u_2[j] = case_all_data_un_2_donly
+
+            case_all_data_1 = case_all_data_1[:, valid_bbox_x_lb:valid_bbox_x_ub,
+                            valid_bbox_y_lb:valid_bbox_y_ub]
+            case_all_data_2 = case_all_data_2[:, valid_bbox_x_lb:valid_bbox_x_ub,
+                            valid_bbox_y_lb:valid_bbox_y_ub]
+
+            case_all_data_1_donly = np.pad(case_all_data_1[:-1], ((0, 0),
+                                                              (-min(0, bbox_x_lb), max(bbox_x_ub - shape[0], 0)),
+                                                              (-min(0, bbox_y_lb), max(bbox_y_ub - shape[1], 0))),
+                                         self.pad_mode, **self.pad_kwargs_data)
+            case_all_data_2_donly = np.pad(case_all_data_2[:-1], ((0, 0),
+                                                              (-min(0, bbox_x_lb), max(bbox_x_ub - shape[0], 0)),
+                                                              (-min(0, bbox_y_lb), max(bbox_y_ub - shape[1], 0))),
+                                         self.pad_mode, **self.pad_kwargs_data)
+
+            case_all_data_1_segonly = np.pad(case_all_data_1[-1:], ((0, 0),
+                                                                (-min(0, bbox_x_lb), max(bbox_x_ub - shape[0], 0)),
+                                                                (-min(0, bbox_y_lb), max(bbox_y_ub - shape[1], 0))),
+                                           'constant', **{'constant_values': -1})
+            case_all_data_2_segonly = np.pad(case_all_data_2[-1:], ((0, 0),
+                                                                (-min(0, bbox_x_lb), max(bbox_x_ub - shape[0], 0)),
+                                                                (-min(0, bbox_y_lb), max(bbox_y_ub - shape[1], 0))),
+                                           'constant', **{'constant_values': -1})
+
+            data_l_1[j] = case_all_data_1_donly
+            data_l_2[j] = case_all_data_2_donly
+            seg_1[j] = case_all_data_1_segonly
+            seg_2[j] = case_all_data_2_segonly
+
+        for i in range(data_l_1.shape[0]):
+            assert np.count_nonzero(data_l_1[i]) > 0
+            assert np.count_nonzero(data_l_2[i]) > 0
+            assert np.count_nonzero(data_u_1[i]) > 0
+
+        keys = selected_keys
+        data = [data_l_1, data_l_2, data_u_1]
+        if self.v1:
+            data.append(data_u_2)
+        return {'data': data, 'seg': [seg_1, seg_2], 'properties': case_properties, "keys": keys}
+
+
+class DataLoaderVideo(SlimDataLoaderBase):
+    def __init__(self, data, patch_size, final_patch_size, batch_size, is_val, video_length, oversample_foreground_percent=0.0,
+                 memmap_mode="r", pseudo_3d_slices=1, pad_mode="edge",
+                 pad_kwargs_data=None, pad_sides=None):
+        """
+        This is the basic data loader for 2D networks. It uses preprocessed data as produced by my (Fabian) preprocessing.
+        You can load the data with load_dataset(folder) where folder is the folder where the npz files are located. If there
+        are only npz files present in that folder, the data loader will unpack them on the fly. This may take a while
+        and increase CPU usage. Therefore, I advise you to call unpack_dataset(folder) first, which will unpack all npz
+        to npy. Don't forget to call delete_npy(folder) after you are done with training?
+        Why all the hassle? Well the decathlon dataset is huge. Using npy for everything will consume >1 TB and that is uncool
+        given that I (Fabian) will have to store that permanently on /datasets and my local computer. With this strategy all
+        data is stored in a compressed format (factor 10 smaller) and only unpacked when needed.
+        :param data: get this with load_dataset(folder, stage=0). Plug the return value in here and you are g2g (good to go)
+        :param patch_size: what patch size will this data loader return? it is common practice to first load larger
+        patches so that a central crop after data augmentation can be done to reduce border artifacts. If unsure, use
+        get_patch_size() from data_augmentation.default_data_augmentation
+        :param final_patch_size: what will the patch finally be cropped to (after data augmentation)? this is the patch
+        size that goes into your network. We need this here because we will pad patients in here so that patches at the
+        border of patients are sampled properly
+        :param batch_size:
+        :param num_batches: how many batches will the data loader produce before stopping? None=endless
+        :param seed:
+        :param stage: ignore this (Fabian only)
+        :param transpose: ignore this
+        :param random: sample randomly; CAREFUL! non-random sampling requires batch_size=1, otherwise you will iterate batch_size times over the dataset
+        :param pseudo_3d_slices: 7 = 3 below and 3 above the center slice
+        """
+        super(DataLoaderVideo, self).__init__(data, batch_size, None)
+        if pad_kwargs_data is None:
+            pad_kwargs_data = OrderedDict()
+        self.pad_kwargs_data = pad_kwargs_data
+        self.is_val = is_val
+        self.pad_mode = pad_mode
+        self.pseudo_3d_slices = pseudo_3d_slices
+        self.oversample_foreground_percent = oversample_foreground_percent
+        self.final_patch_size = final_patch_size
+        self.patch_size = patch_size
+        self.list_of_keys = list(self._data.keys())
+        self.need_to_pad = np.array(patch_size) - np.array(final_patch_size)
+        self.memmap_mode = memmap_mode
+        self.video_length = video_length
+        self.percent = None
+        if pad_sides is not None:
+            if not isinstance(pad_sides, np.ndarray):
+                pad_sides = np.array(pad_sides)
+            self.need_to_pad += pad_sides
+        self.pad_sides = pad_sides
+        self.data_shape, self.seg_shape = self.determine_shapes()
+
+    def determine_shapes(self):
+        num_seg = 1
+
+        k = list(self._data.keys())[0]
+        if isfile(self._data[k]['data_file'][:-4] + ".npy"):
+            case_all_data = np.load(self._data[k]['data_file'][:-4] + ".npy", self.memmap_mode)
+        else:
+            case_all_data = np.load(self._data[k]['data_file'])['data']
+        num_color_channels = case_all_data.shape[0] - num_seg
+        data_shape = (self.batch_size, num_color_channels, *self.patch_size)
+        seg_shape = (self.batch_size, num_seg, *self.patch_size)
+        return data_shape, seg_shape
+
+    def get_do_oversample(self, batch_idx):
+        return not batch_idx < round(self.batch_size * (1 - self.oversample_foreground_percent))
+    
+    def get_slice_nb(self, random_slice, case_all_data):
+        if random_slice == 0:
+            middle_slice = 1
+        else:
+            middle_slice = random_slice - 1
+        #if self.v1:
+        #    if random_slice == 0:
+        #        middle_slice = 1
+        #    else:
+        #        middle_slice = random_slice - 1
+        #else:
+        #    if self.is_val:
+        #        if random_slice == 0:
+        #            middle_slice = 1
+        #        else:
+        #            middle_slice = random_slice - 1
+        #    else:
+        #        if random_slice == 0:
+        #            middle_slice = 1
+        #        elif random_slice == case_all_data.shape[1] - 1:
+        #            middle_slice = case_all_data.shape[1] - 2
+        #        else:
+        #            p_middle = np.full(shape=(case_all_data.shape[1],), fill_value=0.0)
+        #            p_middle[random_slice + 1] = 0.5
+        #            p_middle[random_slice - 1] = 0.5
+        #            middle_slice = np.random.choice(case_all_data.shape[1], p=p_middle)
+        return middle_slice
+
+    def generate_train_batch(self):
+        eval_idx = None
+        selected_keys = np.random.choice(self.list_of_keys, self.batch_size, True, None)
+
+        data = np.zeros(shape=(self.video_length, self.batch_size, self.data_shape[1], self.data_shape[2], self.data_shape[3]))
+        seg = np.zeros(shape=(self.video_length, self.batch_size, self.data_shape[1], self.data_shape[2], self.data_shape[3]))
+        registered_idx = np.zeros(shape=(self.batch_size,), dtype=int)
+
+        case_properties = []
+        for j, i in enumerate(selected_keys):
+            if 'properties' in self._data[i].keys():
+                properties = self._data[i]['properties']
+            else:
+                properties = load_pickle(self._data[i]['properties_file'])
+            case_properties.append(properties)
+
+            if not isfile(self._data[i]['data_file'][:-4] + ".npy"):
+                # lets hope you know what you're doing
+                case_all_data = np.load(self._data[i]['data_file'][:-4] + ".npz")['data']
+            else:
+                case_all_data = np.load(self._data[i]['data_file'][:-4] + ".npy", self.memmap_mode)
+
+            # this is for when there is just a 2d slice in case_all_data (2d support)
+            if len(case_all_data.shape) == 3:
+                case_all_data = case_all_data[:, None]
+
+            # first select a slice. This can be either random (no force fg) or guaranteed to contain some class
+            values = np.arange(case_all_data.shape[1])
+            if self.is_val:
+                s = np.random.choice(case_all_data.shape[1])
+                step = self.video_length // 2
+                start = min(max(s - step, 0), case_all_data.shape[1] - self.video_length)
+                indices = values[start:start + self.video_length]
+                assert len(indices) == self.video_length
+                eval_idx = int(np.where(indices == s)[0])
+            else:
+                windows = sliding_window_view(values, self.video_length)
+                window_idx = np.random.choice(len(windows))
+                indices = windows[window_idx]
+                assert len(indices) == self.video_length
+            
+            dist = np.abs(indices - (case_all_data.shape[1] // 2))
+            registered_idx[j] = np.argmin(dist)
+
+            for idx, t in enumerate(indices):
+
+                # now crop case_all_data to contain just the slice of interest. If we want additional slice above and
+                # below the current slice, here is where we get them. We stack those as additional color channels
+                slice_data = case_all_data[:, t]
+
+                # case all data should now be (c, x, y)
+                assert len(slice_data.shape) == 3
+
+                # we can now choose the bbox from -need_to_pad // 2 to shape - patch_size + need_to_pad // 2. Here we
+                # define what the upper and lower bound can be to then sample from them with np.random.randint
+
+                need_to_pad = self.need_to_pad.copy()
+                for d in range(2):
+                    # if slice_data.shape + need_to_pad is still < patch size we need to pad more! We pad on both sides
+                    # always
+                    if need_to_pad[d] + slice_data.shape[d + 1] < self.patch_size[d]:
+                        need_to_pad[d] = self.patch_size[d] - slice_data.shape[d + 1]
+
+                shape = slice_data.shape[1:]
+                lb_x = - need_to_pad[0] // 2
+                ub_x = shape[0] + need_to_pad[0] // 2 + need_to_pad[0] % 2 - self.patch_size[0]
+                lb_y = - need_to_pad[1] // 2
+                ub_y = shape[1] + need_to_pad[1] // 2 + need_to_pad[1] % 2 - self.patch_size[1]
+
+                # if not force_fg then we can just sample the bbox randomly from lb and ub. Else we need to make sure we get
+                # at least one of the foreground classes in the patch
+                bbox_x_lb = np.random.randint(lb_x, ub_x + 1)
+                bbox_y_lb = np.random.randint(lb_y, ub_y + 1)
+
+                bbox_x_ub = bbox_x_lb + self.patch_size[0]
+                bbox_y_ub = bbox_y_lb + self.patch_size[1]
+
+                # whoever wrote this knew what he was doing (hint: it was me). We first crop the data to the region of the
+                # bbox that actually lies within the data. This will result in a smaller array which is then faster to pad.
+                # valid_bbox is just the coord that lied within the data cube. It will be padded to match the patch size
+                # later
+                valid_bbox_x_lb = max(0, bbox_x_lb)
+                valid_bbox_x_ub = min(shape[0], bbox_x_ub)
+                valid_bbox_y_lb = max(0, bbox_y_lb)
+                valid_bbox_y_ub = min(shape[1], bbox_y_ub)
+
+                # At this point you might ask yourself why we would treat seg differently from seg_from_previous_stage.
+                # Why not just concatenate them here and forget about the if statements? Well that's because segneeds to
+                # be padded with -1 constant whereas seg_from_previous_stage needs to be padded with 0s (we could also
+                # remove label -1 in the data augmentation but this way it is less error prone)
+
+                slice_data = slice_data[:, valid_bbox_x_lb:valid_bbox_x_ub,
+                                valid_bbox_y_lb:valid_bbox_y_ub]
+
+                slice_data_donly = np.pad(slice_data[:-1], ((0, 0),
+                                                                (-min(0, bbox_x_lb), max(bbox_x_ub - shape[0], 0)),
+                                                                (-min(0, bbox_y_lb), max(bbox_y_ub - shape[1], 0))),
+                                            self.pad_mode, **self.pad_kwargs_data)
+
+                slice_data_segonly = np.pad(slice_data[-1:], ((0, 0),
+                                                                    (-min(0, bbox_x_lb), max(bbox_x_ub - shape[0], 0)),
+                                                                    (-min(0, bbox_y_lb), max(bbox_y_ub - shape[1], 0))),
+                                            'constant', **{'constant_values': -1})
+
+                data[idx, j] = slice_data_donly
+                seg[idx, j] = slice_data_segonly
+
+        keys = selected_keys
+        data = [data[i] for i in range(len(data))]
+        seg = [seg[i] for i in range(len(seg))]
+        return {'data': data, 'seg': seg, 'properties': case_properties, "keys": keys, "idx": eval_idx, 'registered_idx': registered_idx}
 
 if __name__ == "__main__":
     t = "Task002_Heart"

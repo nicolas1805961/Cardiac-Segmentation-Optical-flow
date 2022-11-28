@@ -39,9 +39,6 @@ def main():
     parser.add_argument("-pl2d", "--planner2d", type=str, default="ExperimentPlanner2D_v21",
                         help="Name of the ExperimentPlanner class for the 2D U-Net. Default is ExperimentPlanner2D_v21. "
                              "Can be 'None', in which case this U-Net will not be configured")
-    #parser.add_argument("-pl2du", "--planner2dunlabeled", type=str, default=None,
-    #                    help="Name of the unlabeled ExperimentPlanner class for the 2D U-Net. Default is ExperimentPlanner2D_v21. "
-    #                         "Can be 'None', in which case this U-Net will not be configured")
     parser.add_argument("-no_pp", action="store_true",
                         help="Set this flag if you dont want to run the preprocessing. If this is set then this script "
                              "will only run the experiment planning and create the plans file")
@@ -110,8 +107,11 @@ def main():
         if args.verify_dataset_integrity:
             verify_dataset_integrity(join(nnUNet_raw_data, task_name))
 
-        crop(task_name, False, tf)
-        crop_unlabeled(task_name, False, tf)
+        if '28' in task_name:
+            crop(task_name, False, tf, get_original_path=True)
+        else:
+            crop(task_name, False, tf)
+            crop_unlabeled(task_name, False, tf)
 
         tasks.append(task_name)
 

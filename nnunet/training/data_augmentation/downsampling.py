@@ -118,16 +118,6 @@ class DownsampleX(AbstractTransform):
         self.order = order
 
     def __call__(self, **data_dict):
-        #x_list = []
-        #for i in range(len(self.ds_scales)):
-        #    scales = self.ds_scales[i]
-        #    if torch.all(scales == 1):
-        #        x_list.append(data_dict[self.input_key])
-        #    else:
-        #        x_down = torch.nn.functional.interpolate(data_dict[self.input_key], scale_factor=scales, mode='bicubic', align_corners=False, antialias=True)
-        #        x_list.append(x_down)
-
-        #data_dict[self.output_key] = x_list
         data_dict[self.output_key] = downsample_x_for_ds_transform2(data_dict[self.input_key], self.ds_scales, self.order)
         return data_dict
 

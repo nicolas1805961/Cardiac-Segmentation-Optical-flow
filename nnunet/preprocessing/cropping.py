@@ -60,7 +60,7 @@ def get_case_identifier_from_npz(case):
     return case_identifier
 
 
-def load_case_from_list_of_files(data_files, seg_file=None):
+def load_case_from_list_of_files(data_files, seg_file=None, original_path=None):
     assert isinstance(data_files, list) or isinstance(data_files, tuple), "case must be either a list or a tuple"
     properties = OrderedDict()
     data_itk = [sitk.ReadImage(f) for f in data_files]
@@ -73,6 +73,8 @@ def load_case_from_list_of_files(data_files, seg_file=None):
     properties["itk_origin"] = data_itk[0].GetOrigin()
     properties["itk_spacing"] = data_itk[0].GetSpacing()
     properties["itk_direction"] = data_itk[0].GetDirection()
+
+    properties["original_path"] = original_path
 
     data_npy = np.vstack([sitk.GetArrayFromImage(d)[None] for d in data_itk])
     if seg_file is not None:
@@ -119,7 +121,8 @@ def crop_to_nonzero(data, seg=None, nonzero_label=-1):
 
 
 def get_patient_identifiers_from_cropped_files(folder):
-    return [i.split(os.sep)[-1][:-4] for i in subfiles(folder, join=True, suffix=".npz")]
+    out = [i.split(os.sep)[-1][:-4] for i in subfiles(folder, join=True, suffix=".npz")]
+    return out
 
 
 class ImageCropper(object):
@@ -152,11 +155,11 @@ class ImageCropper(object):
         return data, seg, properties
 
     @staticmethod
-    def crop_from_list_of_files(data_files, seg_file=None):
-        data, seg, properties = load_case_from_list_of_files(data_files, seg_file)
+    def crop_from_list_of_files(data_files, seg_file=None, original_path=None):
+        data, seg, properties = load_case_from_list_of_files(data_files, seg_file, original_path)
         return ImageCropper.crop(data, properties, seg)
 
-    def load_crop_save(self, case, case_identifier, overwrite_existing=False):
+    def load_crop_save(self, case, case_identifier, overwrite_existing=False, original_path=None):
         try:
             print(case_identifier)
             #print(self.output_folder)
@@ -166,7 +169,7 @@ class ImageCropper(object):
                     or (not os.path.isfile(os.path.join(self.output_folder, "%s.npz" % case_identifier))
                         or not os.path.isfile(os.path.join(self.output_folder, "%s.pkl" % case_identifier))):
                 
-                data, seg, properties = self.crop_from_list_of_files(case[:-1], case[-1])
+                data, seg, properties = self.crop_from_list_of_files(case[:-1], case[-1], original_path)
 
                 all_data = np.vstack((data, seg))
                 np.savez_compressed(os.path.join(self.output_folder, "%s.npz" % case_identifier), data=all_data)
@@ -204,7 +207,7 @@ class ImageCropper(object):
     def get_patient_identifiers_from_cropped_files(self):
         return [i.split(os.sep)[-1][:-4] for i in self.get_list_of_cropped_files()]
 
-    def run_cropping(self, list_of_files, overwrite_existing=False, output_folder=None):
+    def run_cropping(self, list_of_files, overwrite_existing=False, output_folder=None, original_path_list=None):
         """
         also copied ground truth nifti segmentation into the preprocessed folder so that we can use them for evaluation
         on the cluster
@@ -225,7 +228,7 @@ class ImageCropper(object):
         list_of_args = []
         for j, case in enumerate(list_of_files):
             case_identifier = get_case_identifier(case)
-            list_of_args.append((case, case_identifier, overwrite_existing))
+            list_of_args.append((case, case_identifier, overwrite_existing, original_path_list[j]))
 
         p = Pool(self.num_threads)
         p.starmap(self.load_crop_save, list_of_args)

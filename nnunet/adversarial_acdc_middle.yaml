@@ -13,7 +13,7 @@ maximize_distance: False
 average_distance: False
 similarity_loss_weight: 10.0 #100.0
 #contrastive_loss_weight: 100.0
-mix_residual: True
+mix_residual: False
 registered_seg: True
 nb_repeat: 4 #4, 2
 middle_unlabeled: False
@@ -25,26 +25,32 @@ alpha_discriminator: 0.5 #0.125
 adversarial_loss_weight: 1.0
 v1: True
 
+filter_skip_co_segmentation: True
+patch_size: [224, 224]
 transformer_bottleneck: True
 device: 'cuda:0'
-simple_decoder: False
+simple_decoder: True
 deep_supervision: False
+val_subset_size: -1
+apply_clahe: True
+expansion_ratio: 1
 add_extra_bottleneck_blocks: True
 affinity: False
 affinity_loss_weight: 0.0001 # 0.001
 unlabeled_loss_weight: 2
 unlabeled: False
-progressive_similarity_growing: False
 classification_weight: 0.1 #1.45
 classification: False
-similarity: False
-asymmetric_unet: True
-epoch_log: 10 #10
+asymmetric_unet: False
+vq_vae: False
+vae: False
+vae_noise: False
+vae_loss_weight: 1.0
+epoch_log: 1 #10
 scheduler: 'cosine'
 optimizer: 'adam'
-adversarial_loss: False
-alpha_discriminator: 0.10 #0.125
-adversarial_weight: 1.0 #0.1
+cutmix: False
+start_reconstruction_dim: 4
 discriminator_lr: 0.00001 # 0.00005
 initial_lr: 0.0001 #0.0001
 discriminator_decay: 0.0001
@@ -52,28 +58,34 @@ weight_decay: 0.0001 #0.0001
 warmup_percent: 0.1
 smoothing: 0.0
 max_num_epochs: 1000 #1000
-patch_size: [288, 288] # lib=288
+swin_bottleneck: True
+#window_size: 7
+#image_size: 224
 norm: 'BatchNorm2d' # 'InstanceNorm2d', 'BatchNorm2d', ''
 filter_skip_co_reconstruction: False
-filter_skip_co_segmentation: True
-bottleneck_heads: 16 # 16
+num_memory_bus: 8
+embed_dim: 96
+nb_frames: 1
+bottleneck_heads: 8 # 16
 dim_feedforward: 3072
 activation: 'gelu'
-conv_layer: 'other'
+conv_layer: 'RFR'
 num_bottleneck_layers: 1
 dropout: 0
-conv_depth: [2, 2, 2]
+conv_depth: [1, 2, 3]
 transformer_depth: [] #[2, 2, 2], [2]
 num_heads: [] #[3, 6, 12], [8] [12]
 spatial_cross_attention_num_heads: [2, 4, 8] #[2, 4, 6, 8, 12] [12, 8, 6, 4, 2] [bottom, ..., top] [3, 6, 12] [4, 4, 8, 8, 16]
-batch_size: 6 #6
+method: 'equal'
+batch_size: 2 #6
 bottleneck: 'swin' # ['vit', 'swin', 'factorized', 'vit_3d', 'swin_3d']
 rpe_mode: 'bias' # ['contextual', 'bias', 'None']
 rpe_contextual_tensors: 'qkv'
 drop_path_rate: 0.0
 autoencoder_dim: 64
-in_encoder_dims: [1, 128, 256] #[1, 24, 96, 192, 384] [1, 96, 384] [1, 24, 96] [1, 32, 128] [1, 32, 128, 256, 512] [1, 48, 192] [1, 96, 192]
-out_encoder_dims: [64, 128, 256] #[24, 48, 96, 192, 384] [96, 192, 384] [24, 48, 96] [32, 64, 128] [32, 64, 128, 256, 512] [48, 96, 192] [96, 192, 384]
+in_encoder_dims: [1, 64, 128] #[1, 24, 96, 192, 384] [1, 96, 384] [1, 24, 96] [1, 32, 128] [1, 32, 128, 256, 512] [1, 48, 192] [1, 96, 192]
+out_encoder_dims: [32, 64, 128] #[24, 48, 96, 192, 384] [96, 192, 384] [24, 48, 96] [32, 64, 128] [32, 64, 128, 256, 512] [48, 96, 192] [96, 192, 384]
+channel_attention: False
 merge: 'linear' # ['linear', 'rescale_linear', 'rescale_conv']
 zoom_p: 0.25
 rotation_p: 0.25
@@ -127,6 +139,9 @@ reconstruction_attention_type: [] #['channel', 'spatial', 'identity']
 concat_spatial_cross_attention: True
 directional_field: False
 directional_field_weight: 1.0
+shift_nb: 5
+sampler_param: 2
+slope: -2
 
 learn_transforms: False
 use_cropped_images: True
@@ -135,7 +150,6 @@ binary: False
 reconstruction: False
 reconstruction_skip: False
 reconstruction_loss_weight: 1.0 #2.65
-similarity_weight: 0.1 #0.0001
 similarity_down_scale: 8
 uncertainty_weighting: False
 dynamic_weight_averaging: False
@@ -152,10 +166,7 @@ discriminator_depth: [2, 2, 2]
 seg_in_discriminator_dims: [5, 64, 128]
 rec_in_discriminator_dims: [1, 64, 128]
 out_discriminator_dims: [64, 128, 256]
-discriminator_learning_rate: 0.0005
-discriminator_weight_decay: 0.0001
 r1_penalty_iteration: 1
-adversarial_loss_weight: 1.0
 
 reinforcement: False
 policy_net_learning_rate: 0.0001

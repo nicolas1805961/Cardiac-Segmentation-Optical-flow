@@ -17,29 +17,6 @@ import yaml
 def read_config(filename):
     with open(filename) as file:
         config = yaml.load(file, Loader=yaml.FullLoader)
-
-    if config['nb_nets'] > 1:
-        assert config['small'] == False and config['middle'] == False and config['big'] == False
-    if config['bottleneck'] == 'swin' or config['bottleneck'] == 'vit':
-        assert config['nb_frames'] == 1, "bottleneck mode 'swin' and 'vit' require nb_frames to be 1"
-        assert len(config['patch_size']) == 2, "bottleneck mode 'swin' and 'vit' require len(patch_size) to be 2"
-    elif config['bottleneck'] == 'swin_3d' or config['bottleneck'] == 'vit_3d' or config['bottleneck'] == 'factorized':
-        assert config['nb_frames'] > 1, "bottleneck mode 'swin_3d', 'vit_3d' and 'factorized' require nb_frames to be more than 1"
-    if config['bottleneck'] == 'factorized':
-        assert len(config['patch_size']) == 2, "bottleneck mode 'factorized' require len(patch_size) to be 2"
-    if filename == 'lib_config.yaml':
-        assert config['semi_supervised'] == False, "can not run in a semi supervised manner with the lib dataset"
-    if config['semi_supervised'] == True:
-        assert config['use_spatial_transformer'] == False, "Semi supervised model can not be used with spatial transformer"
-    assert len(config['transformer_depth']) == len(config['num_heads']), "transformer_depth and num_heads must have the same size"
-    if not config['reconstruction']:
-        assert config['reconstruction_skip'] is False, "Cannot use skip connection between decoder and reconstruction decoder if 'reconstruction' is False"
-    if config['uncertainty_weighting'] or config['dynamic_weight_averaging']:
-        assert config['reconstruction'], "Need reconstruction for uncertainty weighting or dynamic weight averaging"
-    if config['similarity']:
-        assert config['reconstruction'], "Similarity can not be true without reconstruction"
-    if config['adversarial_loss']:
-        assert config['reconstruction'], "Reconstruction needs to be activated to use adversarial losses"
     return config
 
 
@@ -52,15 +29,15 @@ class CustomExperimentPlanner(ExperimentPlanner2D):
         self.unet_base_num_features = 32
         #self.preprocessor_name = "CustomPreprocessorFor2D"
         self.config = read_config(os.path.join(Path.cwd(), 'adversarial_acdc.yaml'))
-        self.patch_size = 288 if '026' in self.preprocessed_output_folder else 224
+        self.patch_size = 320 if '026' in self.preprocessed_output_folder else 224
 
     def get_properties_for_stage(self, current_spacing, original_spacing, original_shape, num_cases,
                                  num_modalities, num_classes):
 
         new_median_shape = np.round(original_spacing / current_spacing * original_shape).astype(int)
-
         dataset_num_voxels = np.prod(new_median_shape, dtype=np.int64) * num_cases
         input_patch_size = new_median_shape[1:]
+
 
         network_num_pool_per_axis, pool_op_kernel_sizes, conv_kernel_sizes, new_shp, \
         shape_must_be_divisible_by = get_pool_and_conv_props(current_spacing[1:], input_patch_size,
@@ -111,6 +88,11 @@ class CustomExperimentPlanner(ExperimentPlanner2D):
         max_batch_size = np.round(self.batch_size_covers_max_percent_of_dataset * dataset_num_voxels /
                                   np.prod(input_patch_size, dtype=np.int64)).astype(int)
         batch_size = max(1, min(batch_size, max_batch_size))
+
+        print(f'Advised patch size is: {input_patch_size}')
+        print(f'Advised network_num_pool_per_axis is: {network_num_pool_per_axis}')
+        print(f'Advised pool_op_kernel_sizes is: {pool_op_kernel_sizes}')
+        print(f'Advised conv_kernel_sizes is: {conv_kernel_sizes}')
 
         plan = {
             'batch_size': self.config['batch_size'],
