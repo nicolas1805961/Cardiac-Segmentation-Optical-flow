@@ -14,6 +14,7 @@
 
 from collections import OrderedDict
 import numpy as np
+from numpy.random import RandomState
 from multiprocessing import Pool
 from math import ceil, floor
 from scipy.signal import savgol_filter
@@ -1471,8 +1472,8 @@ class DataLoader2DMiddleUnlabeled(SlimDataLoaderBase):
         return {'data': data, 'seg': [seg_1, seg_2], 'properties': case_properties, "keys": keys}
 
 
-class DataLoaderVideo(SlimDataLoaderBase):
-    def __init__(self, data, patch_size, final_patch_size, batch_size, is_val, video_length, oversample_foreground_percent=0.0,
+class DataLoaderVideoUnlabeled(SlimDataLoaderBase):
+    def __init__(self, data, patch_size, final_patch_size, batch_size, is_val, unlabeled_dataset, video_length, force_one_label, oversample_foreground_percent=0.0,
                  memmap_mode="r", pseudo_3d_slices=1, pad_mode="edge",
                  pad_kwargs_data=None, pad_sides=None):
         """
@@ -1499,7 +1500,7 @@ class DataLoaderVideo(SlimDataLoaderBase):
         :param random: sample randomly; CAREFUL! non-random sampling requires batch_size=1, otherwise you will iterate batch_size times over the dataset
         :param pseudo_3d_slices: 7 = 3 below and 3 above the center slice
         """
-        super(DataLoaderVideo, self).__init__(data, batch_size, None)
+        super(DataLoaderVideoUnlabeled, self).__init__(data, batch_size, None)
         if pad_kwargs_data is None:
             pad_kwargs_data = OrderedDict()
         self.pad_kwargs_data = pad_kwargs_data
@@ -1510,16 +1511,19 @@ class DataLoaderVideo(SlimDataLoaderBase):
         self.final_patch_size = final_patch_size
         self.patch_size = patch_size
         self.list_of_keys = list(self._data.keys())
+        self.un_list_of_keys = list(unlabeled_dataset.keys())
         self.need_to_pad = np.array(patch_size) - np.array(final_patch_size)
         self.memmap_mode = memmap_mode
         self.video_length = video_length
         self.percent = None
+        self.force_one_label = force_one_label
         if pad_sides is not None:
             if not isinstance(pad_sides, np.ndarray):
                 pad_sides = np.array(pad_sides)
             self.need_to_pad += pad_sides
         self.pad_sides = pad_sides
         self.data_shape, self.seg_shape = self.determine_shapes()
+        self.un_data = unlabeled_dataset
 
     def determine_shapes(self):
         num_seg = 1
@@ -1566,54 +1570,90 @@ class DataLoaderVideo(SlimDataLoaderBase):
         return middle_slice
 
     def generate_train_batch(self):
-        eval_idx = None
+        #eval_idx = None
         selected_keys = np.random.choice(self.list_of_keys, self.batch_size, True, None)
+        list_of_frames = []
+        for i in range(len(selected_keys)):
+            patient_id = selected_keys[i][:10]
+            l_filtered = [x for x in self.list_of_keys if x[:10] in patient_id]
+            un_filtered = [x for x in self.un_list_of_keys if x[:10] in patient_id]
+            filtered = l_filtered + un_filtered
+            list_of_frames.append(filtered)
 
+        video_padding = np.ones(shape=(self.video_length, self.batch_size), dtype=bool)
+        labeled_binary = np.zeros(shape=(self.video_length, self.batch_size), dtype=bool)
         data = np.zeros(shape=(self.video_length, self.batch_size, self.data_shape[1], self.data_shape[2], self.data_shape[3]))
         seg = np.zeros(shape=(self.video_length, self.batch_size, self.data_shape[1], self.data_shape[2], self.data_shape[3]))
-        registered_idx = np.zeros(shape=(self.batch_size,), dtype=int)
+        data.fill(np.nan)
+        #registered_idx = np.zeros(shape=(self.batch_size,), dtype=int)
 
         case_properties = []
-        for j, i in enumerate(selected_keys):
-            if 'properties' in self._data[i].keys():
-                properties = self._data[i]['properties']
+        for j, frames in enumerate(list_of_frames):
+            labeled_frame = frames[0]
+            if 'properties' in self._data[labeled_frame].keys():
+                properties = self._data[labeled_frame]['properties']
             else:
-                properties = load_pickle(self._data[i]['properties_file'])
+                properties = load_pickle(self._data[labeled_frame]['properties_file'])
             case_properties.append(properties)
 
-            if not isfile(self._data[i]['data_file'][:-4] + ".npy"):
-                # lets hope you know what you're doing
-                case_all_data = np.load(self._data[i]['data_file'][:-4] + ".npz")['data']
-            else:
-                case_all_data = np.load(self._data[i]['data_file'][:-4] + ".npy", self.memmap_mode)
+            depth = properties['size_after_resampling'][0]
+            depth_idx = np.random.choice(depth)
 
-            # this is for when there is just a 2d slice in case_all_data (2d support)
-            if len(case_all_data.shape) == 3:
-                case_all_data = case_all_data[:, None]
-
-            # first select a slice. This can be either random (no force fg) or guaranteed to contain some class
-            values = np.arange(case_all_data.shape[1])
-            if self.is_val:
-                s = np.random.choice(case_all_data.shape[1])
-                step = self.video_length // 2
-                start = min(max(s - step, 0), case_all_data.shape[1] - self.video_length)
-                indices = values[start:start + self.video_length]
-                assert len(indices) == self.video_length
-                eval_idx = int(np.where(indices == s)[0])
-            else:
-                windows = sliding_window_view(values, self.video_length)
-                window_idx = np.random.choice(len(windows))
-                indices = windows[window_idx]
-                assert len(indices) == self.video_length
+            frames = sorted(frames, key=lambda x: int(x[16:18]))
+            frames = np.array(frames)
             
-            dist = np.abs(indices - (case_all_data.shape[1] // 2))
-            registered_idx[j] = np.argmin(dist)
+            labeled_idx = np.where(~np.char.endswith(frames, '_u'))[0]
+            values = np.arange(len(frames))
 
-            for idx, t in enumerate(indices):
+            if self.video_length > len(frames):
+                padding_length = self.video_length - len(frames)
+                video = frames
+            else:
+                padding_length = 0
+                if self.is_val:
+                    s = np.random.choice(labeled_idx)
+                    step = self.video_length // 2
+                    start = min(max(s - step, 0), len(frames) - self.video_length)
+                    frame_indices = values[start:start + self.video_length]
+                    assert len(frame_indices) == self.video_length
+                    #eval_idx = int(np.where(indices == s)[0])
+                else:
+                    windows = sliding_window_view(values, self.video_length)
+                    if self.force_one_label:
+                        mask = np.isin(windows, labeled_idx)
+                        mask = np.any(mask, axis=1)
+                        windows = windows[mask]
+                    window_idx = np.random.choice(len(windows))
+                    frame_indices = windows[window_idx]
+                    assert len(frame_indices) == self.video_length
+                video = frames[frame_indices]
+
+            seed = np.random.randint(0, 4294967296, dtype=np.int64)
+            for idx, t in enumerate(video):
+                prng = RandomState(seed)
+
+                if '_u' in t:
+                    if not isfile(self.un_data[t]['data_file'][:-4] + ".npy"):
+                        # lets hope you know what you're doing
+                        case_all_data = np.load(self.un_data[t]['data_file'][:-4] + ".npz")['data']
+                    else:
+                        case_all_data = np.load(self.un_data[t]['data_file'][:-4] + ".npy", self.memmap_mode)
+                else:
+                    if not isfile(self._data[t]['data_file'][:-4] + ".npy"):
+                        # lets hope you know what you're doing
+                        case_all_data = np.load(self._data[t]['data_file'][:-4] + ".npz")['data']
+                    else:
+                        case_all_data = np.load(self._data[t]['data_file'][:-4] + ".npy", self.memmap_mode)
+
+                # this is for when there is just a 2d slice in case_all_data (2d support)
+                if len(case_all_data.shape) == 3:
+                    case_all_data = case_all_data[:, None]
+                
+                assert case_all_data.shape[1] == depth
 
                 # now crop case_all_data to contain just the slice of interest. If we want additional slice above and
                 # below the current slice, here is where we get them. We stack those as additional color channels
-                slice_data = case_all_data[:, t]
+                slice_data = case_all_data[:, depth_idx]
 
                 # case all data should now be (c, x, y)
                 assert len(slice_data.shape) == 3
@@ -1636,8 +1676,8 @@ class DataLoaderVideo(SlimDataLoaderBase):
 
                 # if not force_fg then we can just sample the bbox randomly from lb and ub. Else we need to make sure we get
                 # at least one of the foreground classes in the patch
-                bbox_x_lb = np.random.randint(lb_x, ub_x + 1)
-                bbox_y_lb = np.random.randint(lb_y, ub_y + 1)
+                bbox_x_lb = prng.randint(lb_x, ub_x + 1)
+                bbox_y_lb = prng.randint(lb_y, ub_y + 1)
 
                 bbox_x_ub = bbox_x_lb + self.patch_size[0]
                 bbox_y_ub = bbox_y_lb + self.patch_size[1]
@@ -1658,24 +1698,46 @@ class DataLoaderVideo(SlimDataLoaderBase):
 
                 slice_data = slice_data[:, valid_bbox_x_lb:valid_bbox_x_ub,
                                 valid_bbox_y_lb:valid_bbox_y_ub]
+                
+                video_idx = idx + (padding_length // 2)
 
-                slice_data_donly = np.pad(slice_data[:-1], ((0, 0),
+                if '_u' in t:
+                    slice_data_donly = np.pad(slice_data, ((0, 0),
                                                                 (-min(0, bbox_x_lb), max(bbox_x_ub - shape[0], 0)),
                                                                 (-min(0, bbox_y_lb), max(bbox_y_ub - shape[1], 0))),
                                             self.pad_mode, **self.pad_kwargs_data)
-
-                slice_data_segonly = np.pad(slice_data[-1:], ((0, 0),
+                else:
+                    slice_data_donly = np.pad(slice_data[:-1], ((0, 0),
                                                                     (-min(0, bbox_x_lb), max(bbox_x_ub - shape[0], 0)),
                                                                     (-min(0, bbox_y_lb), max(bbox_y_ub - shape[1], 0))),
-                                            'constant', **{'constant_values': -1})
+                                                self.pad_mode, **self.pad_kwargs_data)
 
-                data[idx, j] = slice_data_donly
-                seg[idx, j] = slice_data_segonly
+                    slice_data_segonly = np.pad(slice_data[-1:], ((0, 0),
+                                                                        (-min(0, bbox_x_lb), max(bbox_x_ub - shape[0], 0)),
+                                                                        (-min(0, bbox_y_lb), max(bbox_y_ub - shape[1], 0))),
+                                                'constant', **{'constant_values': -1})
+                    seg[video_idx, j] = slice_data_segonly
+                    labeled_binary[video_idx, j] = True
+
+                data[video_idx, j] = slice_data_donly
+                video_padding[video_idx, j] = False
 
         keys = selected_keys
-        data = [data[i] for i in range(len(data))]
-        seg = [seg[i] for i in range(len(seg))]
-        return {'data': data, 'seg': seg, 'properties': case_properties, "keys": keys, "idx": eval_idx, 'registered_idx': registered_idx}
+        data = [data[i] for i in range(self.video_length)]
+        seg = [seg[i] for i in range(self.video_length)]
+        #labeled_binary = [labeled_binary[i] for i in range(len(labeled_binary))]
+
+        #if self.is_val:
+        #    matplotlib.use('QtAgg')
+        #    print(video_padding)
+        #    print(labeled_binary)
+        #    fig, ax = plt.subplots(2, self.video_length)
+        #    for i in range(self.video_length):
+        #        ax[0, i].imshow(data[i][0, 0], cmap='gray')
+        #        ax[1, i].imshow(seg[i][0, 0], cmap='gray')
+        #    plt.show()
+
+        return {'data': data, 'seg': seg, 'properties': case_properties, "keys": keys, "labeled_binary": labeled_binary, "video_padding": video_padding}
 
 if __name__ == "__main__":
     t = "Task002_Heart"

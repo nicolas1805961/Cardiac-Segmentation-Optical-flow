@@ -3,12 +3,22 @@ separability: False
 separability_loss_weight: 1.0
 convolutional_patch_embedding: True
 
+force_one_label: True
 feature_extractor: False
-video_length: 6
+video_length: 2
 crop: True
-nb_memory_bus: 8
-cropper_weights_path: 'only_sfb\model_final_checkpoint.model'
+nb_memory_bus: 4
+cropper_weights_folder_path: 'only_sfb'
+video_weights_folder_path: 'pretrained'
 crop_size: 128
+nb_layers: 1
+slots: True
+softmax_indices: False
+learn_indices: True
+area_size: [16, 16, 16]
+nb_zones: [2, 4, 8]
+use_patches: True
+deformable_points: 4
 
 middle_loss_weight: 1.0
 seg_motion_estimation_loss_weight: 0.1
@@ -32,66 +42,48 @@ alpha_discriminator: 0.5 #0.125
 adversarial_loss_weight: 1.0
 v1: True
 
-filter_skip_co_segmentation: True
+unlabeled: False
+log_images: True
+filter_skip_co_segmentation: False
 patch_size: [224, 224]
 transformer_bottleneck: True
 device: 'cuda:0'
-simple_decoder: True
 deep_supervision: False
-val_subset_size: -1
-apply_clahe: True
-expansion_ratio: 1
 add_extra_bottleneck_blocks: True
-affinity: False
-affinity_loss_weight: 0.0001 # 0.001
-unlabeled_loss_weight: 2
-unlabeled: False
 classification_weight: 0.1 #1.45
 classification: False
 asymmetric_unet: False
-vq_vae: False
-vae: False
-vae_noise: False
-vae_loss_weight: 1.0
 epoch_log: 1 #10
 scheduler: 'cosine'
 optimizer: 'adam'
-cutmix: False
-start_reconstruction_dim: 4
 discriminator_lr: 0.00001 # 0.00005
 initial_lr: 0.0001 #0.0001
 discriminator_decay: 0.0001
 weight_decay: 0.0001 #0.0001
 warmup_percent: 0.1
 smoothing: 0.0
-max_num_epochs: 1000 #1000
-swin_bottleneck: True
+max_num_epochs: 300 #1000
 #window_size: 7
 #image_size: 224
-norm: 'BatchNorm2d' # 'InstanceNorm2d', 'BatchNorm2d', ''
-filter_skip_co_reconstruction: False
-num_memory_bus: 8
-embed_dim: 96
-nb_frames: 1
+norm: 'batchnorm' # 'instancenorm', 'batchnorm'
 bottleneck_heads: 8 # 16
-dim_feedforward: 3072
 activation: 'gelu'
-conv_layer: 'RFR'
+conv_layer: 'other'
 num_bottleneck_layers: 1
 dropout: 0
-conv_depth: [1, 2, 3, 4]
+conv_depth: [2, 2, 2]
 transformer_depth: [] #[2, 2, 2], [2]
 num_heads: [] #[3, 6, 12], [8] [12]
-spatial_cross_attention_num_heads: [2, 4, 8, 8] #[2, 4, 6, 8, 12] [12, 8, 6, 4, 2] [bottom, ..., top] [3, 6, 12] [4, 4, 8, 8, 16]
+spatial_cross_attention_num_heads: [2, 4, 8] #[2, 4, 6, 8, 12] [12, 8, 6, 4, 2] [bottom, ..., top] [3, 6, 12] [4, 4, 8, 8, 16]
 method: 'equal'
-batch_size: 1 #6
+batch_size: 2 #36
 bottleneck: 'swin' # ['vit', 'swin', 'factorized', 'vit_3d', 'swin_3d']
 rpe_mode: 'bias' # ['contextual', 'bias', 'None']
 rpe_contextual_tensors: 'qkv'
 drop_path_rate: 0.0
 autoencoder_dim: 64
-in_encoder_dims: [1, 64, 128, 256] #[1, 24, 96, 192, 384] [1, 96, 384] [1, 24, 96] [1, 32, 128] [1, 32, 128, 256, 512] [1, 48, 192] [1, 96, 192]
-out_encoder_dims: [32, 64, 128, 256] #[24, 48, 96, 192, 384] [96, 192, 384] [24, 48, 96] [32, 64, 128] [32, 64, 128, 256, 512] [48, 96, 192] [96, 192, 384]
+in_encoder_dims: [1, 128, 256] #[1, 24, 96, 192, 384] [1, 96, 384] [1, 24, 96] [1, 32, 128] [1, 32, 128, 256, 512] [1, 48, 192] [1, 96, 192]
+out_encoder_dims: [64, 128, 256] #[24, 48, 96, 192, 384] [96, 192, 384] [24, 48, 96] [32, 64, 128] [32, 64, 128, 256, 512] [48, 96, 192] [96, 192, 384]
 channel_attention: False
 merge: 'linear' # ['linear', 'rescale_linear', 'rescale_conv']
 zoom_p: 0.25

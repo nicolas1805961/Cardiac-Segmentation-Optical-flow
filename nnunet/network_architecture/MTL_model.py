@@ -27,10 +27,11 @@ from ..lib.vq_vae import VectorQuantizer, VectorQuantizerEMA, VanillaVAE, Quanti
 from torch.cuda.amp import autocast
 from nnunet.utilities.random_stuff import no_op
 from typing import Union, Tuple
-from ..lib.vit_transformer import TransformerEncoderLayer, TransformerEncoder, CrossTransformerEncoderLayer, CrossTransformerEncoder
+from ..lib.vit_transformer import SpatialTransformerLayer, ChannelAttention, TransformerEncoderLayer, TransformerEncoder, CrossTransformerEncoderLayer, CrossTransformerEncoder, RelativeTransformerEncoderLayer
 from batchgenerators.augmentations.utils import pad_nd_image
 from ..training.dataloading.dataset_loading import get_idx, select_idx
-from ..lib.position_embedding import PositionEmbeddingSine2d
+from ..lib.position_embedding import PositionEmbeddingSine2d, PositionEmbeddingLearned
+from torch.nn import init
 
 class ModelWrap(SegmentationNetwork):
     def __init__(self, model1, model2, do_ds):
@@ -74,14 +75,15 @@ class MTLmodel(SegmentationNetwork):
                 window_size,
                 swin_abs_pos,
                 deep_supervision,
+                channel_attention,
                 proj,
+                num_classes,
                 out_encoder_dims,
                 use_conv_mlp,
                 uncertainty_weighting,
                 device,
                 similarity_down_scale,
                 concat_spatial_cross_attention,
-                reconstruction_attention_type,
                 encoder_attention_type,
                 spatial_cross_attention_num_heads,
                 merge,
@@ -103,12 +105,10 @@ class MTLmodel(SegmentationNetwork):
                 one_vs_all,
                 separability,
                 transformer_depth,
-                filter_skip_co_reconstruction,
                 filter_skip_co_segmentation,
                 bottleneck_heads, 
                 adversarial_loss,
                 nb_repeat,
-                simple_decoder,
                 v1,
                 mix_residual,
                 transformer_bottleneck,
@@ -155,12 +155,13 @@ class MTLmodel(SegmentationNetwork):
         self.mix_residual = mix_residual
         self.separability = separability
         self.add_extra_bottleneck_blocks = add_extra_bottleneck_blocks
+        self.channel_attention = channel_attention
         if uncertainty_weighting:
             self.logsigma = nn.Parameter(torch.FloatTensor([1.61, -0.7, -0.7]))
         else:
             self.logsigma = [None] * 3
         
-        self.num_classes = 2 if binary else 4
+        self.num_classes = num_classes
 
         self.adversarial_loss = adversarial_loss
 
@@ -177,44 +178,36 @@ class MTLmodel(SegmentationNetwork):
 
         self.patch_size = patch_size
         self.encoder = Encoder(conv_layer=conv_layer, norm=norm, out_dims=out_encoder_dims, device=device, in_dims=in_dims, conv_depth=conv_depth, dpr=dpr_encoder)
-        in_dims[0] = self.num_classes
 
         if asymmetric_unet:
             conv_depth_decoder = [x//2 for x in conv_depth[::-1]]
         else:
             conv_depth_decoder = conv_depth[::-1]
-        
-        if separability:
-            self.get_separability = GetSeparability()
-        
-        if self.affinity:
-            self.SegAffinityComputer = GetCrossSimilarityMatrix(similarity_down_scale)
-            if simple_decoder:
-                self.affinity_decoder = nn.Sequential(decoder_alt.AffinityDecoder2(dim=self.d_model),
-                                                   GetCrossSimilarityMatrix(similarity_down_scale))    
-            else: 
-                self.affinity_decoder = nn.Sequential(decoder_alt.AffinityDecoder(norm=norm, shortcut=shortcut, proj_qkv=proj, out_encoder_dims=out_encoder_dims[::-1], use_conv_mlp=use_conv_mlp, last_activation='identity', blur=blur, img_size=image_size, num_classes=4, blur_kernel=blur_kernel, device=device, swin_abs_pos=swin_abs_pos, in_encoder_dims=in_dims[::-1], merge=merge, conv_depth=conv_depth_decoder, transformer_depth=transformer_depth[::-1], dpr=dpr_decoder, rpe_mode=rpe_mode, rpe_contextual_tensor=rpe_contextual_tensor, num_heads=num_heads, window_size=window_size, drop_path_rate=drop_path_rate, deep_supervision=False),
-                                                        GetCrossSimilarityMatrix(similarity_down_scale))
-        
-        if self.reconstruction:
-            sm_computation = nn.Sequential(ConvBlock(in_dim=1, out_dim=4, kernel_size=1, norm=norm),
-                                                GetCrossSimilarityMatrix(similarity_down_scale))
-
-            self.reconstruction = decoder_alt.ReconstructionDecoder(conv_layer=conv_layer, similarity=similarity, norm=norm, filter_skip_co_reconstruction=filter_skip_co_reconstruction, reconstruction=reconstruction, reconstruction_skip=reconstruction_skip, sm_computation=sm_computation, concat_spatial_cross_attention=concat_spatial_cross_attention, attention_type=reconstruction_attention_type, spatial_cross_attention_num_heads=spatial_cross_attention_num_heads[::-1], shortcut=shortcut, proj_qkv=proj, out_encoder_dims=out_encoder_dims[::-1], use_conv_mlp=use_conv_mlp, last_activation='identity', blur=blur, img_size=image_size, num_classes=1, blur_kernel=blur_kernel, device=device, swin_abs_pos=swin_abs_pos, in_encoder_dims=in_dims[::-1], merge=merge, conv_depth=conv_depth_decoder, transformer_depth=transformer_depth[::-1], dpr=dpr_decoder, rpe_mode=rpe_mode, rpe_contextual_tensor=rpe_contextual_tensor, num_heads=num_heads, window_size=window_size, drop_path_rate=drop_path_rate, deep_supervision=self.do_ds)
-            #self.reconstruction = decoder_alt.SimpleDecoder(in_dim=512, out_dim=1)
 
         if not self.middle:
-            self.decoder = decoder_alt.SegmentationDecoder(conv_layer=conv_layer, norm=norm, similarity_down_scale=similarity_down_scale, filter_skip_co_segmentation=filter_skip_co_segmentation, directional_field=directional_field, attention_map=attention_map, reconstruction=reconstruction, reconstruction_skip=reconstruction_skip, concat_spatial_cross_attention=concat_spatial_cross_attention, attention_type=encoder_attention_type, spatial_cross_attention_num_heads=spatial_cross_attention_num_heads[::-1], shortcut=shortcut, proj_qkv=proj, out_encoder_dims=out_encoder_dims[::-1], use_conv_mlp=use_conv_mlp, last_activation='identity', img_size=image_size, num_classes=self.num_classes, device=device, swin_abs_pos=swin_abs_pos, in_encoder_dims=in_dims[::-1], merge=merge, conv_depth=conv_depth_decoder, transformer_depth=transformer_depth[::-1], dpr=dpr_decoder, rpe_mode=rpe_mode, rpe_contextual_tensor=rpe_contextual_tensor, num_heads=num_heads, window_size=window_size, drop_path_rate=drop_path_rate, deep_supervision=self.do_ds)
+            decoder_output_dims = in_dims[::-1]
+            decoder_output_dims[-1] = self.num_classes
+            H, W = (int(image_size / 2**(self.num_stages)), int(image_size / 2**(self.num_stages)))
+            self.decoder = decoder_alt.SegmentationDecoder(conv_layer=conv_layer, norm=norm, similarity_down_scale=similarity_down_scale, filter_skip_co_segmentation=filter_skip_co_segmentation, directional_field=directional_field, attention_map=attention_map, reconstruction=reconstruction, reconstruction_skip=reconstruction_skip, concat_spatial_cross_attention=concat_spatial_cross_attention, attention_type=encoder_attention_type, spatial_cross_attention_num_heads=spatial_cross_attention_num_heads[::-1], shortcut=shortcut, proj_qkv=proj, out_encoder_dims=out_encoder_dims[::-1], use_conv_mlp=use_conv_mlp, last_activation='identity', img_size=image_size, num_classes=self.num_classes, device=device, swin_abs_pos=swin_abs_pos, in_encoder_dims=decoder_output_dims, merge=merge, conv_depth=conv_depth_decoder, transformer_depth=transformer_depth[::-1], dpr=dpr_decoder, rpe_mode=rpe_mode, rpe_contextual_tensor=rpe_contextual_tensor, num_heads=num_heads, window_size=window_size, drop_path_rate=drop_path_rate, deep_supervision=self.do_ds)
+            
             self.pos = PositionEmbeddingSine2d(num_pos_feats=self.d_model // 2, normalize=True)
+
+            #self.positional_emb = nn.Parameter(torch.zeros(1, H * W, self.d_model), requires_grad=True)
+            #init.trunc_normal_(self.positional_emb, std=0.2)
+            
             self.extra_bottleneck_block_1 = conv_layer(in_dim=self.d_model, out_dim=self.d_model, nb_blocks=1, dpr=dpr_bottleneck, norm=norm, kernel_size=3)
             if transformer_bottleneck:
-                encoder_layer = TransformerEncoderLayer(d_model=int(self.d_model), nhead=bottleneck_heads, dim_feedforward=2048)
-                self.bottleneck = TransformerEncoder(encoder_layer=encoder_layer, num_layers=self.num_bottleneck_layers)
+                if self.channel_attention:
+                    channel_attention_layer = ChannelAttention(dim=int(self.d_model), num_heads=bottleneck_heads, use_conv_mlp=False, input_resolution=self.bottleneck_size)
+                    encoder_layer = SpatialTransformerLayer(dim=int(self.d_model), num_heads=bottleneck_heads, use_conv_mlp=use_conv_mlp, input_resolution=self.bottleneck_size)
+                else:
+                    channel_attention_layer = None
+                    encoder_layer = TransformerEncoderLayer(d_model=int(self.d_model), nhead=bottleneck_heads, dim_feedforward=4 * int(self.d_model))
+                self.bottleneck = TransformerEncoder(encoder_layer=encoder_layer, num_layers=self.num_bottleneck_layers, channel_layer=channel_attention_layer)
             else:
                 self.bottleneck = conv_layer(in_dim=self.d_model, out_dim=self.d_model, nb_blocks=1, dpr=dpr_bottleneck, norm=norm, kernel_size=3)
             self.extra_bottleneck_block_2 = conv_layer(in_dim=self.d_model, out_dim=self.d_model, nb_blocks=1, dpr=dpr_bottleneck, norm=norm, kernel_size=3)
 
-            H, W = (int(image_size / 2**(self.num_stages)), int(image_size / 2**(self.num_stages)))
             if classification:
                 #self.classification_conv = ConvBlock(in_dim=self.d_model, out_dim=1, kernel_size=1, norm=norm, stride=1)
 
@@ -229,7 +222,7 @@ class MTLmodel(SegmentationNetwork):
         else:
             self.decoder = decoder_alt.SegmentationDecoder(conv_layer=conv_layer, norm=norm, filter_skip_co_segmentation=filter_skip_co_segmentation, concat_spatial_cross_attention=concat_spatial_cross_attention, spatial_cross_attention_num_heads=spatial_cross_attention_num_heads[::-1], shortcut=shortcut, proj_qkv=proj, out_encoder_dims=out_encoder_dims[::-1], use_conv_mlp=use_conv_mlp, last_activation='identity', img_size=image_size, num_classes=self.num_classes, device=device, swin_abs_pos=swin_abs_pos, in_encoder_dims=in_dims[::-1], conv_depth=conv_depth_decoder, transformer_depth=transformer_depth[::-1], dpr=dpr_decoder, rpe_mode=rpe_mode, rpe_contextual_tensor=rpe_contextual_tensor, num_heads=num_heads, window_size=window_size, drop_path_rate=drop_path_rate, deep_supervision=self.do_ds)
             if registered_seg:
-                self.motion_decoder = decoder_alt.SimpleDecoderStages(in_dim=self.d_model, out_dim=4, nb_stages=len(conv_depth), norm=norm, conv_layer=conv_layer, conv_depth=conv_depth_decoder, dpr=dpr_decoder, deep_supervision=False)
+                self.motion_decoder = decoder_alt.SimpleDecoderStages(in_dim=self.d_model, out_dim=num_classes, nb_stages=len(conv_depth), norm=norm, conv_layer=conv_layer, conv_depth=conv_depth_decoder, dpr=dpr_decoder, deep_supervision=False)
             if middle_classification:
                 self.reduce = nn.Sequential(torch.nn.MaxPool2d(2),
                     torch.nn.Conv2d(in_channels=self.d_model, out_channels=self.d_model // 4, kernel_size=H // 2))
@@ -264,7 +257,7 @@ class MTLmodel(SegmentationNetwork):
 
                 self.filter = Filter(dim=self.d_model, num_heads=bottleneck_heads, norm=norm)
 
-                self_attention_layer = TransformerEncoderLayer(d_model=self.d_model * 2, nhead=bottleneck_heads, dim_feedforward=2048)
+                self_attention_layer = TransformerEncoderLayer(d_model=self.d_model * 2, nhead=bottleneck_heads, dim_feedforward=self.d_model * 2 * 4)
                 self.self_attention_bottleneck = TransformerEncoder(encoder_layer=self_attention_layer, num_layers=1)
                 self.conv_blocks = conv_layer(in_dim=self.d_model * 2, out_dim=self.d_model, nb_blocks=2, dpr=dpr_bottleneck * 2, norm=norm, kernel_size=3)
 
@@ -281,9 +274,9 @@ class MTLmodel(SegmentationNetwork):
                 #self.conv_blocks_1 = conv_layer(in_dim=self.d_model * 2, out_dim=self.d_model, nb_blocks=2, dpr=dpr_bottleneck * 2, norm=norm, kernel_size=3)
                 #self.conv_blocks_2 = conv_layer(in_dim=self.d_model * 2, out_dim=self.d_model, nb_blocks=2, dpr=dpr_bottleneck * 2, norm=norm, kernel_size=3)
             else:
-                cross_attention_layer = CrossTransformerEncoderLayer(d_model=self.d_model, nhead=bottleneck_heads, dim_feedforward=2048)
-                self_attention_layer_pre = TransformerEncoderLayer(d_model=self.d_model, nhead=bottleneck_heads, dim_feedforward=2048)
-                self_attention_layer_post = TransformerEncoderLayer(d_model=self.d_model * 2, nhead=bottleneck_heads, dim_feedforward=2048)
+                cross_attention_layer = CrossTransformerEncoderLayer(d_model=self.d_model, nhead=bottleneck_heads, dim_feedforward=self.d_model * 4)
+                self_attention_layer_pre = TransformerEncoderLayer(d_model=self.d_model, nhead=bottleneck_heads, dim_feedforward=self.d_model * 4)
+                self_attention_layer_post = TransformerEncoderLayer(d_model=self.d_model * 2, nhead=bottleneck_heads, dim_feedforward=self.d_model * 2 * 4)
 
                 self.self_attention_bottleneck_pre = TransformerEncoder(encoder_layer=self_attention_layer_pre, num_layers=1)
                 self.self_attention_bottleneck_post = TransformerEncoder(encoder_layer=self_attention_layer_post, num_layers=1)
@@ -441,6 +434,8 @@ class MTLmodel(SegmentationNetwork):
             if self.transformer_bottleneck:
                 B, C, H, W = x_encoded.shape
                 pos = self.pos(shape_util=(B, H, W), device=x.device)
+                pos = torch.flatten(pos, start_dim=2).permute(0, 2, 1)
+                #pos = self.positional_emb.repeat(B, 1, 1)
                 x_encoded = self.bottleneck(x_encoded, pos=pos)
             else:
                 x_encoded = self.bottleneck(x_encoded)

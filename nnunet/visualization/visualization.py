@@ -6,24 +6,28 @@ from matplotlib.colors import Normalize
 from torch.nn.functional import interpolate
 import matplotlib as mpl
 from matplotlib.colors import ListedColormap
+import matplotlib.patches as patches
+from cv2 import rectangle
 
 
 class Visualizer(object):
     def __init__(self, 
                 unlabeled, 
-                adversarial_loss, 
-                affinity,
+                adversarial_loss,
                 middle_unlabeled,
                 middle,
+                learn_indices,
                 registered_seg,
                 writer):
         self.unlabeled = unlabeled
         self.middle_unlabeled = middle_unlabeled
         self.adversarial_loss = adversarial_loss
-        self.affinity = affinity
+        self.affinity = False
         self.middle = middle
         self.registered_seg = registered_seg
+        self.learn_indices = learn_indices
         self.writer = writer
+        self.dices = []
         self.eval_images = self.initialize_image_data()
     
     def reset(self):
@@ -39,6 +43,8 @@ class Visualizer(object):
             eval_images['confidence'] = None
         if self.affinity:
             eval_images['affinity'] = None
+        if self.learn_indices:
+            eval_images['theta'] = None
         if self.middle:
             eval_images['sim'] = None
             eval_images['weights'] = None
@@ -94,7 +100,7 @@ class Visualizer(object):
                     payload = {'input': None,
                                 'pred': None,
                                 'gt': None}
-                    score = 0
+                    score = -1
                     data.append(payload)
                     scores.append(score)
             elif key == 'confidence':
@@ -149,6 +155,13 @@ class Visualizer(object):
                                 'x1': None,
                                 'x2': None}
                     score = 0
+                    data.append(payload)
+                    scores.append(score)
+            elif key == 'theta':
+                for i in range(log_images_nb):
+                    payload = {'input': None,
+                                'theta': None}
+                    score = -1
                     data.append(payload)
                     scores.append(score)
             eval_images[key] = np.stack([np.array(data), np.array(scores)], axis=0)
@@ -442,6 +455,35 @@ class Visualizer(object):
         self.writer.add_images(os.path.join('Segmentation', 'ground_truth').replace('\\', '/'), gt_list, epoch, dataformats='NHWC')
         self.writer.add_images(os.path.join('Segmentation', 'prediction').replace('\\', '/'), pred_list, epoch, dataformats='NHWC')
     
+    def log_theta_images(self, epoch, area_size):
+        input_list = [x['input'] for x in self.eval_images['theta'][0]]
+        input_list = [self.get_images_ready_for_display(x, colormap=None) for x in input_list]
+        input_list = np.stack(input_list, axis=0)
+        input_list = np.tile(input_list, reps=(1, 1, 1, 3))
+        N, H, W, C = input_list.shape
+
+        theta_list = [x['theta'] for x in self.eval_images['theta'][0]]
+        rect_images = []
+        for i in range(len(theta_list)):
+            rect = input_list[i]
+            #x, y = theta_list[i][0, 2], theta_list[i][1, 2]
+            #x1 = ((x + 1) * W / 2) - (area_size / 2)
+            #y1 = ((y + 1) * H / 2) - (area_size / 2)
+            #x2 = ((x + 1) * W / 2) + (area_size / 2)
+            #y2 = ((y + 1) * H / 2) + (area_size / 2)
+            for j in range(theta_list[i].shape[0]):
+                x1 = theta_list[i][j][0]
+                y1 = theta_list[i][j][1]
+                x2 = theta_list[i][j][2]
+                y2 = theta_list[i][j][3]
+                start = (int(x1), int(y1))
+                end = (int(x2), int(y2))
+                rect = rectangle(rect, start, end, (255, 0, 0))
+            rect_images.append(rect)
+        rect_images = np.stack(rect_images, axis=0)
+
+        self.writer.add_images(os.path.join('Focus', 'focus_area').replace('\\', '/'), rect_images, epoch, dataformats='NHWC')
+    
     def log_pseudo_label_images(self, colormap_seg, norm, epoch):
         input_list = [x['input'] for x in self.eval_images['pseudo_label'][0]]
         input_list = [self.get_images_ready_for_display(x, colormap=None) for x in input_list]
@@ -516,7 +558,7 @@ class Visualizer(object):
         pred = pred.cpu().numpy()
         x = x.cpu().numpy()
 
-        if self.eval_images['seg'][1, 0] < seg_dice:
+        if self.eval_images['seg'][1, 0] <= seg_dice:
 
             self.eval_images['seg'][0, 0]['gt'] = gt.astype(np.float32)
             self.eval_images['seg'][0, 0]['pred'] = pred.astype(np.float32)
@@ -525,6 +567,20 @@ class Visualizer(object):
 
             sorted_indices = self.eval_images['seg'][1, :].argsort()
             self.eval_images['seg'] = self.eval_images['seg'][:, sorted_indices]
+    
+    def set_up_image_theta(self, seg_dice, theta, x):
+        seg_dice = seg_dice.cpu().numpy()
+        theta = theta.cpu().numpy()
+        x = x.cpu().numpy()
+
+        if self.eval_images['theta'][1, 0] <= seg_dice:
+
+            self.eval_images['theta'][0, 0]['theta'] = theta.astype(np.float32)
+            self.eval_images['theta'][0, 0]['input'] = x.astype(np.float32)
+            self.eval_images['theta'][1, 0] = seg_dice
+
+            sorted_indices = self.eval_images['theta'][1, :].argsort()
+            self.eval_images['theta'] = self.eval_images['theta'][:, sorted_indices]
 
     def set_up_image_pseudo_label(self, seg_dice, pred, unlabeled_input):
         seg_dice = seg_dice.cpu().numpy()

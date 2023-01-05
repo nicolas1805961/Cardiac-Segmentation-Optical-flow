@@ -8,6 +8,7 @@
 import matplotlib
 from copy import copy
 from math import ceil
+from torch.nn import init
 import torch
 import sys
 import torch.nn as nn
@@ -27,10 +28,12 @@ from ..lib.vq_vae import VectorQuantizer, VectorQuantizerEMA, VanillaVAE, Quanti
 from torch.cuda.amp import autocast
 from nnunet.utilities.random_stuff import no_op
 from typing import Union, Tuple
-from ..lib.vit_transformer import SpatioTemporalTransformer, SpatialTransformerLayer, TemporalTransformerLayer
+from ..lib.vit_transformer import SpatioTemporalTransformer, SpatialTransformerLayer, TransformerEncoderLayer, SlotAttention, TemporalTransformerLayer, CrossTransformerEncoderLayer, CrossRelativeSpatialTransformerLayer
 from batchgenerators.augmentations.utils import pad_nd_image
 from ..training.dataloading.dataset_loading import get_idx, select_idx
 from ..lib.position_embedding import PositionEmbeddingSine2d
+from torchvision.transforms.functional import gaussian_blur
+from torch.nn.functional import interpolate
 
 class ModelWrap(SegmentationNetwork):
     def __init__(self, model1, model2, do_ds):
@@ -67,7 +70,6 @@ class ModelWrap(SegmentationNetwork):
 
 class VideoModel(SegmentationNetwork):
     def __init__(self,
-                patch_size, 
                 window_size,
                 deep_supervision,
                 out_encoder_dims,
@@ -78,19 +80,27 @@ class VideoModel(SegmentationNetwork):
                 concat_spatial_cross_attention,
                 spatial_cross_attention_num_heads,
                 log_function,
-                batch_size,
                 in_dims,
+                conv_layer_1d,
+                use_patches,
+                nb_layers,
                 video_length,
                 proj_qkv,
+                nb_zones,
+                area_size,
+                learn_indices,
+                softmax_indices,
                 image_size,
                 num_bottleneck_layers,
                 conv_layer,
+                deformable_points,
                 conv_depth,
                 num_heads,
                 filter_skip_co_segmentation,
                 bottleneck_heads,
                 drop_path_rate,
-                norm):
+                norm_1d,
+                norm_2d):
         super(VideoModel, self).__init__()
         
         self.num_stages = (len(conv_depth))
@@ -98,7 +108,6 @@ class VideoModel(SegmentationNetwork):
         self.d_model = out_encoder_dims[-1] * 2
         self.bottleneck_size = [int(image_size / (2**self.num_stages)), int(image_size / (2**self.num_stages))]
         self.image_size = image_size
-        self.batch_size = batch_size
         self.bottleneck_heads = bottleneck_heads
         self.do_ds = deep_supervision
         self.conv_op=nn.Conv2d
@@ -106,6 +115,9 @@ class VideoModel(SegmentationNetwork):
         self.log_function = log_function
         self.nb_memory_bus = nb_memory_bus
         self.video_length = video_length
+        self.nb_layers = nb_layers
+        self.learn_indices = learn_indices
+        self.softmax_indices = softmax_indices
         
         self.num_classes = 4
 
@@ -118,46 +130,101 @@ class VideoModel(SegmentationNetwork):
         dpr_decoder = [x[::-1] for x in dpr_encoder[::-1]]
         dpr_bottleneck = dpr[-1]
 
-        self.patch_size = patch_size
-        self.encoder = Encoder(conv_layer=conv_layer, norm=norm, out_dims=out_encoder_dims, device=device, in_dims=in_dims, conv_depth=conv_depth, dpr=dpr_encoder)
+        self.encoder = Encoder(conv_layer=conv_layer, norm=norm_2d, out_dims=out_encoder_dims, device=device, in_dims=in_dims, conv_depth=conv_depth, dpr=dpr_encoder)
         in_dims[0] = self.num_classes
         conv_depth_decoder = conv_depth[::-1]
-        self.decoder = decoder_alt.SegmentationDecoder(conv_layer=conv_layer, norm=norm, similarity_down_scale=similarity_down_scale, filter_skip_co_segmentation=filter_skip_co_segmentation, concat_spatial_cross_attention=concat_spatial_cross_attention, spatial_cross_attention_num_heads=spatial_cross_attention_num_heads[::-1], shortcut=False, proj_qkv=proj_qkv, out_encoder_dims=out_encoder_dims[::-1], use_conv_mlp=use_conv_mlp, last_activation='identity', img_size=image_size, num_classes=self.num_classes, device=device, swin_abs_pos=False, in_encoder_dims=in_dims[::-1], merge=False, conv_depth=conv_depth_decoder, transformer_depth=0, dpr=dpr_decoder, rpe_mode=False, rpe_contextual_tensor=False, num_heads=num_heads, window_size=window_size, drop_path_rate=drop_path_rate, deep_supervision=self.do_ds)
+        self.decoder = decoder_alt.VideoSegmentationDecoder(deformable_points=deformable_points, use_patches=use_patches, nb_zones=nb_zones, area_size=area_size, video_length=video_length, nb_memory_bus=nb_memory_bus, norm_1d=norm_1d, conv_layer_1d=conv_layer_1d, learn_indices=learn_indices, softmax_indices=softmax_indices, conv_layer=conv_layer, norm=norm_2d, similarity_down_scale=similarity_down_scale, filter_skip_co_segmentation=filter_skip_co_segmentation, concat_spatial_cross_attention=concat_spatial_cross_attention, spatial_cross_attention_num_heads=spatial_cross_attention_num_heads[::-1], shortcut=False, proj_qkv=proj_qkv, out_encoder_dims=out_encoder_dims[::-1], use_conv_mlp=use_conv_mlp, last_activation='identity', img_size=image_size, num_classes=self.num_classes, device=device, swin_abs_pos=False, in_encoder_dims=in_dims[::-1], merge=False, conv_depth=conv_depth_decoder, transformer_depth=0, dpr=dpr_decoder, rpe_mode=False, rpe_contextual_tensor=False, num_heads=num_heads, window_size=window_size, drop_path_rate=drop_path_rate, deep_supervision=self.do_ds)
         self.pos = PositionEmbeddingSine2d(num_pos_feats=self.d_model // 2, normalize=True)
 
-        self.extra_bottleneck_block_1 = conv_layer(in_dim=self.d_model, out_dim=self.d_model, nb_blocks=1, dpr=dpr_bottleneck, norm=norm, kernel_size=3)
-        self.extra_bottleneck_block_2 = conv_layer(in_dim=self.d_model, out_dim=self.d_model, nb_blocks=1, dpr=dpr_bottleneck, norm=norm, kernel_size=3)
+        self.extra_bottleneck_block_1 = conv_layer(in_dim=self.d_model, out_dim=self.d_model, nb_blocks=1, dpr=dpr_bottleneck, norm=norm_2d, kernel_size=3)
+        self.extra_bottleneck_block_2 = conv_layer(in_dim=self.d_model, out_dim=self.d_model, nb_blocks=1, dpr=dpr_bottleneck, norm=norm_2d, kernel_size=3)
 
-        spatial_transformer_layer = SpatialTransformerLayer(d_model=self.d_model, nhead=self.bottleneck_heads, nb_memory_bus=self.nb_memory_bus)
-        temporal_transformer_layer = TemporalTransformerLayer(d_model=self.d_model, nhead=self.bottleneck_heads)
-        self.spatio_temporal_encoder = SpatioTemporalTransformer(dim=self.d_model, spatial_layer=spatial_transformer_layer, temporal_layer=temporal_transformer_layer, num_layers=1, nb_memory_bus=self.nb_memory_bus)
+        H, W = (int(image_size / 2**(self.num_stages)), int(image_size / 2**(self.num_stages)))
 
+        temporal_transformer_layer = TemporalTransformerLayer(d_model=self.d_model, nhead=self.bottleneck_heads, dim_feedforward=self.d_model * 4)
+        spatial_transformer_layer = TransformerEncoderLayer(d_model=self.d_model, nhead=self.bottleneck_heads, dim_feedforward=self.d_model * 4)
+        slot_layer = SlotAttention(dim=self.d_model, iters=4, hidden_dim=self.d_model)
+        self.spatio_temporal_encoder = SpatioTemporalTransformer(conv_layer=None, dim=self.d_model, slot_layer=slot_layer, temporal_layer=temporal_transformer_layer, spatial_layer=spatial_transformer_layer, num_layers=self.nb_layers, nb_memory_bus=self.nb_memory_bus, norm_1d=norm_1d, video_length=self.video_length, conv_layer_1d=conv_layer_1d, area_size=area_size, use_patches=False)
         #self.query_embed = nn.Embedding(4, self.d_model)
-        self.memory_bus = nn.Parameter(torch.randn(self.nb_memory_bus, self.d_model))
-        self.memory_pos = nn.Parameter(torch.randn(self.nb_memory_bus, self.d_model))
+    
+    def get_mask(self, softmax_volume):
+        "softmax_volume: B, T, C, H, W"
+        B, T, C, H, W = softmax_volume.shape
+        k = int((H / (2**self.num_stages)) ** 2)
+        scale_factors = [1/2**i for i in range(self.num_stages)]
+        scale_list = []
+        for scale_factor in scale_factors:
+            temp_blurred = 1 - torch.max(softmax_volume, dim=2)[0]
+            temp_blurred = gaussian_blur(temp_blurred, kernel_size=[19, 19])
+            temp_blurred = interpolate(temp_blurred, scale_factor=(scale_factor, scale_factor), mode='bilinear', antialias=True)
+            B, T, H, W = temp_blurred.shape
+
+            matplotlib.use('QtAgg')
+            fig, ax = plt.subplots(1, 1)
+            ax.imshow(temp_blurred[0, 0].cpu(), cmap='plasma')
+            plt.show()
+
+            temp_blurred_flattened = torch.flatten(temp_blurred, start_dim=-2)
+            values, indices = torch.topk(temp_blurred_flattened, k=k, dim=-1, largest=True)
+            #mask = torch.zeros_like(temp_blurred_flattened)
+            #mask.scatter_(dim=-1, index=indices, src=torch.ones_like(mask))
+            #mask = mask.view(B, T, H, W).unsqueeze(2)
+            scale_list.append(indices)
+
+            
+        #matplotlib.use('QtAgg')
+        #fig, ax = plt.subplots(1, 3)
+        #ax[0].imshow(scale_list[0][0, 0, 0].cpu(), cmap='plasma')
+        #ax[1].imshow(scale_list[1][0, 0, 0].cpu(), cmap='plasma')
+        #ax[2].imshow(scale_list[2][0, 0, 0].cpu(), cmap='plasma')
+        #plt.show()
+
+        return scale_list
 
     def forward(self, data_dict):
+        theta = None
         out = {}
         encoded_list = []
         skip_co_list = []
         out_list = []
         for x in data_dict['labeled_data']:
             encoded, skip_connections = self.encoder(x)
+
+            if not torch.all(torch.isfinite(encoded)):
+                for name, param in self.encoder.named_parameters():
+                    if not torch.all(torch.isfinite(param)):
+                        print(name)
+                matplotlib.use('QtAgg')
+                fig, ax = plt.subplots(1, len(x))
+                for u in range(len(x)):
+                    ax[u].imshow(x[u, 0].cpu(), cmap='gray')
+                plt.show()
+
             encoded = self.extra_bottleneck_block_1(encoded)
             encoded_list.append(encoded)
             skip_co_list.append(skip_connections)
         
         spatial_tokens = torch.stack(encoded_list, dim=0)
         T, B, C, H, W = spatial_tokens.shape
-        
-        memory_bus = self.memory_bus
-        memory_pos = self.memory_pos
-        spatial_tokens, memory_bus = self.spatio_temporal_encoder(spatial_tokens, memory_bus, memory_pos)
-        spatial_tokens = spatial_tokens.permute(1, 2, 0).view(T, B, C, -1).view(T, B, C, H, W)
+        spatial_tokens = self.spatio_temporal_encoder(spatial_tokens)
+
+        if self.softmax_indices or self.learn_indices:
+            stage_list = []
+            for stage in range(self.num_stages):
+                video_list = [skip_co_list[i][stage] for i in range(self.video_length)]
+                video_volume = torch.stack(video_list, dim=0)
+                stage_list.append(video_volume)
+            skip_co_list = stage_list
 
         for i in range(len(spatial_tokens)):
             decoded = self.extra_bottleneck_block_2(spatial_tokens[i])
-            seg = self.decoder(decoded, skip_co_list[i])
+            if self.softmax_indices:
+                seg, _ = self.decoder(decoded, skip_co_list, softmax_volume=data_dict['mask_data'], frame_index=i)
+            elif self.learn_indices:
+                seg = self.decoder(decoded, skip_co_list)
+                #seg, theta = self.decoder(decoded, skip_co_list, frame_index=i)
+            else:
+                seg = self.decoder(decoded, skip_co_list[i])
             if not self.do_ds:
                 seg = seg[0]
             out_list.append(seg)
@@ -165,11 +232,12 @@ class VideoModel(SegmentationNetwork):
         #seg = torch.stack(out_list, dim=0)
             
         out['labeled_data'] = out_list
+        #out['theta'] = theta
             
         return out
     
 
-    def predict_3D(self, x: np.ndarray, processor, do_mirroring: bool, mirror_axes: Tuple[int, ...] = (0, 1, 2),
+    def predict_3D_video(self, data, idx, video_padding, processor, do_mirroring: bool, mirror_axes: Tuple[int, ...] = (0, 1, 2),
                    use_sliding_window: bool = False,
                    step_size: float = 0.5, patch_size: Tuple[int, ...] = None, regions_class_order: Tuple[int, ...] = None,
                    use_gaussian: bool = False, pad_border_mode: str = "constant",
@@ -232,7 +300,7 @@ class VideoModel(SegmentationNetwork):
             self.log_function("WARNING! Network is in train mode during inference. This may be intended, or not...")
             #print('WARNING! Network is in train mode during inference. This may be intended, or not...')
 
-        assert len(x.shape) == 4, "data must have shape (c,x,y,z)"
+        assert len(data[0].shape) == 4, "data must have shape (c,x,y,z)"
 
         if mixed_precision:
             context = autocast
@@ -241,25 +309,13 @@ class VideoModel(SegmentationNetwork):
 
         with context():
             with torch.no_grad():
-                if self.conv_op == nn.Conv3d:
-                    if use_sliding_window:
-                        res = self._internal_predict_3D_3Dconv_tiled(x, step_size, do_mirroring, mirror_axes, patch_size,
-                                                                     regions_class_order, use_gaussian, pad_border_mode,
-                                                                     pad_kwargs=pad_kwargs, all_in_gpu=all_in_gpu,
-                                                                     verbose=verbose)
-                    else:
-                        res = self._internal_predict_3D_3Dconv(x, patch_size, do_mirroring, mirror_axes, regions_class_order,
-                                                               pad_border_mode, pad_kwargs=pad_kwargs, verbose=verbose)
-                elif self.conv_op == nn.Conv2d:
-                    if use_sliding_window:
-                        res = self._internal_predict_3D_2Dconv_tiled_video(x, processor, patch_size, do_mirroring, mirror_axes, step_size,
+                if use_sliding_window:
+                    res = self._internal_predict_3D_2Dconv_tiled_video(data, idx, video_padding, processor, patch_size, do_mirroring, mirror_axes, step_size,
                                                                                 regions_class_order, use_gaussian, pad_border_mode,
                                                                                 pad_kwargs, all_in_gpu, False)
-                    else:
-                        res = self._internal_predict_3D_2Dconv(x, patch_size, do_mirroring, mirror_axes, regions_class_order,
-                                                               pad_border_mode, pad_kwargs, all_in_gpu, False)
                 else:
-                    raise RuntimeError("Invalid conv op, cannot determine what dimensionality (2d/3d) the network is")
+                    res = self._internal_predict_3D_2Dconv(data, idx, video_padding, patch_size, do_mirroring, mirror_axes, regions_class_order,
+                                                               pad_border_mode, pad_kwargs, all_in_gpu, False)
 
         return res
 
@@ -421,7 +477,7 @@ class VideoModel(SegmentationNetwork):
         return result_torch
     
 
-    def _internal_maybe_mirror_and_pred_2D_video(self, video, idx, processor, registered_idx, mirror_axes: tuple,
+    def _internal_maybe_mirror_and_pred_2D_video(self, video, idx, video_padding, processor, mirror_axes: tuple,
                                            do_mirroring: bool = True,
                                            mult: np.ndarray or torch.tensor = None) -> torch.tensor:
         # if cuda available:
@@ -430,14 +486,14 @@ class VideoModel(SegmentationNetwork):
 
         assert len(video[0].shape) == 4, 'x must be (b, c, x, y)'
 
-        for t in range(len(video)):
-            video[t] = maybe_to_torch(video[t])
+        video = maybe_to_torch(video)
+        video_padding = maybe_to_torch(video_padding).bool()
 
-        result_torch = torch.zeros([video[0].shape[0], self.num_classes] + list(video[0].shape[2:]), dtype=torch.float)
+        result_torch = torch.zeros([video.shape[1], self.num_classes] + list(video.shape[3:]), dtype=torch.float)
 
         if torch.cuda.is_available():
-            for t in range(len(video)):
-                video[t] = to_cuda(video[t], gpu_id=self.get_device())
+            video_padding = to_cuda(video_padding, gpu_id=self.get_device())
+            video = to_cuda(video, gpu_id=self.get_device())
             result_torch = result_torch.cuda(self.get_device(), non_blocking=True)
 
         if mult is not None:
@@ -454,11 +510,11 @@ class VideoModel(SegmentationNetwork):
 
         for m in range(mirror_idx):
             if m == 0:
-                labeled_data = video
+                labeled_data = [video[i] for i in range(len(video))]
                 with torch.no_grad():
-                    network_input, padding_need, translation_dists = processor.preprocess(data_list=labeled_data, idx=registered_idx)
+                    network_input, padding_need, _ = processor.preprocess_no_registration(data_list=labeled_data, video_padding=video_padding)
                 output = self(network_input)
-                output = processor.uncrop(output, padding_need, translation_dists)
+                output = processor.uncrop_no_registration(output, padding_need)
                 output = {'labeled_data': [output[:, i] for i in range(output.shape[1])]}
                 pred = self.inference_apply_nonlin(output['labeled_data'][idx])
                 result_torch += 1 / num_results * pred
@@ -468,9 +524,9 @@ class VideoModel(SegmentationNetwork):
                 for t in range(len(video)):
                     labeled_data.append(torch.flip(video[t], (3, )))
                 with torch.no_grad():
-                    network_input, padding_need, translation_dists = processor.preprocess(data_list=labeled_data, idx=registered_idx)
+                    network_input, padding_need, _ = processor.preprocess_no_registration(data_list=labeled_data, video_padding=video_padding)
                 output = self(network_input)
-                output = processor.uncrop(output, padding_need, translation_dists)
+                output = processor.uncrop_no_registration(output, padding_need)
                 output = {'labeled_data': [output[:, i] for i in range(output.shape[1])]}
                 pred = self.inference_apply_nonlin(output['labeled_data'][idx])
                 result_torch += 1 / num_results * torch.flip(pred, (3, ))
@@ -480,9 +536,9 @@ class VideoModel(SegmentationNetwork):
                 for t in range(len(video)):
                     labeled_data.append(torch.flip(video[t], (2, )))
                 with torch.no_grad():
-                    network_input, padding_need, translation_dists = processor.preprocess(data_list=labeled_data, idx=registered_idx)
+                    network_input, padding_need, _ = processor.preprocess_no_registration(data_list=labeled_data, video_padding=video_padding)
                 output = self(network_input)
-                output = processor.uncrop(output, padding_need, translation_dists)
+                output = processor.uncrop_no_registration(output, padding_need)
                 output = {'labeled_data': [output[:, i] for i in range(output.shape[1])]}
                 pred = self.inference_apply_nonlin(output['labeled_data'][idx])
                 result_torch += 1 / num_results * torch.flip(pred, (2, ))
@@ -492,9 +548,9 @@ class VideoModel(SegmentationNetwork):
                 for t in range(len(video)):
                     labeled_data.append(torch.flip(video[t], (3, 2)))
                 with torch.no_grad():
-                    network_input, padding_need, translation_dists = processor.preprocess(data_list=labeled_data, idx=registered_idx)
+                    network_input, padding_need, _ = processor.preprocess_no_registration(data_list=labeled_data, video_padding=video_padding)
                 output = self(network_input)
-                output = processor.uncrop(output, padding_need, translation_dists)
+                output = processor.uncrop_no_registration(output, padding_need)
                 output = {'labeled_data': [output[:, i] for i in range(output.shape[1])]}
                 pred = self.inference_apply_nonlin(output['labeled_data'][idx])
                 result_torch += 1 / num_results * torch.flip(pred, (3, 2))
@@ -504,7 +560,7 @@ class VideoModel(SegmentationNetwork):
 
         return result_torch
 
-    def _internal_predict_3D_2Dconv_tiled_video(self, x: np.ndarray, processor, patch_size: Tuple[int, int], do_mirroring: bool,
+    def _internal_predict_3D_2Dconv_tiled_video(self, data, idx, video_padding, processor, patch_size: Tuple[int, int], do_mirroring: bool,
                                                 mirror_axes: tuple = (0, 1), step_size: float = 0.5,
                                                 regions_class_order: tuple = None, use_gaussian: bool = False,
                                                 pad_border_mode: str = "edge", pad_kwargs: dict =None,
@@ -513,28 +569,17 @@ class VideoModel(SegmentationNetwork):
         if all_in_gpu:
             raise NotImplementedError
 
-        assert len(x.shape) == 4, "data must be c, x, y, z"
+        assert len(data[0].shape) == 4, "data must be c, x, y, z"
 
         predicted_segmentation = []
         softmax_pred = []
 
-        values = np.arange(x.shape[1])
-        for s in range(x.shape[1]):
-            step = self.video_length // 2
-            start = min(max(s - step, 0), x.shape[1] - self.video_length)
-            indices = values[start:start + self.video_length]
-            assert len(indices) == self.video_length
-            idx = int(np.where(indices == s)[0])
+        for depth_idx in range(data.shape[2]):
 
-            dist = np.abs(indices - (x.shape[1] // 2))
-            registered_idx = np.argmin(dist)
-
-            data_list = []
-            for index in indices:
-                data_list.append(x[:, index])
+            #current_video = [x[:, depth_idx] for x in frame_list]
 
             pred_seg, softmax_pres = self._internal_predict_2D_2Dconv_tiled_video(
-                data_list, idx, processor, [registered_idx], step_size, do_mirroring, mirror_axes, patch_size, regions_class_order, use_gaussian,
+                data[:, :, depth_idx], idx, video_padding, processor, step_size, do_mirroring, mirror_axes, patch_size, regions_class_order, use_gaussian,
                 pad_border_mode, pad_kwargs, all_in_gpu, verbose)
 
             predicted_segmentation.append(pred_seg[None])
@@ -546,7 +591,7 @@ class VideoModel(SegmentationNetwork):
         return predicted_segmentation, softmax_pred
 
 
-    def _internal_predict_2D_2Dconv_tiled_video(self, video, idx, processor, registered_idx, step_size: float, do_mirroring: bool, mirror_axes: tuple,
+    def _internal_predict_2D_2Dconv_tiled_video(self, video, idx, video_padding, processor, step_size: float, do_mirroring: bool, mirror_axes: tuple,
                                           patch_size: tuple, regions_class_order: tuple, use_gaussian: bool,
                                           pad_border_mode: str, pad_kwargs: dict, all_in_gpu: bool,
                                           verbose: bool) -> Tuple[np.ndarray, np.ndarray]:
@@ -560,14 +605,17 @@ class VideoModel(SegmentationNetwork):
 
         # for sliding window inference the image must at least be as large as the patch size. It does not matter
         # whether the shape is divisible by 2**num_pool as long as the patch size is
-        data_list = []
-        slicer_list = []
-        for x in video:
-            data, slicer = pad_nd_image(x, patch_size, pad_border_mode, pad_kwargs, True, None)
-            data_list.append(data)
-            slicer_list.append(slicer)
+        data, slicer = pad_nd_image(video, patch_size, pad_border_mode, pad_kwargs, True, None)
+        slicer = slicer[1:]
+        
+        #data_list = []
+        #slicer_list = []
+        #for x in video:
+        #    data, slicer = pad_nd_image(x, patch_size, pad_border_mode, pad_kwargs, True, None)
+        #    data_list.append(data)
+        #    slicer_list.append(slicer)
 
-        data_shape = data_list[0].shape  # still c, x, y
+        data_shape = data[0].shape  # still c, x, y
 
         # compute the steps for sliding window
         steps = self._compute_steps_for_sliding_window(patch_size, data_shape[1:], step_size)
@@ -618,23 +666,22 @@ class VideoModel(SegmentationNetwork):
                 add_for_nb_of_preds = torch.ones(patch_size, device=self.get_device())
 
             if verbose: print("initializing result array (on GPU)")
-            aggregated_results = torch.zeros([self.num_classes] + list(data_list[0].shape[1:]), dtype=torch.half,
+            aggregated_results = torch.zeros([self.num_classes] + list(data[0].shape[1:]), dtype=torch.half,
                                              device=self.get_device())
 
             if verbose: print("moving data to GPU")
-            for i in range(len(data_list)):
-                data_list[i] = torch.from_numpy(data_list[i]).cuda(self.get_device(), non_blocking=True)
+            data = torch.from_numpy(data).cuda(self.get_device(), non_blocking=True)
 
             if verbose: print("initializing result_numsamples (on GPU)")
-            aggregated_nb_of_predictions = torch.zeros([self.num_classes] + list(data_list[0].shape[1:]), dtype=torch.half,
+            aggregated_nb_of_predictions = torch.zeros([self.num_classes] + list(data[0].shape[1:]), dtype=torch.half,
                                                        device=self.get_device())
         else:
             if use_gaussian and num_tiles > 1:
                 add_for_nb_of_preds = self._gaussian_2d
             else:
                 add_for_nb_of_preds = np.ones(patch_size, dtype=np.float32)
-            aggregated_results = np.zeros([self.num_classes] + list(data_list[0].shape[1:]), dtype=np.float32)
-            aggregated_nb_of_predictions = np.zeros([self.num_classes] + list(data_list[0].shape[1:]), dtype=np.float32)
+            aggregated_results = np.zeros([self.num_classes] + list(data[0].shape[1:]), dtype=np.float32)
+            aggregated_nb_of_predictions = np.zeros([self.num_classes] + list(data[0].shape[1:]), dtype=np.float32)
 
         for x in steps[0]:
             lb_x = x
@@ -643,12 +690,8 @@ class VideoModel(SegmentationNetwork):
                 lb_y = y
                 ub_y = y + patch_size[1]
 
-                video = []
-                for t in range(len(data_list)):
-                    video.append(data_list[t][None, :, lb_x:ub_x, lb_y:ub_y])
-
                 predicted_patch = self._internal_maybe_mirror_and_pred_2D_video(
-                    video, idx, processor, registered_idx, mirror_axes, do_mirroring,
+                    data[:, None, :, lb_x:ub_x, lb_y:ub_y], idx, video_padding, processor, mirror_axes, do_mirroring,
                     gaussian_importance_map)[0]
 
                 if all_in_gpu:

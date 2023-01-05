@@ -151,12 +151,13 @@ def main():
     # else:
     #     raise ValueError("force_separate_z must be None, True or False. Given: %s" % force_separate_z)
 
-    if middle:
-        config = read_config(os.path.join(Path.cwd(), 'adversarial_acdc_middle.yaml'), middle)
-    elif video:
-        config = read_config(os.path.join(Path.cwd(), 'video.yaml'), middle)
+    if network_trainer == 'nnMTLTrainerV2Video':
+        config = read_config(os.path.join(Path.cwd(), 'video.yaml'), middle, video)
     else:
-        config = read_config(os.path.join(Path.cwd(), 'adversarial_acdc.yaml'), middle)
+        if middle:
+            config = read_config(os.path.join(Path.cwd(), 'adversarial_acdc_middle.yaml'), middle, video)
+        else:
+            config = read_config(os.path.join(Path.cwd(), 'adversarial_acdc.yaml'), middle, video)
 
     plans_file, output_folder_name, dataset_directory, batch_dice, stage, \
         trainer_class = get_default_configuration(network, task, network_trainer, config, plans_identifier)

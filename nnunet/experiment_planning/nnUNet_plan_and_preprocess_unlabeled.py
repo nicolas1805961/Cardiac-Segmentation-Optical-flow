@@ -107,8 +107,8 @@ def main():
         if args.verify_dataset_integrity:
             verify_dataset_integrity(join(nnUNet_raw_data, task_name))
 
-        if '28' in task_name:
-            crop(task_name, False, tf, get_original_path=True)
+        if '28' in task_name or '29' in task_name:
+            crop(task_name, False, tf, get_info=True)
         else:
             crop(task_name, False, tf)
             crop_unlabeled(task_name, False, tf)

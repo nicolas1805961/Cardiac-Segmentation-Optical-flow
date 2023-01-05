@@ -1,12 +1,17 @@
 import torch
 from torchvision.ops import masks_to_boxes
 from torchvision.transforms.functional import affine
+import matplotlib.pyplot as plt
+import matplotlib
+from torch.nn.functional import pad
 
 class Processor(object):
-    def __init__(self, crop_size, image_size, cropping_network) -> None:
+    def __init__(self, crop_size, image_size, cropping_network, get_softmax, nb_layers) -> None:
         self.crop_size = crop_size
         self.image_size = image_size
         self.cropping_network = cropping_network
+        self.get_softmax = get_softmax
+        self.nb_layers = nb_layers
     
     def get_coords(self, data):
         coords = masks_to_boxes(data.unsqueeze(0))
@@ -84,20 +89,20 @@ class Processor(object):
             batch_list.append(current_video)
         return torch.stack(batch_list, dim=0)
     
-    #def get_mean_centroid(self, data):
-    #    mean_centroid_list = []
-    #    for b in range(len(data)):
-    #        current_data = data[b]
-    #        current_flattened_data = torch.flatten(current_data, start_dim=1)
-    #        mask = torch.count_nonzero(current_flattened_data, dim=-1) != 0
-    #        current_data = current_data[mask]
-    #        coords = masks_to_boxes(current_data)
-    #        x = coords[:, 0] + ((coords[:, 2] - coords[:, 0]) / 2)
-    #        y = coords[:, 1] + ((coords[:, 3] - coords[:, 1]) / 2)
-    #        coords = torch.stack([x, y], dim=-1)
-    #        mean_centroid = coords.mean(dim=0)
-    #        mean_centroid_list.append(mean_centroid)
-    #    return torch.stack(mean_centroid_list, dim=0).int()
+    def get_mean_centroid(self, data):
+        mean_centroid_list = []
+        for b in range(len(data)):
+            current_data = data[b]
+            current_flattened_data = torch.flatten(current_data, start_dim=1)
+            mask = torch.count_nonzero(current_flattened_data, dim=-1) != 0
+            current_data = current_data[mask]
+            coords = masks_to_boxes(current_data)
+            x = coords[:, 0] + ((coords[:, 2] - coords[:, 0]) / 2)
+            y = coords[:, 1] + ((coords[:, 3] - coords[:, 1]) / 2)
+            coords = torch.stack([x, y], dim=-1)
+            mean_centroid = coords.mean(dim=0)
+            mean_centroid_list.append(mean_centroid)
+        return torch.stack(mean_centroid_list, dim=0).int()
     
     def adjust_cropping_window(self, centroid):
         half_crop_size = self.crop_size // 2
@@ -139,12 +144,21 @@ class Processor(object):
     
     def discretize(self, data_list):
         out_list = []
+        softmax_list = []
         for data in data_list:
-            out = self.cropping_network(data)['pred']
-            out = torch.softmax(out, dim=1)
-            out = torch.argmax(out, dim=1)
+            if torch.count_nonzero(data) == 0:
+                softmaxed = torch.zeros_like(data_list[0])
+            else:
+                softmaxed = self.cropping_network(data)['pred']
+                softmaxed = torch.softmax(softmaxed, dim=1)
+            if self.get_softmax:
+                softmax_list.append(softmaxed)
+            out = torch.argmax(softmaxed, dim=1)
             out_list.append(out)
-        return torch.stack(out_list, dim=1)
+        out_list = torch.stack(out_list, dim=1) # B, T, H, W
+        if self.get_softmax:
+            softmax_list = torch.stack(softmax_list, dim=1) # B, T, C, H, W
+        return out_list, softmax_list
     
     def uncrop(self, output, padding_need, translation_dists):
         output_volume = torch.stack(output['labeled_data'], dim=1)
@@ -161,10 +175,20 @@ class Processor(object):
             out_list.append(video_list)
         out_volume = torch.stack(out_list, dim=0)
         return out_volume
+    
+    def uncrop_no_registration(self, output, padding_need):
+        output_volume = torch.stack(output['labeled_data'], dim=1)
+        assert len(output_volume) == len(padding_need)
+        out_list = []
+        for b in range(len(output_volume)):
+            padded = torch.nn.functional.pad(output_volume[b], pad=padding_need[b])
+            out_list.append(padded)
+        out_volume = torch.stack(out_list, dim=0)
+        return out_volume
 
     def preprocess(self, data_list, idx):
         #matplotlib.use('QtAgg')
-        temp_volume = self.discretize(data_list)
+        temp_volume, softmax_volume = self.discretize(data_list)
 
         #fig, ax = plt.subplots(1, 2)
         #print(data_dict['registered_idx'])
@@ -196,3 +220,51 @@ class Processor(object):
         assert cropped_volume.shape[-1] == self.crop_size, print(cropped_volume.shape[-1])
         network_input = {'labeled_data': [cropped_volume[:, i] for i in range(cropped_volume.shape[1])]}
         return network_input, padding_need, translation_dists
+
+    def preprocess_no_registration(self, data_list, video_padding):
+        network_input = {}
+        #matplotlib.use('QtAgg')
+        temp_volume, softmax_volume = self.discretize(data_list) # B, T, H, W,  B, T, C, H, W
+
+        mean_centroids = self.get_mean_centroid(temp_volume) # B, 2
+        data_volume = torch.stack(data_list, dim=1) # B, T, 1, H, W
+
+        cropped_volume, padding_need = self.crop_data(data_volume, mean_centroids) # B, T, 1, 128, 128
+        if self.get_softmax:
+            cropped_softmax, _ = self.crop_data(softmax_volume, mean_centroids) # B, T, C, 128, 128
+
+        video_padding = video_padding.permute(1, 0) # B, T
+        cropped_volume[video_padding] = torch.zeros(size=(cropped_volume.shape[-2], cropped_volume.shape[-1]), dtype=cropped_volume.dtype, device=cropped_volume.device)
+        assert torch.all(torch.isfinite(cropped_volume))
+        assert cropped_volume.shape[-1] == self.crop_size, print(cropped_volume.shape[-1])
+
+        if self.get_softmax:
+            cropped_softmax[video_padding] = torch.zeros(size=(cropped_softmax.shape[-2], cropped_softmax.shape[-1]), dtype=cropped_softmax.dtype, device=cropped_softmax.device)
+            assert torch.all(torch.isfinite(cropped_softmax))
+            assert cropped_softmax.shape[-1] == self.crop_size, print(cropped_softmax.shape[-1])
+
+            #temporal_mask_list = []
+            #for t in range(cropped_mask_list[0].shape[1]):
+            #    skip_mask_list = []
+            #    for j in range(self.nb_layers):
+            #        skip_mask_list.append(cropped_mask_list[j][t])
+            #    temporal_mask_list.append(skip_mask_list)
+
+            network_input['mask_data'] = cropped_softmax
+        else:
+            network_input['mask_data'] = None
+
+        #fig, ax = plt.subplots(1, 6)
+        #for i in range(1):
+        #    ax[0].imshow(data_volume[i, 0, 0].cpu(), cmap='gray')
+        #    ax[1].imshow(data_volume[i, 1, 0].cpu(), cmap='gray')
+        #    ax[2].imshow(temp_volume[i, 0].cpu(), cmap='gray')
+        #    ax[3].imshow(temp_volume[i, 1].cpu(), cmap='gray')
+        #    ax[4].imshow(cropped_volume[i, 0, 0].cpu(), cmap='gray')
+        #    ax[5].imshow(cropped_volume[i, 1, 0].cpu(), cmap='gray')
+        #ax[2].scatter(mean_centroids[0, 0].cpu(), mean_centroids[0, 1].cpu(), color="red") # plotting single point
+        #ax[3].scatter(mean_centroids[0, 0].cpu(), mean_centroids[0, 1].cpu(), color="red") # plotting single point
+        #plt.show()
+
+        network_input['labeled_data'] = [cropped_volume[:, i] for i in range(cropped_volume.shape[1])]
+        return network_input, padding_need, temp_volume

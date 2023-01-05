@@ -18,6 +18,7 @@ from collections import OrderedDict
 from multiprocessing import Pool
 from time import sleep
 from typing import Tuple, List
+import matplotlib.pyplot as plt
 
 import matplotlib
 import numpy as np
@@ -524,7 +525,7 @@ class nnUNetTrainer(NetworkTrainer):
         return ret
     
 
-    def predict_preprocessed_data_return_seg_and_softmax_video(self, data: np.ndarray, processor, do_mirroring: bool = True,
+    def predict_preprocessed_data_return_seg_and_softmax_video(self, data, idx, video_padding, processor, do_mirroring: bool = True,
                                                          mirror_axes: Tuple[int] = None,
                                                          use_sliding_window: bool = True, step_size: float = 0.5,
                                                          use_gaussian: bool = True, pad_border_mode: str = 'constant',
@@ -558,7 +559,7 @@ class nnUNetTrainer(NetworkTrainer):
 
         current_mode = self.network.training
         self.network.eval()
-        ret = self.network.predict_3D(data, processor=processor, do_mirroring=do_mirroring, mirror_axes=mirror_axes,
+        ret = self.network.predict_3D_video(data, idx=idx, video_padding=video_padding, processor=processor, do_mirroring=do_mirroring, mirror_axes=mirror_axes,
                                       use_sliding_window=use_sliding_window, step_size=step_size,
                                       patch_size=self.patch_size, regions_class_order=self.regions_class_order,
                                       use_gaussian=use_gaussian, pad_border_mode=pad_border_mode,
@@ -614,7 +615,7 @@ class nnUNetTrainer(NetworkTrainer):
 
     def validate_middle_unlabeled(self, log_function, do_mirroring: bool = True, use_sliding_window: bool = True, step_size: float = 0.5,
                  save_softmax: bool = True, use_gaussian: bool = True, overwrite: bool = True,
-                 validation_folder_name: str = 'validation_raw', debug: bool = False, all_in_gpu: bool = False,
+                 validation_folder_name: str = 'validation_raw', debug: bool = True, all_in_gpu: bool = False,
                  segmentation_export_kwargs: dict = None, run_postprocessing_on_folds: bool = True):
         """
         if debug=True then the temporary files generated for postprocessing determination will be kept
@@ -781,8 +782,8 @@ class nnUNetTrainer(NetworkTrainer):
 
     def validate(self, log_function, do_mirroring: bool = True, use_sliding_window: bool = True, step_size: float = 0.5,
                  save_softmax: bool = True, use_gaussian: bool = True, overwrite: bool = True,
-                 validation_folder_name: str = 'validation_raw', debug: bool = False, all_in_gpu: bool = False,
-                 segmentation_export_kwargs: dict = None, run_postprocessing_on_folds: bool = True):
+                 validation_folder_name: str = 'validation_raw', debug: bool = True, all_in_gpu: bool = False,
+                 segmentation_export_kwargs: dict = None, run_postprocessing_on_folds: bool = True, output_folder=None):
         """
         if debug=True then the temporary files generated for postprocessing determination will be kept
         """
@@ -810,6 +811,8 @@ class nnUNetTrainer(NetworkTrainer):
             interpolation_order_z = segmentation_export_kwargs['interpolation_order_z']
 
         # predictions as they come from the network go here
+        if output_folder is not None:
+            self.output_folder = output_folder
         output_folder = join(self.output_folder, validation_folder_name)
         maybe_mkdir_p(output_folder)
         # this is for debug purposes
@@ -941,8 +944,9 @@ class nnUNetTrainer(NetworkTrainer):
 
     def validate_video(self, processor, log_function, do_mirroring: bool = True, use_sliding_window: bool = True, step_size: float = 0.5,
                  save_softmax: bool = True, use_gaussian: bool = True, overwrite: bool = True,
-                 validation_folder_name: str = 'validation_raw', debug: bool = False, all_in_gpu: bool = False,
-                 segmentation_export_kwargs: dict = None, run_postprocessing_on_folds: bool = True):
+                 validation_folder_name: str = 'validation_raw', debug: bool = True, all_in_gpu: bool = False,
+                 segmentation_export_kwargs: dict = None, run_postprocessing_on_folds: bool = True, output_folder=None):
+
         """
         if debug=True then the temporary files generated for postprocessing determination will be kept
         """
@@ -970,6 +974,8 @@ class nnUNetTrainer(NetworkTrainer):
             interpolation_order_z = segmentation_export_kwargs['interpolation_order_z']
 
         # predictions as they come from the network go here
+        if output_folder is not None:
+            self.output_folder = output_folder
         output_folder = join(self.output_folder, validation_folder_name)
         maybe_mkdir_p(output_folder)
         # this is for debug purposes
@@ -998,18 +1004,60 @@ class nnUNetTrainer(NetworkTrainer):
         export_pool = Pool(default_num_threads)
         results = []
 
-        for k in self.dataset_val.keys():
+        list_of_keys = list(self.dataset_val.keys())
+        un_list_of_keys = list(self.dataset_un_val.keys())
+        for k in list_of_keys:
             properties = load_pickle(self.dataset[k]['properties_file'])
             fname = properties['list_of_data_files'][0].split(os.sep)[-1][:-12]
-            if overwrite or (not isfile(join(output_folder, fname + ".nii.gz"))) or \
-                    (save_softmax and not isfile(join(output_folder, fname + ".npz"))):
-                data = np.load(self.dataset[k]['data_file'])['data']
 
-                #print(k, data.shape)
-                self.print_to_log_file(k, data.shape)
-                data[-1][data[-1] == -1] = 0
+            patient_id = k[:10]
+            l_filtered = [x for x in list_of_keys if x[:10] in patient_id]
+            un_filtered = [x for x in un_list_of_keys if x[:10] in patient_id]
+            filtered = l_filtered + un_filtered
+            filtered = sorted(filtered, key=lambda x: int(x[16:18]))
+            filtered = np.array(filtered)
+            
+            if self.video_length > len(filtered):
+                padding_length = self.video_length - len(filtered)
+                video = filtered
+            else:
+                padding_length = 0
+                labeled_idx = np.where(filtered == k)[0][0]
+                values = np.arange(len(filtered))
+                step = self.video_length // 2
+                start = min(max(labeled_idx - step, 0), len(filtered) - self.video_length)
+                frame_indices = values[start:start + self.video_length]
+                assert len(frame_indices) == self.video_length
+                video = filtered[frame_indices]
 
-                softmax_pred = self.predict_preprocessed_data_return_seg_and_softmax_video(data[:-1],
+            video_padding = np.ones(shape=(self.video_length, 1), dtype=bool)
+            data = np.zeros(shape=(self.video_length, 1) + properties['size_after_resampling'])
+
+            if overwrite or (not isfile(join(output_folder, fname + ".nii.gz"))) or (save_softmax and not isfile(join(output_folder, fname + ".npz"))):
+                for idx, frame in enumerate(video):
+                    video_idx = idx + (padding_length // 2)
+                    if frame == k:
+                        labeled_idx = video_idx
+                    if '_u' in frame:
+                        data[video_idx] = np.load(self.dataset_un_val[frame]['data_file'])['data']
+                    else:
+                        current_data = np.load(self.dataset_val[frame]['data_file'])['data']
+                        current_data[-1][current_data[-1] == -1] = 0
+                        data[video_idx] = current_data[:-1]
+                    video_padding[video_idx] = False
+                    #self.print_to_log_file(k, data.shape)
+
+                #matplotlib.use('QtAgg')
+                #print(labeled_idx)
+                #print(video_padding)
+                #fig, ax = plt.subplots(1, self.video_length)
+                #for i in range(self.video_length):
+                #    ax[i].imshow(data[i, 0, 5], cmap='gray')
+                #plt.show()
+
+                softmax_pred = self.predict_preprocessed_data_return_seg_and_softmax_video(data=data,
+                                                                                     idx=labeled_idx,
+                                                                                     video_padding=video_padding,
                                                                                      processor=processor,
                                                                                      do_mirroring=do_mirroring,
                                                                                      mirror_axes=mirror_axes,
