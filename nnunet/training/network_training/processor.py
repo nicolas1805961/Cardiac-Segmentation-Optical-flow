@@ -177,13 +177,13 @@ class Processor(object):
         return out_volume
     
     def uncrop_no_registration(self, output, padding_need):
-        output_volume = torch.stack(output['labeled_data'], dim=1)
+        output_volume = output['predictions'].transpose(0, 1)
         assert len(output_volume) == len(padding_need)
         out_list = []
         for b in range(len(output_volume)):
             padded = torch.nn.functional.pad(output_volume[b], pad=padding_need[b])
             out_list.append(padded)
-        out_volume = torch.stack(out_list, dim=0)
+        out_volume = torch.stack(out_list, dim=1)
         return out_volume
 
     def preprocess(self, data_list, idx):
@@ -220,15 +220,9 @@ class Processor(object):
         assert cropped_volume.shape[-1] == self.crop_size, print(cropped_volume.shape[-1])
         network_input = {'labeled_data': [cropped_volume[:, i] for i in range(cropped_volume.shape[1])]}
         return network_input, padding_need, translation_dists
-
-    def preprocess_no_registration(self, data_list, video_padding):
+    
+    def crop_and_pad(self, data_volume, mean_centroids, video_padding, softmax_volume=None):
         network_input = {}
-        #matplotlib.use('QtAgg')
-        temp_volume, softmax_volume = self.discretize(data_list) # B, T, H, W,  B, T, C, H, W
-
-        mean_centroids = self.get_mean_centroid(temp_volume) # B, 2
-        data_volume = torch.stack(data_list, dim=1) # B, T, 1, H, W
-
         cropped_volume, padding_need = self.crop_data(data_volume, mean_centroids) # B, T, 1, 128, 128
         if self.get_softmax:
             cropped_softmax, _ = self.crop_data(softmax_volume, mean_centroids) # B, T, C, 128, 128
@@ -243,28 +237,19 @@ class Processor(object):
             assert torch.all(torch.isfinite(cropped_softmax))
             assert cropped_softmax.shape[-1] == self.crop_size, print(cropped_softmax.shape[-1])
 
-            #temporal_mask_list = []
-            #for t in range(cropped_mask_list[0].shape[1]):
-            #    skip_mask_list = []
-            #    for j in range(self.nb_layers):
-            #        skip_mask_list.append(cropped_mask_list[j][t])
-            #    temporal_mask_list.append(skip_mask_list)
-
             network_input['mask_data'] = cropped_softmax
         else:
             network_input['mask_data'] = None
 
-        #fig, ax = plt.subplots(1, 6)
-        #for i in range(1):
-        #    ax[0].imshow(data_volume[i, 0, 0].cpu(), cmap='gray')
-        #    ax[1].imshow(data_volume[i, 1, 0].cpu(), cmap='gray')
-        #    ax[2].imshow(temp_volume[i, 0].cpu(), cmap='gray')
-        #    ax[3].imshow(temp_volume[i, 1].cpu(), cmap='gray')
-        #    ax[4].imshow(cropped_volume[i, 0, 0].cpu(), cmap='gray')
-        #    ax[5].imshow(cropped_volume[i, 1, 0].cpu(), cmap='gray')
-        #ax[2].scatter(mean_centroids[0, 0].cpu(), mean_centroids[0, 1].cpu(), color="red") # plotting single point
-        #ax[3].scatter(mean_centroids[0, 0].cpu(), mean_centroids[0, 1].cpu(), color="red") # plotting single point
-        #plt.show()
+        cropped_volume = cropped_volume.transpose(0, 1)
+        return cropped_volume, padding_need
 
-        network_input['labeled_data'] = [cropped_volume[:, i] for i in range(cropped_volume.shape[1])]
-        return network_input, padding_need, temp_volume
+    def preprocess_no_registration(self, data_list, video_padding):
+        temp_volume, softmax_volume = self.discretize(data_list) # B, T, H, W,  B, T, C, H, W
+
+        mean_centroids = self.get_mean_centroid(temp_volume) # B, 2
+        data_volume = torch.stack(data_list, dim=1) # B, T, 1, H, W
+
+        cropped_volume, padding_need = self.crop_and_pad(data_volume, mean_centroids, video_padding, softmax_volume)
+
+        return cropped_volume, padding_need, temp_volume, mean_centroids

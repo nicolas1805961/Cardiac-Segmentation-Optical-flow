@@ -29,7 +29,7 @@ class CustomExperimentPlanner(ExperimentPlanner2D):
         self.unet_base_num_features = 32
         #self.preprocessor_name = "CustomPreprocessorFor2D"
         self.config = read_config(os.path.join(Path.cwd(), 'adversarial_acdc.yaml'))
-        self.patch_size = 320 if '026' in self.preprocessed_output_folder else 224
+        self.patch_size = 224 if '027' in self.preprocessed_output_folder else 288
 
     def get_properties_for_stage(self, current_spacing, original_spacing, original_shape, num_cases,
                                  num_modalities, num_classes):

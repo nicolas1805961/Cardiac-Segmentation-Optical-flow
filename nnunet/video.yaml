@@ -19,6 +19,7 @@ area_size: [16, 16, 16]
 nb_zones: [2, 4, 8]
 use_patches: True
 deformable_points: 4
+merge_temporal_tokens: True
 
 middle_loss_weight: 1.0
 seg_motion_estimation_loss_weight: 0.1
@@ -74,7 +75,7 @@ dropout: 0
 conv_depth: [2, 2, 2]
 transformer_depth: [] #[2, 2, 2], [2]
 num_heads: [] #[3, 6, 12], [8] [12]
-spatial_cross_attention_num_heads: [2, 4, 8] #[2, 4, 6, 8, 12] [12, 8, 6, 4, 2] [bottom, ..., top] [3, 6, 12] [4, 4, 8, 8, 16]
+spatial_cross_attention_num_heads: [8, 8, 8] #[2, 4, 6, 8, 12] [12, 8, 6, 4, 2] [bottom, ..., top] [3, 6, 12] [4, 4, 8, 8, 16]
 method: 'equal'
 batch_size: 2 #36
 bottleneck: 'swin' # ['vit', 'swin', 'factorized', 'vit_3d', 'swin_3d']

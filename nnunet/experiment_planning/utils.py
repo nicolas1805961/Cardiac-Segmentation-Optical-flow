@@ -87,7 +87,7 @@ def get_additional_info(base_folder_splitted, path_list):
     out = []
     for tr, path in zip(training_files, path_list):
         assert path.split(os.sep)[-1][:13] == tr['image'].split('/')[-1][:13], print(path.split(os.sep)[-1][:13], tr['image'].split('/')[-1][:13])
-        dict_you_want = {your_key: tr[your_key] for your_key in ['center', 'manufacturer', 'phase', 'strength']}
+        dict_you_want = {your_key: tr[your_key] for your_key in ['center', 'manufacturer', 'phase', 'strength', 'slice thickness', 'spacing between slices']}
         out.append(dict_you_want)
     return out
 

@@ -75,7 +75,6 @@ class MTLmodel(SegmentationNetwork):
                 window_size,
                 swin_abs_pos,
                 deep_supervision,
-                channel_attention,
                 proj,
                 num_classes,
                 out_encoder_dims,
@@ -155,7 +154,6 @@ class MTLmodel(SegmentationNetwork):
         self.mix_residual = mix_residual
         self.separability = separability
         self.add_extra_bottleneck_blocks = add_extra_bottleneck_blocks
-        self.channel_attention = channel_attention
         if uncertainty_weighting:
             self.logsigma = nn.Parameter(torch.FloatTensor([1.61, -0.7, -0.7]))
         else:
@@ -197,13 +195,8 @@ class MTLmodel(SegmentationNetwork):
             
             self.extra_bottleneck_block_1 = conv_layer(in_dim=self.d_model, out_dim=self.d_model, nb_blocks=1, dpr=dpr_bottleneck, norm=norm, kernel_size=3)
             if transformer_bottleneck:
-                if self.channel_attention:
-                    channel_attention_layer = ChannelAttention(dim=int(self.d_model), num_heads=bottleneck_heads, use_conv_mlp=False, input_resolution=self.bottleneck_size)
-                    encoder_layer = SpatialTransformerLayer(dim=int(self.d_model), num_heads=bottleneck_heads, use_conv_mlp=use_conv_mlp, input_resolution=self.bottleneck_size)
-                else:
-                    channel_attention_layer = None
-                    encoder_layer = TransformerEncoderLayer(d_model=int(self.d_model), nhead=bottleneck_heads, dim_feedforward=4 * int(self.d_model))
-                self.bottleneck = TransformerEncoder(encoder_layer=encoder_layer, num_layers=self.num_bottleneck_layers, channel_layer=channel_attention_layer)
+                encoder_layer = TransformerEncoderLayer(d_model=int(self.d_model), nhead=bottleneck_heads, dim_feedforward=4 * int(self.d_model))
+                self.bottleneck = TransformerEncoder(encoder_layer=encoder_layer, num_layers=self.num_bottleneck_layers)
             else:
                 self.bottleneck = conv_layer(in_dim=self.d_model, out_dim=self.d_model, nb_blocks=1, dpr=dpr_bottleneck, norm=norm, kernel_size=3)
             self.extra_bottleneck_block_2 = conv_layer(in_dim=self.d_model, out_dim=self.d_model, nb_blocks=1, dpr=dpr_bottleneck, norm=norm, kernel_size=3)

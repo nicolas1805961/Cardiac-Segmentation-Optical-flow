@@ -581,7 +581,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
         """
         models = {}
 
-        num_classes = 3 if '029' in self.dataset_directory else 4
+        num_classes = 4
 
         wanted_norm = self.config['norm']
         if wanted_norm == 'batchnorm':

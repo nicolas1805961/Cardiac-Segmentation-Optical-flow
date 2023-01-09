@@ -82,6 +82,7 @@ class VideoModel(SegmentationNetwork):
                 log_function,
                 in_dims,
                 conv_layer_1d,
+                merge_temporal_tokens,
                 use_patches,
                 nb_layers,
                 video_length,
@@ -118,8 +119,9 @@ class VideoModel(SegmentationNetwork):
         self.nb_layers = nb_layers
         self.learn_indices = learn_indices
         self.softmax_indices = softmax_indices
+        self.merge_temporal_tokens = merge_temporal_tokens
         
-        self.num_classes = 4
+        self.num_classes = out_encoder_dims[0]
 
         # stochastic depth
         num_blocks = conv_depth + [num_bottleneck_layers]
@@ -146,6 +148,13 @@ class VideoModel(SegmentationNetwork):
         slot_layer = SlotAttention(dim=self.d_model, iters=4, hidden_dim=self.d_model)
         self.spatio_temporal_encoder = SpatioTemporalTransformer(conv_layer=None, dim=self.d_model, slot_layer=slot_layer, temporal_layer=temporal_transformer_layer, spatial_layer=spatial_transformer_layer, num_layers=self.nb_layers, nb_memory_bus=self.nb_memory_bus, norm_1d=norm_1d, video_length=self.video_length, conv_layer_1d=conv_layer_1d, area_size=area_size, use_patches=False)
         #self.query_embed = nn.Embedding(4, self.d_model)
+
+        ffn_layers = []
+        for i in range(self.num_stages):
+            ffn_layers.append(nn.Linear(self.d_model // 2**i, self.d_model // 2**(i+1)))
+            if i < self.num_stages - 1:
+                ffn_layers.append(nn.GELU())
+        self.ffn = nn.Sequential(*ffn_layers)
     
     def get_mask(self, softmax_volume):
         "softmax_volume: B, T, C, H, W"
@@ -181,32 +190,33 @@ class VideoModel(SegmentationNetwork):
 
         return scale_list
 
-    def forward(self, data_dict):
+    def dot(self, memory_bus, output_feature_map):
+        T, B, C, H, W = output_feature_map.shape
+        output_feature_map = output_feature_map.view(T, B, C, H * W).view(T * B, C, H * W)
+        if self.merge_temporal_tokens:
+            memory_bus = torch.mean(memory_bus.view(T, B, self.nb_memory_bus, self.d_model), dim=0, keepdim=True)
+            memory_bus = memory_bus.repeat(T, 1, 1, 1).view(T * B, self.nb_memory_bus, self.d_model)
+        memory_bus = self.ffn(memory_bus)
+        output_feature_map = memory_bus @ output_feature_map
+        output_feature_map = output_feature_map.view(T, B, self.nb_memory_bus, H * W).view(T, B, self.nb_memory_bus, H, W)
+        return output_feature_map
+
+    def forward(self, x):
         theta = None
         out = {}
         encoded_list = []
         skip_co_list = []
         out_list = []
-        for x in data_dict['labeled_data']:
-            encoded, skip_connections = self.encoder(x)
-
-            if not torch.all(torch.isfinite(encoded)):
-                for name, param in self.encoder.named_parameters():
-                    if not torch.all(torch.isfinite(param)):
-                        print(name)
-                matplotlib.use('QtAgg')
-                fig, ax = plt.subplots(1, len(x))
-                for u in range(len(x)):
-                    ax[u].imshow(x[u, 0].cpu(), cmap='gray')
-                plt.show()
+        for i in range(len(x)):
+            encoded, skip_connections = self.encoder(x[i])
+            assert torch.all(torch.isfinite(encoded))
 
             encoded = self.extra_bottleneck_block_1(encoded)
             encoded_list.append(encoded)
             skip_co_list.append(skip_connections)
         
         spatial_tokens = torch.stack(encoded_list, dim=0)
-        T, B, C, H, W = spatial_tokens.shape
-        spatial_tokens = self.spatio_temporal_encoder(spatial_tokens)
+        spatial_tokens, memory_bus = self.spatio_temporal_encoder(spatial_tokens) # memory_bus = T*B, M, C 
 
         if self.softmax_indices or self.learn_indices:
             stage_list = []
@@ -216,22 +226,34 @@ class VideoModel(SegmentationNetwork):
                 stage_list.append(video_volume)
             skip_co_list = stage_list
 
-        for i in range(len(spatial_tokens)):
+        sampling_point_list = []
+        attention_weight_list = []
+        for i in range(self.video_length):
             decoded = self.extra_bottleneck_block_2(spatial_tokens[i])
             if self.softmax_indices:
                 seg, _ = self.decoder(decoded, skip_co_list, softmax_volume=data_dict['mask_data'], frame_index=i)
             elif self.learn_indices:
-                seg = self.decoder(decoded, skip_co_list)
+                seg, sampling_points, attention_weights = self.decoder(decoded, skip_co_list, frame_index=i)
                 #seg, theta = self.decoder(decoded, skip_co_list, frame_index=i)
             else:
                 seg = self.decoder(decoded, skip_co_list[i])
             if not self.do_ds:
                 seg = seg[0]
             out_list.append(seg)
+            sampling_point_list.append(sampling_points)
+            attention_weight_list.append(attention_weights)
         
         #seg = torch.stack(out_list, dim=0)
+
+        attention_weights = torch.stack(attention_weight_list, dim=0)
+        sampling_points = torch.stack(sampling_point_list, dim=0)
+        output_feature_map = torch.stack(out_list, dim=0)
+
+        output_feature_map = self.dot(memory_bus, output_feature_map)
             
-        out['labeled_data'] = out_list
+        out['attention_weights'] = attention_weights
+        out['sampling_points'] = sampling_points
+        out['predictions'] = output_feature_map
         #out['theta'] = theta
             
         return out
@@ -512,11 +534,10 @@ class VideoModel(SegmentationNetwork):
             if m == 0:
                 labeled_data = [video[i] for i in range(len(video))]
                 with torch.no_grad():
-                    network_input, padding_need, _ = processor.preprocess_no_registration(data_list=labeled_data, video_padding=video_padding)
+                    network_input, padding_need, _, _ = processor.preprocess_no_registration(data_list=labeled_data, video_padding=video_padding)
                 output = self(network_input)
                 output = processor.uncrop_no_registration(output, padding_need)
-                output = {'labeled_data': [output[:, i] for i in range(output.shape[1])]}
-                pred = self.inference_apply_nonlin(output['labeled_data'][idx])
+                pred = self.inference_apply_nonlin(output['predictions'][idx])
                 result_torch += 1 / num_results * pred
 
             if m == 1 and (1 in mirror_axes):
@@ -524,11 +545,10 @@ class VideoModel(SegmentationNetwork):
                 for t in range(len(video)):
                     labeled_data.append(torch.flip(video[t], (3, )))
                 with torch.no_grad():
-                    network_input, padding_need, _ = processor.preprocess_no_registration(data_list=labeled_data, video_padding=video_padding)
+                    network_input, padding_need, _, _ = processor.preprocess_no_registration(data_list=labeled_data, video_padding=video_padding)
                 output = self(network_input)
                 output = processor.uncrop_no_registration(output, padding_need)
-                output = {'labeled_data': [output[:, i] for i in range(output.shape[1])]}
-                pred = self.inference_apply_nonlin(output['labeled_data'][idx])
+                pred = self.inference_apply_nonlin(output['predictions'][idx])
                 result_torch += 1 / num_results * torch.flip(pred, (3, ))
 
             if m == 2 and (0 in mirror_axes):
@@ -536,11 +556,10 @@ class VideoModel(SegmentationNetwork):
                 for t in range(len(video)):
                     labeled_data.append(torch.flip(video[t], (2, )))
                 with torch.no_grad():
-                    network_input, padding_need, _ = processor.preprocess_no_registration(data_list=labeled_data, video_padding=video_padding)
+                    network_input, padding_need, _, _ = processor.preprocess_no_registration(data_list=labeled_data, video_padding=video_padding)
                 output = self(network_input)
                 output = processor.uncrop_no_registration(output, padding_need)
-                output = {'labeled_data': [output[:, i] for i in range(output.shape[1])]}
-                pred = self.inference_apply_nonlin(output['labeled_data'][idx])
+                pred = self.inference_apply_nonlin(output['predictions'][idx])
                 result_torch += 1 / num_results * torch.flip(pred, (2, ))
 
             if m == 3 and (0 in mirror_axes) and (1 in mirror_axes):
@@ -548,11 +567,10 @@ class VideoModel(SegmentationNetwork):
                 for t in range(len(video)):
                     labeled_data.append(torch.flip(video[t], (3, 2)))
                 with torch.no_grad():
-                    network_input, padding_need, _ = processor.preprocess_no_registration(data_list=labeled_data, video_padding=video_padding)
+                    network_input, padding_need, _, _ = processor.preprocess_no_registration(data_list=labeled_data, video_padding=video_padding)
                 output = self(network_input)
                 output = processor.uncrop_no_registration(output, padding_need)
-                output = {'labeled_data': [output[:, i] for i in range(output.shape[1])]}
-                pred = self.inference_apply_nonlin(output['labeled_data'][idx])
+                pred = self.inference_apply_nonlin(output['predictions'][idx])
                 result_torch += 1 / num_results * torch.flip(pred, (3, 2))
 
         if mult is not None:
