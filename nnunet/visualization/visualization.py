@@ -515,7 +515,7 @@ class Visualizer(object):
                 center = tuple(current_locations[c].tolist())
                 color = np.array(list(colormap(norm(current_weights[c]))[:-1])) * 255
                 color = tuple(color.tolist())
-                frame = cv.circle(frame, center=center, radius=3, color=color, thickness=-1, lineType=cv.LINE_AA)
+                frame = cv.circle(frame, center=center, radius=2, color=color, thickness=-1, lineType=cv.LINE_AA)
             if i == t:
                 frame = cv.line(frame, (x - 2, y - 2), (x + 2, y + 2), color=(0, 255, 0), thickness=1, lineType=cv.LINE_AA) # R, G, B
                 frame = cv.line(frame, (x - 2, y + 2), (x + 2, y - 2), color=(0, 255, 0), thickness=1, lineType=cv.LINE_AA)

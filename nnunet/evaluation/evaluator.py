@@ -304,7 +304,7 @@ class NiftiEvaluator(Evaluator):
 
 
 def run_evaluation(args):
-    test, ref, evaluator, metric_kwargs = args
+    test, ref, evaluator, metric_kwargs, metadata = args
     # evaluate
     evaluator.set_test(test)
     evaluator.set_reference(ref)
@@ -315,6 +315,7 @@ def run_evaluation(args):
         current_scores["test"] = test
     if type(ref) == str:
         current_scores["reference"] = ref
+    current_scores.update(metadata)
     return current_scores
 
 
@@ -328,6 +329,7 @@ def aggregate_scores(test_ref_pairs,
                      json_author="Fabian",
                      json_task="",
                      num_threads=2,
+                     metadata_list=None,
                      **metric_kwargs):
     """
     test = predicted image
@@ -357,7 +359,7 @@ def aggregate_scores(test_ref_pairs,
     test = [i[0] for i in test_ref_pairs]
     ref = [i[1] for i in test_ref_pairs]
     p = Pool(num_threads)
-    all_res = p.map(run_evaluation, zip(test, ref, [evaluator]*len(ref), [metric_kwargs]*len(ref)))
+    all_res = p.map(run_evaluation, zip(test, ref, [evaluator]*len(ref), [metric_kwargs]*len(ref), metadata_list))
     p.close()
     p.join()
 
@@ -366,7 +368,9 @@ def aggregate_scores(test_ref_pairs,
 
         # append score list for mean
         for label, score_dict in all_res[i].items():
-            if label in ("test", "reference"):
+            ignore_list = list(metadata_list[i].keys()) + ["test", "reference"]
+            #if label in ("test", "reference"):
+            if label in ignore_list:
                 continue
             if label not in all_scores["mean"]:
                 all_scores["mean"][label] = OrderedDict()

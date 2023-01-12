@@ -528,16 +528,13 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
         else:
             indices = torch.nonzero(cropped_target > 0)
             high = max(0, indices.shape[0] - 1)
-            t = random.randint(0, high)
-            b = random.randint(0, high)
-            c = random.randint(0, high)
-            y = random.randint(0, high)
-            x = random.randint(0, high)
-            t = indices[t, 0].item()
-            b = indices[b, 1].item()
-            c = indices[c, 2].item()
-            y = indices[y, 3].item()
-            x = indices[x, 4].item()
+            idx = random.randint(0, high)
+            indices = indices[idx]
+            t = indices[0].item()
+            b = indices[1].item()
+            c = indices[2].item()
+            y = indices[3].item()
+            x = indices[4].item()
         return (t, b, c, y, x)
 
     

@@ -779,6 +779,11 @@ class nnUNetTrainer(NetworkTrainer):
                     raise e
 
         self.network.train(current_mode)
+    
+    def create_metadata_dict(self, properties):
+        key_list = ['center', 'manufacturer', 'phase', 'strength', 'slice thickness', 'spacing between slices']
+        out = {key: properties[key] for key in key_list if key in properties}
+        return out
 
     def validate(self, log_function, do_mirroring: bool = True, use_sliding_window: bool = True, step_size: float = 0.5,
                  save_softmax: bool = True, use_gaussian: bool = True, overwrite: bool = True,
@@ -841,8 +846,10 @@ class nnUNetTrainer(NetworkTrainer):
         export_pool = Pool(default_num_threads)
         results = []
 
+        metadata_list = []
         for k in self.dataset_val.keys():
             properties = load_pickle(self.dataset[k]['properties_file'])
+            metadata_list.append(self.create_metadata_dict(properties))
             fname = properties['list_of_data_files'][0].split(os.sep)[-1][:-12]
             if overwrite or (not isfile(join(output_folder, fname + ".nii.gz"))) or \
                     (save_softmax and not isfile(join(output_folder, fname + ".npz"))):
@@ -904,7 +911,8 @@ class nnUNetTrainer(NetworkTrainer):
                              json_name=job_name + " val tiled %s" % (str(use_sliding_window)),
                              json_author="Fabian",
                              json_task=task, num_threads=default_num_threads,
-                             advanced=True)
+                             advanced=True,
+                             metadata_list=metadata_list)
 
         if run_postprocessing_on_folds:
             # in the old nnunet we would stop here. Now we add a postprocessing. This postprocessing can remove everything
@@ -913,7 +921,8 @@ class nnUNetTrainer(NetworkTrainer):
             # have this applied during inference as well
             self.print_to_log_file("determining postprocessing")
             determine_postprocessing(self.output_folder, self.gt_niftis_folder, validation_folder_name,
-                                     final_subf_name=validation_folder_name + "_postprocessed", debug=debug, log_function=log_function)
+                                     final_subf_name=validation_folder_name + "_postprocessed", debug=debug, log_function=log_function,
+                                     metadata_list=metadata_list)
             # after this the final predictions for the vlaidation set can be found in validation_folder_name_base + "_postprocessed"
             # They are always in that folder, even if no postprocessing as applied!
 
