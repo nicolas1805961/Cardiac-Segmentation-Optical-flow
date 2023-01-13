@@ -31,6 +31,8 @@ def main():
     parser.add_argument('-o', "--output_folder", required=True, help="folder for saving predictions")
     parser.add_argument('-t', '--task_name', help='task name or task ID, required.',
                         default=default_plans_identifier, required=True)
+    parser.add_argument('-w', '--weight_folder', help='folder where to find the model\'s weights',
+                        default=None, required=True)
 
     parser.add_argument('-tr', '--trainer_class_name',
                         help='Name of the nnUNetTrainer used for 2D U-Net, full resolution 3D U-Net and low resolution '
@@ -123,6 +125,7 @@ def main():
                              'that this is not recommended (mixed precision is ~2x faster!)')
 
     args = parser.parse_args()
+    model_folder = args.weight_folder
     input_folder = args.input_folder
     output_folder = args.output_folder
     part_id = args.part_id
@@ -146,9 +149,9 @@ def main():
 
     task_name = args.task_name
 
-    if not task_name.startswith("Task"):
-        task_id = int(task_name)
-        task_name = convert_id_to_task_name(task_id)
+    #if not task_name.startswith("Task"):
+    #    task_id = int(task_name)
+    #    task_name = convert_id_to_task_name(task_id)
 
     assert model in ["2d", "3d_lowres", "3d_fullres", "3d_cascade_fullres"], "-m must be 2d, 3d_lowres, 3d_fullres or " \
                                                                              "3d_cascade_fullres"
@@ -209,8 +212,9 @@ def main():
     else:
         trainer = trainer_class_name
 
-    model_folder_name = join(network_training_output_dir, model, task_name, trainer + "__" +
-                              args.plans_identifier)
+    model_folder_name = model_folder
+    #model_folder_name = join(network_training_output_dir, model, task_name, trainer + "__" +
+    #                          args.plans_identifier)
     print("using model stored in ", model_folder_name)
     assert isdir(model_folder_name), "model output folder not found. Expected: %s" % model_folder_name
 

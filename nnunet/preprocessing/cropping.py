@@ -74,7 +74,8 @@ def load_case_from_list_of_files(data_files, seg_file=None, info_dict=None):
     properties["itk_spacing"] = data_itk[0].GetSpacing()
     properties["itk_direction"] = data_itk[0].GetDirection()
 
-    properties.update(info_dict)
+    if info_dict is not None:
+        properties.update(info_dict)
 
     data_npy = np.vstack([sitk.GetArrayFromImage(d)[None] for d in data_itk])
     if seg_file is not None:
