@@ -5,6 +5,7 @@
 # Written by Ze Liu
 # --------------------------------------------------------
 
+from nnunet.analysis import flop_count_operators
 import matplotlib
 from copy import copy
 from math import ceil
@@ -551,7 +552,7 @@ class MTLmodel(SegmentationNetwork):
                    step_size: float = 0.5, patch_size: Tuple[int, ...] = None, regions_class_order: Tuple[int, ...] = None,
                    use_gaussian: bool = False, pad_border_mode: str = "constant",
                    pad_kwargs: dict = None, all_in_gpu: bool = False,
-                   verbose: bool = True, mixed_precision: bool = True) -> Tuple[np.ndarray, np.ndarray]:
+                   verbose: bool = True, mixed_precision: bool = True, get_flops=False) -> Tuple[np.ndarray, np.ndarray]:
         """
         Use this function to predict a 3D image. It does not matter whether the network is a 2D or 3D U-Net, it will
         detect that automatically and run the appropriate code.
@@ -636,7 +637,7 @@ class MTLmodel(SegmentationNetwork):
                         else:
                             res = self._internal_predict_3D_2Dconv_tiled(x, patch_size, do_mirroring, mirror_axes, step_size,
                                                                         regions_class_order, use_gaussian, pad_border_mode,
-                                                                        pad_kwargs, all_in_gpu, False)
+                                                                        pad_kwargs, all_in_gpu, False, get_flops=get_flops)
                     else:
                         res = self._internal_predict_3D_2Dconv(x, patch_size, do_mirroring, mirror_axes, regions_class_order,
                                                                pad_border_mode, pad_kwargs, all_in_gpu, False)
@@ -804,8 +805,9 @@ class MTLmodel(SegmentationNetwork):
     
 
     def _internal_maybe_mirror_and_pred_2D(self, x: Union[np.ndarray, torch.tensor], mirror_axes: tuple,
+                                            get_time_stats,
                                            do_mirroring: bool = True,
-                                           mult: np.ndarray or torch.tensor = None) -> torch.tensor:
+                                           mult: np.ndarray or torch.tensor = None):
         # if cuda available:
         #   everything in here takes place on the GPU. If x and mult are not yet on GPU this will be taken care of here
         #   we now return a cuda tensor! Not numpy array!
@@ -831,6 +833,20 @@ class MTLmodel(SegmentationNetwork):
             mirror_idx = 1
             num_results = 1
 
+        if get_time_stats:
+            out_flop = flop_count_operators(self, x)
+
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            _ = self(x)
+            end.record()
+            torch.cuda.synchronize()
+            inference_time = start.elapsed_time(end)
+        else:
+            out_flop = inference_time = None
+
+
         for m in range(mirror_idx):
             if m == 0:
                 pred = self.inference_apply_nonlin(self(x)['pred'])
@@ -851,7 +867,7 @@ class MTLmodel(SegmentationNetwork):
         if mult is not None:
             result_torch[:, :] *= mult
 
-        return result_torch
+        return result_torch, out_flop, inference_time
 
     def _internal_predict_3D_2Dconv_tiled_middle(self, x: np.ndarray, patch_size: Tuple[int, int], do_mirroring: bool,
                                                 mirror_axes: tuple = (0, 1), step_size: float = 0.5,

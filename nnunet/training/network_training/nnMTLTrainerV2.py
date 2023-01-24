@@ -12,7 +12,8 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
-
+from nnunet.analysis import flop_count_operators
+from tqdm import tqdm
 from collections import OrderedDict
 from multiprocessing import Pool
 from nnunet.configuration import default_num_threads
@@ -973,6 +974,33 @@ class nnMTLTrainerV2(nnUNetTrainer):
                                                     pseudo_label=pseudo_label,
                                                     cross_sim=cross_sim,
                                                     middle_pred=middle_pred)
+    
+    def get_throughput(self, optimal_batch_size, output_folder):
+        self.network.do_ds = False
+        model = self.network
+        device = model.get_device()
+
+        with torch.no_grad():
+            dummy_input = torch.randn(1, 1,224,224, dtype=torch.float).to(device)
+            out_flop = flop_count_operators(model, dummy_input) 
+            dummy_input = torch.randn(optimal_batch_size, 1,224,224, dtype=torch.float).to(device)
+            repetitions=100
+            total_time = 0
+            for rep in tqdm(range(repetitions)):
+                starter = torch.cuda.Event(enable_timing=True)
+                ender = torch.cuda.Event(enable_timing=True)
+                starter.record()
+                _ = model(dummy_input)
+                ender.record()
+                torch.cuda.synchronize()
+                curr_time = starter.elapsed_time(ender)/1000
+                total_time += curr_time
+        Throughput =   (repetitions*optimal_batch_size)/total_time
+        gflops = 0
+        for flop_key in out_flop.keys():
+            gflops += out_flop[flop_key]
+        with open(join(output_folder, "computational_time"), 'w') as fd:
+            fd.writelines([f'Gflops: {gflops}', '\n', f'FPS: {Throughput}'])
 
     def validate(self, do_mirroring: bool = True, use_sliding_window: bool = True,
                  step_size: float = 0.5, save_softmax: bool = True, use_gaussian: bool = True, overwrite: bool = True,
@@ -1006,7 +1034,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
                                                          use_sliding_window: bool = True, step_size: float = 0.5,
                                                          use_gaussian: bool = True, pad_border_mode: str = 'constant',
                                                          pad_kwargs: dict = None, all_in_gpu: bool = False,
-                                                         verbose: bool = True, mixed_precision=True) -> Tuple[np.ndarray, np.ndarray]:
+                                                         verbose: bool = True, mixed_precision=True, get_flops=False) -> Tuple[np.ndarray, np.ndarray]:
         """
         We need to wrap this because we need to enforce self.network.do_ds = False for prediction
         """
@@ -1020,7 +1048,8 @@ class nnMTLTrainerV2(nnUNetTrainer):
                                                                        pad_border_mode=pad_border_mode,
                                                                        pad_kwargs=pad_kwargs, all_in_gpu=all_in_gpu,
                                                                        verbose=verbose,
-                                                                       mixed_precision=mixed_precision)
+                                                                       mixed_precision=mixed_precision,
+                                                                       get_flops=get_flops)
         self.network.do_ds = ds
         return ret
 

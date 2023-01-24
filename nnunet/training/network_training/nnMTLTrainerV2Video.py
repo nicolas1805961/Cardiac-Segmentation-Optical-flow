@@ -133,7 +133,9 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
                                     middle=False,
                                     registered_seg=False,
                                     learn_indices=self.learn_indices,
-                                    writer=self.writer)
+                                    writer=self.writer,
+                                    area_size=self.area_size[-1],
+                                    crop_size=self.crop_size)
 
         if output_folder.count(os.sep) < 2:
             self.output_folder = output_folder
@@ -296,7 +298,20 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
 
     def load_video_weights(self, model):
         weight_path = os.path.join(self.video_weights_folder_path, 'model_final_checkpoint.model')
-        missing_keys, unexpected_keys  = model.load_state_dict(torch.load(weight_path)['state_dict'], strict=False)
+        loaded_state_dict = torch.load(weight_path)['state_dict']
+        #print(loaded_state_dict.keys())
+        current_model_dict = model.state_dict()
+        #print(current_model_dict.keys())
+
+        new_state_dict = copy(current_model_dict)
+        for k, v in loaded_state_dict.items():
+            if v.size() == current_model_dict[k].size():
+                new_state_dict[k] = v
+            else:
+                new_state_dict[k] = current_model_dict[k]
+
+        missing_keys, unexpected_keys = model.load_state_dict(new_state_dict, strict=False)
+
         for missing_key in missing_keys:
             assert "conv_1d" in missing_key, f'Missing key: {missing_key}'
         assert len(unexpected_keys) == 0, f'Unexpected_keys: {unexpected_keys}'
@@ -341,7 +356,7 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
         #in_shape_mask = in_shape_mask.view(self.config['batch_size'], self.video_length, 1, self.crop_size, self.crop_size)
 
         self.network = build_video_model(self.config, conv_layer=conv_layer, conv_layer_1d=conv_layer_1d, norm_2d=norm_2d, norm_1d=norm_1d, log_function=self.print_to_log_file, image_size=self.crop_size, window_size=8)
-        if self.config['batch_size'] == 1:
+        if self.config['fine_tuning']:
             self.load_video_weights(self.network)
         model_input_data = torch.randn(self.video_length, self.config['batch_size'], 1, self.crop_size, self.crop_size)
         models['temporal_model'] = (self.network, model_input_data)
@@ -427,7 +442,7 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
             return gradient_image, data
 
     
-    def start_online_evaluation_video(self, pred, x, target, video_cropped_input=None, gradient_image=None, gradient_x=None, theta=None, attention_weights=None, sampling_locations=None, coords=None):
+    def start_online_evaluation_video(self, pred, x, target, video_cropped_input=None, gradient_image=None, gradient_x=None, theta_coords=None, attention_weights=None, sampling_locations=None, coords=None, coords_da=None):
         """attention_weights: T, -1
             sampling_locations: T, -1, 2
             video_cropped_input: T, 1, H, W
@@ -455,8 +470,8 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
                     current_target = target[b, 0]
                     self.vis.set_up_image_seg(seg_dice=seg_dice[b].mean(), gt=current_target, pred=current_pred, x=current_x)
 
-                if video_cropped_input is not None and self.epoch_iter_nb == self.num_val_batches_per_epoch - 1:
-                    self.vis.set_up_image_deformable_attention(locations=sampling_locations, weights=attention_weights, x=video_cropped_input[:, 0], coords=coords)
+                if self.epoch_iter_nb == self.num_val_batches_per_epoch - 1 and attention_weights is not None:
+                    self.vis.set_up_image_deformable_attention(locations=sampling_locations, weights=attention_weights, x=video_cropped_input[:, 0], coords=coords_da, theta_coords=theta_coords)
                     self.vis.set_up_image_gradient(gradient=gradient_image, x=gradient_x, gradient_coords=coords)
                         
                         #current_theta = theta[t]
@@ -538,24 +553,27 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
         return (t, b, c, y, x)
 
     
-    def setup_deformable_attention(self, sampling_locations, attention_weights, data, indices):
-        t, b, c, y, x = indices
+    def sample_indices_da(self, attention_weights):
+        T, B, H = attention_weights.shape[:3]
+        t = random.randint(0, T - 1)
+        b = random.randint(0, B - 1)
+        h = random.randint(0, H - 1)
+        y = random.randint(0, self.area_size[-1] - 1)
+        x = random.randint(0, self.area_size[-1] - 1)
+        return (t, b, h, y, x)
 
-        sampling_locations = sampling_locations[t, b] # T, n_heads, H, W, n_points, 2
-        attention_weights = attention_weights[t, b] # T, n_heads, H, W, n_points
+    
+    def setup_deformable_attention(self, sampling_locations, attention_weights, data, indices, theta_coords):
+        t, b, h, y, x = indices
+
+        #sampling_locations = sampling_locations[t, b] # n_heads, T, n_heads, H, W, n_points, 2
+        attention_weights = attention_weights[t, b] # n_heads, T, n_heads, H, W, n_points
+        theta_coords = theta_coords[t, b] # n_heads, T, 4
         data = data[:, b] # T, 1, H, W
 
-        H = W = self.crop_size
-        sampling_locations = torch.round(((sampling_locations + 1) / 2) * H).int()
-
-        attention_weights = attention_weights[:, :, y, x, :]
-        sampling_locations = sampling_locations[:, :, y, x, :, :]
-        attention_weights = torch.flatten(attention_weights, start_dim=1, end_dim=2) # T, -1
-        sampling_locations = torch.flatten(sampling_locations, start_dim=1, end_dim=2) # T, -1, 2
-
-        return sampling_locations, attention_weights, data
+        return sampling_locations, attention_weights, data, theta_coords
     
-    def run_online_evaluation_video(self, data, target, pred, labeled_binary, cropped_input=None, attention_weights=None, sampling_locations=None, theta=None, cropped_target=None):
+    def run_online_evaluation_video(self, data, target, pred, labeled_binary, cropped_input=None, attention_weights=None, sampling_locations=None, theta_coords=None, cropped_target=None):
         """
         due to deep supervision the return value and the reference are now lists of tensors. We only need the full
         resolution output because this is what we are interested in in the end. The others are ignored
@@ -566,18 +584,21 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
         gradient_image = None
         gradient_x = None
         coords = None
+        indices_da = None
 
         output_l, target_l = self.get_only_labeled(pred, target, labeled_binary)
         input_l, _ = self.get_only_labeled(data, target, labeled_binary)
 
-        if self.learn_indices and self.epoch_iter_nb == self.num_val_batches_per_epoch - 1:
-            # sampling_locations = T, B, T, n_heads, H, W, n_points, 2
-            # attention_weights = T, B, T, n_heads, H, W, n_points
+        if self.epoch_iter_nb == self.num_val_batches_per_epoch - 1 and attention_weights is not None:
+            # sampling_locations = T, B, n_heads, T, n_heads, area_size, area_size, n_points, 2
+            # attention_weights = T, B, n_heads, T, n_heads, area_size, area_size, n_points
+            # theta_coords = T, B, n_heads, T, 4
 
+            indices_da = self.sample_indices_da(attention_weights)
             indices = self.sample_indices(cropped_target)
             gradient_image, gradient_x = self.get_gradient_images(cropped_input, indices)
-            sampling_locations, attention_weights, cropped_input = self.setup_deformable_attention(sampling_locations, attention_weights, cropped_input, indices)
-            coords = (indices[0], indices[4], indices[3])
+            sampling_locations, attention_weights, cropped_input, theta_coords = self.setup_deformable_attention(sampling_locations, attention_weights, cropped_input, indices_da, theta_coords)
+            coords = (indices[0], indices[4], indices[3]) # (t, x, y)
             
 
         return self.start_online_evaluation_video(pred=output_l,
@@ -586,10 +607,11 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
                                                     video_cropped_input=cropped_input,
                                                     gradient_image=gradient_image,
                                                     gradient_x=gradient_x,
-                                                    theta=theta,
+                                                    theta_coords=theta_coords,
                                                     attention_weights=attention_weights,
                                                     sampling_locations=sampling_locations,
-                                                    coords=coords)
+                                                    coords=coords,
+                                                    coords_da=indices_da)
 
     def validate(self, do_mirroring: bool = True, use_sliding_window: bool = True,
                  step_size: float = 0.5, save_softmax: bool = True, use_gaussian: bool = True, overwrite: bool = True,
@@ -783,13 +805,15 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.optimizer.step()
 
-        for name, param in self.network.named_parameters():
-            #print(name)
-            #print(param.grad.mean())
-            if param.grad is None:
-                print(name)
-                print(param.is_leaf)
-                print(param.requires_grad)
+        if self.iter_nb == 0:
+            for param_name, param in self.network.named_parameters():
+                for module_name, module in self.network.named_modules():
+                    if list(module.children()) == []:
+                        if not isinstance(module, nn.BatchNorm2d) and module_name in param_name:
+                            if param.grad is None:
+                                print(param_name)
+                                print(param.is_leaf)
+                                print(param.requires_grad)
 
         #matplotlib.use('QtAgg')
         #fig, ax = plt.subplots(4, self.video_length)
@@ -802,7 +826,7 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
 
         if run_online_evaluation and self.log_images:
             cropped_target, _ = self.processor.crop_and_pad(data_volume=target.transpose(0, 1), mean_centroids=mean_centroids, video_padding=video_padding)
-            self.run_online_evaluation_video(data=data, target=target, pred=output, labeled_binary=labeled_binary, cropped_input=x, attention_weights=cropped_output['attention_weights'], sampling_locations=cropped_output['sampling_points'], cropped_target=cropped_target)
+            self.run_online_evaluation_video(data=data, target=target, pred=output, labeled_binary=labeled_binary, cropped_input=x, attention_weights=cropped_output['attention_weights'], sampling_locations=cropped_output['sampling_points'], theta_coords=cropped_output['theta_coords'], cropped_target=cropped_target)
         del data_list, target_list
 
         if do_backprop:
@@ -1212,7 +1236,7 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
 
             # train one epoch
             self.network.train()
-            if self.config['batch_size'] == 1:
+            if self.config['fine_tuning']:
                 self.freeze_batchnorm_layers(self.network)
 
             if self.use_progress_bar:
@@ -1247,7 +1271,7 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
 
                     if self.also_val_in_tr_mode:
                         self.network.train()
-                        if self.config['batch_size'] == 1:
+                        if self.config['fine_tuning']:
                             self.freeze_batchnorm_layers(self.network)
                         # validation with train=True
                         val_losses = []

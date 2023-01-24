@@ -87,7 +87,6 @@ class VideoModel(SegmentationNetwork):
                 nb_layers,
                 video_length,
                 proj_qkv,
-                nb_zones,
                 area_size,
                 learn_indices,
                 softmax_indices,
@@ -135,7 +134,7 @@ class VideoModel(SegmentationNetwork):
         self.encoder = Encoder(conv_layer=conv_layer, norm=norm_2d, out_dims=out_encoder_dims, device=device, in_dims=in_dims, conv_depth=conv_depth, dpr=dpr_encoder)
         in_dims[0] = self.num_classes
         conv_depth_decoder = conv_depth[::-1]
-        self.decoder = decoder_alt.VideoSegmentationDecoder(deformable_points=deformable_points, use_patches=use_patches, nb_zones=nb_zones, area_size=area_size, video_length=video_length, nb_memory_bus=nb_memory_bus, norm_1d=norm_1d, conv_layer_1d=conv_layer_1d, learn_indices=learn_indices, softmax_indices=softmax_indices, conv_layer=conv_layer, norm=norm_2d, similarity_down_scale=similarity_down_scale, filter_skip_co_segmentation=filter_skip_co_segmentation, concat_spatial_cross_attention=concat_spatial_cross_attention, spatial_cross_attention_num_heads=spatial_cross_attention_num_heads[::-1], shortcut=False, proj_qkv=proj_qkv, out_encoder_dims=out_encoder_dims[::-1], use_conv_mlp=use_conv_mlp, last_activation='identity', img_size=image_size, num_classes=self.num_classes, device=device, swin_abs_pos=False, in_encoder_dims=in_dims[::-1], merge=False, conv_depth=conv_depth_decoder, transformer_depth=0, dpr=dpr_decoder, rpe_mode=False, rpe_contextual_tensor=False, num_heads=num_heads, window_size=window_size, drop_path_rate=drop_path_rate, deep_supervision=self.do_ds)
+        self.decoder = decoder_alt.VideoSegmentationDecoder(deformable_points=deformable_points, use_patches=use_patches, area_size=area_size, video_length=video_length, nb_memory_bus=nb_memory_bus, norm_1d=norm_1d, conv_layer_1d=conv_layer_1d, learn_indices=learn_indices, softmax_indices=softmax_indices, conv_layer=conv_layer, norm=norm_2d, similarity_down_scale=similarity_down_scale, filter_skip_co_segmentation=filter_skip_co_segmentation, concat_spatial_cross_attention=concat_spatial_cross_attention, spatial_cross_attention_num_heads=spatial_cross_attention_num_heads[::-1], shortcut=False, proj_qkv=proj_qkv, out_encoder_dims=out_encoder_dims[::-1], use_conv_mlp=use_conv_mlp, last_activation='identity', img_size=image_size, num_classes=self.num_classes, device=device, swin_abs_pos=False, in_encoder_dims=in_dims[::-1], merge=False, conv_depth=conv_depth_decoder, transformer_depth=0, dpr=dpr_decoder, rpe_mode=False, rpe_contextual_tensor=False, num_heads=num_heads, window_size=window_size, drop_path_rate=drop_path_rate, deep_supervision=self.do_ds)
         self.pos = PositionEmbeddingSine2d(num_pos_feats=self.d_model // 2, normalize=True)
 
         self.extra_bottleneck_block_1 = conv_layer(in_dim=self.d_model, out_dim=self.d_model, nb_blocks=1, dpr=dpr_bottleneck, norm=norm_2d, kernel_size=3)
@@ -158,10 +157,12 @@ class VideoModel(SegmentationNetwork):
                                                                         deformable_points=deformable_points, 
                                                                         video_length=video_length, 
                                                                         num_stages=self.num_stages)
-        self.proj_layers = nn.ModuleList()
-        for i in reversed(range(self.num_stages)):
-            proj = nn.Linear(out_encoder_dims[i], self.d_model)
-            self.proj_layers.append(proj)
+        #self.proj_layers = nn.ModuleList()
+        #for i in reversed(range(self.num_stages)):
+        #    proj = nn.Linear(out_encoder_dims[i], self.d_model)
+        #    self.proj_layers.append(proj)
+
+        self.proj_layers = nn.ModuleList([nn.Identity(), nn.Identity(), nn.Linear(out_encoder_dims[0], self.d_model)])
 
         #ffn_layers = []
         #for i in range(self.num_stages):
@@ -218,7 +219,7 @@ class VideoModel(SegmentationNetwork):
         return output_feature_map
 
     def forward(self, x):
-        theta = None
+        sampling_points = None
         out = {}
         encoded_list = []
         skip_co_list = []
@@ -252,13 +253,14 @@ class VideoModel(SegmentationNetwork):
 
         sampling_point_list = []
         attention_weight_list = []
+        theta_coords_list = []
         out_level_list = []
         for i in range(self.video_length):
             decoded = self.extra_bottleneck_block_2(spatial_tokens[i])
             if self.softmax_indices:
                 prediction_list, _ = self.decoder(decoded, skip_co_list, softmax_volume=data_dict['mask_data'], frame_index=i)
             elif self.learn_indices:
-                prediction_list, sampling_points, attention_weights = self.decoder(decoded, skip_co_list, frame_index=i)
+                prediction_list, sampling_points, attention_weights, theta_coords = self.decoder(decoded, skip_co_list, frame_index=i)
                 out_level_list.append(prediction_list)
                 #seg, theta = self.decoder(decoded, skip_co_list, frame_index=i)
             seg = prediction_list[-1]
@@ -266,9 +268,13 @@ class VideoModel(SegmentationNetwork):
             out_list.append(seg)
             sampling_point_list.append(sampling_points)
             attention_weight_list.append(attention_weights)
+            theta_coords_list.append(theta_coords)
         
         s_list = []
         for i, proj_layer in enumerate(self.proj_layers):
+            if isinstance(proj_layer, nn.Identity):
+                s_list.append(None)
+                continue
             v_list = []
             for j in range(self.video_length):
                 v_list.append(out_level_list[j][i])
@@ -278,8 +284,11 @@ class VideoModel(SegmentationNetwork):
             v_list = v_list.permute(0, 1, 4, 2, 3)
             s_list.append(v_list)
 
-        attention_weights = torch.stack(attention_weight_list, dim=0)
-        sampling_points = torch.stack(sampling_point_list, dim=0)
+        if attention_weight_list[0] is not None:
+            attention_weights = torch.stack(attention_weight_list, dim=0)
+        if sampling_point_list[0] is not None:
+            sampling_points = torch.stack(sampling_point_list, dim=0)
+        theta_coords = torch.stack(theta_coords_list, dim=0)
         output_feature_map = torch.stack(out_list, dim=0)
 
         memory_bus = self.transformer_decoder(memory_bus=memory_bus, skip_connection_list=s_list, advanced_pos=advanced_pos) # B, T*M, C
@@ -287,10 +296,10 @@ class VideoModel(SegmentationNetwork):
         memory_bus = memory_bus.permute(1, 0, 2, 3).contiguous().view(T * B, self.nb_memory_bus, C)
         output_feature_map = self.dot(memory_bus, s_list[-1])
             
+        out['predictions'] = output_feature_map
         out['attention_weights'] = attention_weights
         out['sampling_points'] = sampling_points
-        out['predictions'] = output_feature_map
-        #out['theta'] = theta
+        out['theta_coords'] = theta_coords
             
         return out
     
@@ -364,6 +373,8 @@ class VideoModel(SegmentationNetwork):
             context = autocast
         else:
             context = no_op
+
+        context = no_op
 
         with context():
             with torch.no_grad():
@@ -573,7 +584,7 @@ class VideoModel(SegmentationNetwork):
                     network_input, padding_need, _, _ = processor.preprocess_no_registration(data_list=labeled_data, video_padding=video_padding)
                 output = self(network_input)
                 output = processor.uncrop_no_registration(output, padding_need)
-                pred = self.inference_apply_nonlin(output['predictions'][idx])
+                pred = self.inference_apply_nonlin(output[idx])
                 result_torch += 1 / num_results * pred
 
             if m == 1 and (1 in mirror_axes):
@@ -584,7 +595,7 @@ class VideoModel(SegmentationNetwork):
                     network_input, padding_need, _, _ = processor.preprocess_no_registration(data_list=labeled_data, video_padding=video_padding)
                 output = self(network_input)
                 output = processor.uncrop_no_registration(output, padding_need)
-                pred = self.inference_apply_nonlin(output['predictions'][idx])
+                pred = self.inference_apply_nonlin(output[idx])
                 result_torch += 1 / num_results * torch.flip(pred, (3, ))
 
             if m == 2 and (0 in mirror_axes):
@@ -595,7 +606,7 @@ class VideoModel(SegmentationNetwork):
                     network_input, padding_need, _, _ = processor.preprocess_no_registration(data_list=labeled_data, video_padding=video_padding)
                 output = self(network_input)
                 output = processor.uncrop_no_registration(output, padding_need)
-                pred = self.inference_apply_nonlin(output['predictions'][idx])
+                pred = self.inference_apply_nonlin(output[idx])
                 result_torch += 1 / num_results * torch.flip(pred, (2, ))
 
             if m == 3 and (0 in mirror_axes) and (1 in mirror_axes):
@@ -606,7 +617,7 @@ class VideoModel(SegmentationNetwork):
                     network_input, padding_need, _, _ = processor.preprocess_no_registration(data_list=labeled_data, video_padding=video_padding)
                 output = self(network_input)
                 output = processor.uncrop_no_registration(output, padding_need)
-                pred = self.inference_apply_nonlin(output['predictions'][idx])
+                pred = self.inference_apply_nonlin(output[idx])
                 result_torch += 1 / num_results * torch.flip(pred, (3, 2))
 
         if mult is not None:

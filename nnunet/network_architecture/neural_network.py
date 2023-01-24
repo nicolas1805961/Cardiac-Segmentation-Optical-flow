@@ -12,7 +12,6 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
-
 import numpy as np
 from batchgenerators.augmentations.utils import pad_nd_image
 from nnunet.utilities.random_stuff import no_op
@@ -160,6 +159,7 @@ class SegmentationNetwork(NeuralNetwork):
                 else:
                     raise RuntimeError("Invalid conv op, cannot determine what dimensionality (2d/3d) the network is")
 
+        print(type(res))
         return res
 
     def predict_2D(self, x, do_mirroring: bool, mirror_axes: tuple = (0, 1, 2), use_sliding_window: bool = False,
@@ -618,7 +618,8 @@ class SegmentationNetwork(NeuralNetwork):
     def _internal_predict_2D_2Dconv_tiled(self, x: np.ndarray, step_size: float, do_mirroring: bool, mirror_axes: tuple,
                                           patch_size: tuple, regions_class_order: tuple, use_gaussian: bool,
                                           pad_border_mode: str, pad_kwargs: dict, all_in_gpu: bool,
-                                          verbose: bool) -> Tuple[np.ndarray, np.ndarray]:
+                                          verbose: bool,
+                                          get_flops) -> Tuple[np.ndarray, np.ndarray]:
         # better safe than sorry
         assert len(x.shape) == 3, "x must be (c, x, y)"
 
@@ -705,9 +706,11 @@ class SegmentationNetwork(NeuralNetwork):
             for y in steps[1]:
                 lb_y = y
                 ub_y = y + patch_size[1]
-                predicted_patch = self._internal_maybe_mirror_and_pred_2D(
-                    data[None, :, lb_x:ub_x, lb_y:ub_y], mirror_axes, do_mirroring,
-                    gaussian_importance_map)[0]
+                predicted_patch, out_flop, inference_time = self._internal_maybe_mirror_and_pred_2D(
+                    data[None, :, lb_x:ub_x, lb_y:ub_y], mirror_axes, get_flops, do_mirroring,
+                    gaussian_importance_map)
+
+                predicted_patch = predicted_patch[0]
 
                 if all_in_gpu:
                     predicted_patch = predicted_patch.half()
@@ -747,7 +750,7 @@ class SegmentationNetwork(NeuralNetwork):
             class_probabilities = class_probabilities.detach().cpu().numpy()
 
         if verbose: print("prediction done")
-        return predicted_segmentation, class_probabilities
+        return predicted_segmentation, class_probabilities, out_flop, inference_time
 
     def _internal_predict_3D_2Dconv(self, x: np.ndarray, min_size: Tuple[int, int], do_mirroring: bool,
                                     mirror_axes: tuple = (0, 1), regions_class_order: tuple = None,
@@ -804,7 +807,8 @@ class SegmentationNetwork(NeuralNetwork):
                                           regions_class_order: tuple = None, use_gaussian: bool = False,
                                           pad_border_mode: str = "edge", pad_kwargs: dict =None,
                                           all_in_gpu: bool = False,
-                                          verbose: bool = True) -> Tuple[np.ndarray, np.ndarray]:
+                                          verbose: bool = True,
+                                          get_flops = False) -> Tuple[np.ndarray, np.ndarray]:
         if all_in_gpu:
             raise NotImplementedError
 
@@ -813,10 +817,23 @@ class SegmentationNetwork(NeuralNetwork):
         predicted_segmentation = []
         softmax_pred = []
 
+        out_flop = None
+        out_inference = None
         for s in range(x.shape[1]):
-            pred_seg, softmax_pres = self._internal_predict_2D_2Dconv_tiled(
+            
+            if s == 0:
+                get_flops = get_flops
+            else:
+                get_flops = False
+
+            pred_seg, softmax_pres, flop_list, inference_time = self._internal_predict_2D_2Dconv_tiled(
                 x[:, s], step_size, do_mirroring, mirror_axes, patch_size, regions_class_order, use_gaussian,
-                pad_border_mode, pad_kwargs, all_in_gpu, verbose)
+                pad_border_mode, pad_kwargs, all_in_gpu, verbose, get_flops)
+
+            if s == 0:
+                out_flop = flop_list
+                out_inference = inference_time
+
 
             predicted_segmentation.append(pred_seg[None])
             softmax_pred.append(softmax_pres[None])
@@ -824,7 +841,7 @@ class SegmentationNetwork(NeuralNetwork):
         predicted_segmentation = np.vstack(predicted_segmentation)
         softmax_pred = np.vstack(softmax_pred).transpose((1, 0, 2, 3))
 
-        return predicted_segmentation, softmax_pred
+        return predicted_segmentation, softmax_pred, out_flop, out_inference
 
 
 if __name__ == '__main__':

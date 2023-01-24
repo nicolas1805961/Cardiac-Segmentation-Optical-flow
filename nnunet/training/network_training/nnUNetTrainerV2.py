@@ -209,7 +209,7 @@ class nnUNetTrainerV2(nnUNetTrainer):
                                                          use_sliding_window: bool = True, step_size: float = 0.5,
                                                          use_gaussian: bool = True, pad_border_mode: str = 'constant',
                                                          pad_kwargs: dict = None, all_in_gpu: bool = False,
-                                                         verbose: bool = True, mixed_precision=True) -> Tuple[np.ndarray, np.ndarray]:
+                                                         verbose: bool = True, mixed_precision=True, get_flops=False) -> Tuple[np.ndarray, np.ndarray]:
         """
         We need to wrap this because we need to enforce self.network.do_ds = False for prediction
         """
@@ -223,7 +223,8 @@ class nnUNetTrainerV2(nnUNetTrainer):
                                                                        pad_border_mode=pad_border_mode,
                                                                        pad_kwargs=pad_kwargs, all_in_gpu=all_in_gpu,
                                                                        verbose=verbose,
-                                                                       mixed_precision=mixed_precision)
+                                                                       mixed_precision=mixed_precision,
+                                                                       get_flops=get_flops)
         self.network.do_ds = ds
         return ret
 

@@ -486,7 +486,8 @@ class nnUNetTrainer(NetworkTrainer):
                                                          use_sliding_window: bool = True, step_size: float = 0.5,
                                                          use_gaussian: bool = True, pad_border_mode: str = 'constant',
                                                          pad_kwargs: dict = None, all_in_gpu: bool = False,
-                                                         verbose: bool = True, mixed_precision: bool = True) -> Tuple[np.ndarray, np.ndarray]:
+                                                         verbose: bool = True, mixed_precision: bool = True,
+                                                         get_flops=False) -> Tuple[np.ndarray, np.ndarray]:
         """
         :param data:
         :param do_mirroring:
@@ -520,7 +521,7 @@ class nnUNetTrainer(NetworkTrainer):
                                       patch_size=self.patch_size, regions_class_order=self.regions_class_order,
                                       use_gaussian=use_gaussian, pad_border_mode=pad_border_mode,
                                       pad_kwargs=pad_kwargs, all_in_gpu=all_in_gpu, verbose=verbose,
-                                      mixed_precision=mixed_precision)
+                                      mixed_precision=mixed_precision, get_flops=get_flops)
         self.network.train(current_mode)
         return ret
     
@@ -847,7 +848,7 @@ class nnUNetTrainer(NetworkTrainer):
         results = []
 
         metadata_list = []
-        for k in self.dataset_val.keys():
+        for idx, k in enumerate(self.dataset_val.keys()):
             properties = load_pickle(self.dataset[k]['properties_file'])
             metadata_list.append(self.create_metadata_dict(properties))
             fname = properties['list_of_data_files'][0].split(os.sep)[-1][:-12]
@@ -859,14 +860,28 @@ class nnUNetTrainer(NetworkTrainer):
                 self.print_to_log_file(k, data.shape)
                 data[-1][data[-1] == -1] = 0
 
-                softmax_pred = self.predict_preprocessed_data_return_seg_and_softmax(data[:-1],
+                get_flops = idx == 0
+
+                out = self.predict_preprocessed_data_return_seg_and_softmax(data[:-1],
                                                                                      do_mirroring=do_mirroring,
                                                                                      mirror_axes=mirror_axes,
                                                                                      use_sliding_window=use_sliding_window,
                                                                                      step_size=step_size,
                                                                                      use_gaussian=use_gaussian,
                                                                                      all_in_gpu=all_in_gpu,
-                                                                                     mixed_precision=self.fp16)[1]
+                                                                                     mixed_precision=self.fp16,
+                                                                                     get_flops=get_flops)
+
+                softmax_pred = out[1]
+                
+                if idx == 0:
+                    flop_dict = out[2]
+                    inference_time = out[3] / 1000
+                    gflops = 0
+                    for flop_key in flop_dict.keys():
+                        gflops += flop_dict[flop_key]
+                    with open(join(self.output_folder, "computational_time"), 'w') as fd:
+                        fd.writelines([str(gflops), '\n', str(inference_time)])
 
                 softmax_pred = softmax_pred.transpose([0] + [i + 1 for i in self.transpose_backward])
 
@@ -1015,8 +1030,10 @@ class nnUNetTrainer(NetworkTrainer):
 
         list_of_keys = list(self.dataset_val.keys())
         un_list_of_keys = list(self.dataset_un_val.keys())
+        metadata_list = []
         for k in list_of_keys:
             properties = load_pickle(self.dataset[k]['properties_file'])
+            metadata_list.append(self.create_metadata_dict(properties))
             fname = properties['list_of_data_files'][0].split(os.sep)[-1][:-12]
 
             patient_id = k[:10]
@@ -1119,7 +1136,8 @@ class nnUNetTrainer(NetworkTrainer):
                              json_name=job_name + " val tiled %s" % (str(use_sliding_window)),
                              json_author="Fabian",
                              json_task=task, num_threads=default_num_threads,
-                             advanced=True)
+                             advanced=True,
+                             metadata_list=metadata_list)
 
         if run_postprocessing_on_folds:
             # in the old nnunet we would stop here. Now we add a postprocessing. This postprocessing can remove everything
@@ -1128,7 +1146,8 @@ class nnUNetTrainer(NetworkTrainer):
             # have this applied during inference as well
             self.print_to_log_file("determining postprocessing")
             determine_postprocessing(self.output_folder, self.gt_niftis_folder, validation_folder_name,
-                                     final_subf_name=validation_folder_name + "_postprocessed", debug=debug, log_function=log_function)
+                                     final_subf_name=validation_folder_name + "_postprocessed", debug=debug, log_function=log_function,
+                                     metadata_list=metadata_list)
             # after this the final predictions for the vlaidation set can be found in validation_folder_name_base + "_postprocessed"
             # They are always in that folder, even if no postprocessing as applied!
 
