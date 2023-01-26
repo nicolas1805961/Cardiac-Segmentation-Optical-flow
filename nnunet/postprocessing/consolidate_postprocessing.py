@@ -79,11 +79,11 @@ def consolidate_folds(output_folder_base, validation_folder_name: str = 'validat
     # determine_postprocessing needs a summary.json file in the folder where the raw predictions are. We could compute
     # that from the summary files of the five folds but I am feeling lazy today
     aggregate_scores(test_pred_pairs, labels=classes, json_output_file=join(output_folder_raw, "summary.json"),
-                     num_threads=default_num_threads)
+                     num_threads=default_num_threads, metadata_list=[{}] * len(test_pred_pairs))
 
     determine_postprocessing(output_folder_base, output_folder_gt, 'cv_niftis_raw',
                              final_subf_name="cv_niftis_postprocessed", processes=default_num_threads,
-                             advanced_postprocessing=advanced_postprocessing)
+                             advanced_postprocessing=advanced_postprocessing, metadata_list=[{}] * len(test_pred_pairs))
     # determine_postprocessing will create a postprocessing.json file that can be used for inference
 
 

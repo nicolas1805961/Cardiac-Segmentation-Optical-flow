@@ -150,7 +150,6 @@ class VideoModel(SegmentationNetwork):
         self.slots_mu = nn.Parameter(torch.randn(1, 1, self.d_model))
         self.slots_logsigma = nn.Parameter(torch.zeros(1, 1, self.d_model))
         init.xavier_uniform_(self.slots_logsigma)
-        #self.query_embed = nn.Embedding(4, self.d_model)
 
         self.transformer_decoder = decoder_alt.TransformerVideoDecoder(dim=self.d_model, 
                                                                         num_heads=bottleneck_heads, 
@@ -225,6 +224,13 @@ class VideoModel(SegmentationNetwork):
         skip_co_list = []
         out_list = []
         for i in range(len(x)):
+
+            #matplotlib.use('QtAgg')
+            #print(i)
+            #fig, ax = plt.subplots(1, 1)
+            #ax.imshow(x[i, 0, 0].detach().cpu(), cmap='gray')
+            #plt.show()
+
             encoded, skip_connections = self.encoder(x[i])
             assert torch.all(torch.isfinite(encoded))
 

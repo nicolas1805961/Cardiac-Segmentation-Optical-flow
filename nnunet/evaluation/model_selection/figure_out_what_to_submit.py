@@ -53,6 +53,8 @@ def main():
 
     parser.add_argument("-m", '--models', nargs="+", required=False, default=['2d', '3d_lowres', '3d_fullres',
                                                                               '3d_cascade_fullres'])
+    parser.add_argument("-val", '--validation_folder', type=str, required=True, default='validation_raw', 
+                        help='folder where to find predictions on the fold')
     parser.add_argument("-t", '--task_ids', nargs="+", required=True)
 
     parser.add_argument("-tr", type=str, required=False, default=default_trainer,
@@ -80,7 +82,8 @@ def main():
     disable_postprocessing = args.disable_postprocessing
     folds = tuple(int(i) for i in args.folds)
 
-    validation_folder = "validation_raw"
+    #validation_folder = "validation_raw"
+    validation_folder = args.validation_folder
 
     # this script now acts independently from the summary jsons. That was unnecessary
     id_task_mapping = {}
@@ -141,7 +144,7 @@ def main():
                 # postprocessing_json. If either of those is missing, rerun consolidate_folds
                 if not isfile(postprocessing_json) or not isdir(cv_niftis_folder):
                     print("running missing postprocessing for %s and model %s" % (id_task_mapping[t], m))
-                    consolidate_folds(output_folder, folds=folds)
+                    consolidate_folds(output_folder, folds=folds, validation_folder_name=validation_folder)
 
                 assert isfile(postprocessing_json), "Postprocessing json missing, expected: %s" % postprocessing_json
                 assert isdir(cv_niftis_folder), "Folder with niftis from CV missing, expected: %s" % cv_niftis_folder

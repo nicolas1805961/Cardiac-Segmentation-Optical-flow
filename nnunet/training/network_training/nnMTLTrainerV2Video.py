@@ -90,7 +90,7 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
 
         self.cropper_config = read_config(os.path.join(Path.cwd(), 'adversarial_acdc.yaml'), middle, False)
         self.config = read_config(os.path.join(Path.cwd(), 'video.yaml'), middle, True)
-        self.cropper_weights_folder_path = self.config['cropper_weights_folder_path']
+        self.cropper_weights_folder_path = os.path.join('ACDC_output', 'only_sfb')
         self.video_length = self.config['video_length']
         self.crop = self.config['crop']
         self.feature_extractor = self.config['feature_extractor']
@@ -305,10 +305,10 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
 
         new_state_dict = copy(current_model_dict)
         for k, v in loaded_state_dict.items():
-            if v.size() == current_model_dict[k].size():
-                new_state_dict[k] = v
-            else:
-                new_state_dict[k] = current_model_dict[k]
+            for module_name, module in model.named_modules():
+                if list(module.children()) == []:
+                    if isinstance(module, nn.BatchNorm2d) and module_name in k:
+                        new_state_dict[k] = v
 
         missing_keys, unexpected_keys = model.load_state_dict(new_state_dict, strict=False)
 
@@ -814,6 +814,11 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
                                 print(param_name)
                                 print(param.is_leaf)
                                 print(param.requires_grad)
+
+        
+        #for param_name, param in self.network.named_parameters():
+        #    print(param_name)
+        #    print(param.mean())
 
         #matplotlib.use('QtAgg')
         #fig, ax = plt.subplots(4, self.video_length)
