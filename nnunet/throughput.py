@@ -31,7 +31,7 @@ plans_file, output_folder_name, dataset_directory, batch_dice, stage, \
 trainer = trainer_class(plans_file, 0, output_folder=weight_folder, dataset_directory=dataset_directory,
                             batch_dice=batch_dice, stage=stage, unpack_data=True, middle=False, video=False,
                             deterministic=True,
-                            fp16=True)
+                            fp16=True, inference=True)
 
 trainer.load_final_checkpoint(train=False)
 

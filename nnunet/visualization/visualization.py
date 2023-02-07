@@ -602,48 +602,70 @@ class Visualizer(object):
 
     def log_deformable_attention_images(self, colormap, epoch):
         input_video = self.eval_images['deformable_attention'][0, 0]['input']
-        weights = self.eval_images['deformable_attention'][0, 0]['weights'] # n_heads, area_size, area_size, T, area_size, area_size
+        locations = self.eval_images['deformable_attention'][0, 0]['locations'] # n_zones, T, area_size, area_size, -1, 2
+        weights = self.eval_images['deformable_attention'][0, 0]['weights'] # n_zones, T, area_size, area_size, -1
         coords = self.eval_images['deformable_attention'][0, 0]['coords']
-        theta_coords = self.eval_images['deformable_attention'][0, 0]['theta_coords'] # n_heads, T, 4
+        theta_coords = self.eval_images['deformable_attention'][0, 0]['theta_coords'] # n_zones, 4
 
-        t, b, h, y, x = coords
-        weights = weights[h, y, x] # T, area_size, area_size
-        x = round(x + theta_coords[h, t, 0])
-        y = round(y + theta_coords[h, t, 1])
+        t, b, z, x, y = coords
 
+        locations = locations[z, :, y, x] # T, -1, 2
+        weights = weights[z, :, y, x] # T, -1
+
+        x = round(x + theta_coords[z, 0])
+        y = round(y + theta_coords[z, 1])
+
+        norm1 = matplotlib.colors.Normalize(vmin=weights.min(), vmax=weights.max())
+
+        locations = np.rint(((locations + 1) / 2) * self.crop_size).astype(np.int32)
         theta_coords = np.rint(theta_coords).astype(np.int32)
 
         display_list = []
-        average_weight_list = []
+        #average_weight_list = []
         for i in range(len(input_video)):
 
-            current_weight = weights[i]
-            current_weight = self.get_images_ready_for_display(current_weight, colormap=colormap, vmin=weights.min(), vmax=weights.max())
-            current_weight = cv.resize(current_weight, (self.crop_size, self.crop_size), interpolation=cv.INTER_AREA)
-            if i == t:
-                current_weight = cv.line(current_weight, (x - 2, y - 2), (x + 2, y + 2), color=(0, 255, 0), thickness=1, lineType=cv.LINE_AA) # R, G, B
-                current_weight = cv.line(current_weight, (x - 2, y + 2), (x + 2, y - 2), color=(0, 255, 0), thickness=1, lineType=cv.LINE_AA)
-            average_weight_list.append(current_weight)
+            #current_weight = weights[i]
+            #current_weight = self.get_images_ready_for_display(current_weight, colormap=colormap, vmin=weights.min(), vmax=weights.max())
+            #current_weight = cv.resize(current_weight, (self.crop_size, self.crop_size), interpolation=cv.INTER_AREA)
+            #if i == t:
+            #    current_weight = cv.line(current_weight, (x - 2, y - 2), (x + 2, y + 2), color=(0, 255, 0), thickness=1, lineType=cv.LINE_AA) # R, G, B
+            #    current_weight = cv.line(current_weight, (x - 2, y + 2), (x + 2, y - 2), color=(0, 255, 0), thickness=1, lineType=cv.LINE_AA)
+            #average_weight_list.append(current_weight)
 
             frame = self.get_images_ready_for_display(input_video[i], colormap=None)
             frame = np.tile(frame, (1, 1, 3))
-            current_theta = theta_coords[:, i] # H, 4
 
-            for r in range(len(current_theta)):
-                x1 = current_theta[r, 0]
-                y1 = current_theta[r, 1]
-                x2 = current_theta[r, 2]
-                y2 = current_theta[r, 3]
-                start = (x1, y1)
-                end = (x2, y2)
-                frame = rectangle(frame, start, end, (255, 0, 0), 1)
+            current_locations = locations[i] # -1, 2
+            current_weights = weights[i] # -1,
+            sorting_indices = np.argsort(current_weights)
+            current_locations = current_locations[sorting_indices, :]
+            current_weights = current_weights[sorting_indices]
+
+            for c in range(len(current_locations)):
+                center = tuple(current_locations[c].tolist())
+                color = np.array(list(colormap(norm1(current_weights[c]))[:-1])) * 255
+                color = tuple(color.tolist())
+                frame = cv.circle(frame, center=center, radius=3, color=color, thickness=-1, lineType=cv.LINE_AA)
+
+            if i == t:
+                for r in range(len(theta_coords)):
+                    x1 = theta_coords[r, 0]
+                    y1 = theta_coords[r, 1]
+                    x2 = theta_coords[r, 2]
+                    y2 = theta_coords[r, 3]
+                    start = (x1, y1)
+                    end = (x2, y2)
+                    frame = rectangle(frame, start, end, (255, 0, 0), 1)
+
+                frame = cv.line(frame, (x - 2, y - 2), (x + 2, y + 2), color=(0, 255, 0), thickness=1, lineType=cv.LINE_AA) # R, G, B
+                frame = cv.line(frame, (x - 2, y + 2), (x + 2, y - 2), color=(0, 255, 0), thickness=1, lineType=cv.LINE_AA)
 
             display_list.append(frame)
         video = np.stack(display_list, axis=0)
-        aw_video = np.stack(average_weight_list, axis=0)
+        #aw_video = np.stack(average_weight_list, axis=0)
 
         self.writer.add_images(os.path.join('Deformable attention', 'video').replace('\\', '/'), video, epoch, dataformats='NHWC')
-        self.writer.add_images(os.path.join('Deformable attention', 'average_weights').replace('\\', '/'), aw_video, epoch, dataformats='NHWC')
+        #self.writer.add_images(os.path.join('Deformable attention', 'average_weights').replace('\\', '/'), aw_video, epoch, dataformats='NHWC')
 
 
     def log_theta_images(self, epoch, area_size):
@@ -768,14 +790,14 @@ class Visualizer(object):
         self.eval_images['gradient'][0, 0]['input'] = x.astype(np.float32)
     
     def set_up_image_deformable_attention(self, locations, weights, x, coords, theta_coords):
-        #locations = locations.cpu().numpy()
+        locations = locations.cpu().numpy()
         weights = weights.cpu().numpy()
         x = x.cpu().numpy()
         theta_coords = theta_coords.cpu().numpy()
 
         self.eval_images['deformable_attention'][0, 0]['coords'] = coords
         self.eval_images['deformable_attention'][0, 0]['theta_coords'] = theta_coords.astype(np.float32)
-        self.eval_images['deformable_attention'][0, 0]['locations'] = locations
+        self.eval_images['deformable_attention'][0, 0]['locations'] = locations.astype(np.float32)
         #self.eval_images['deformable_attention'][0, 0]['locations'] = locations.astype(np.float32)
         self.eval_images['deformable_attention'][0, 0]['weights'] = weights.astype(np.float32)
         self.eval_images['deformable_attention'][0, 0]['input'] = x.astype(np.float32)

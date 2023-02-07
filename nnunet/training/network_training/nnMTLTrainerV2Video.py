@@ -12,6 +12,7 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
+import gc
 import random
 from collections import OrderedDict
 from multiprocessing import Pool
@@ -90,7 +91,7 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
 
         self.cropper_config = read_config(os.path.join(Path.cwd(), 'adversarial_acdc.yaml'), middle, False)
         self.config = read_config(os.path.join(Path.cwd(), 'video.yaml'), middle, True)
-        self.cropper_weights_folder_path = os.path.join('ACDC_output', 'only_sfb')
+        self.cropper_weights_folder_path = os.path.join('ACDC_output', 'Ablation', 'only_sfb')
         self.video_length = self.config['video_length']
         self.crop = self.config['crop']
         self.feature_extractor = self.config['feature_extractor']
@@ -554,22 +555,32 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
 
     
     def sample_indices_da(self, attention_weights):
-        T, B, H = attention_weights.shape[:3]
+        T, B, Z = attention_weights.shape[:3]
         t = random.randint(0, T - 1)
         b = random.randint(0, B - 1)
-        h = random.randint(0, H - 1)
-        y = random.randint(0, self.area_size[-1] - 1)
+        z = random.randint(0, Z - 1)
         x = random.randint(0, self.area_size[-1] - 1)
-        return (t, b, h, y, x)
+        y = random.randint(0, self.area_size[-1] - 1)
+        return (t, b, z, x, y)
 
     
     def setup_deformable_attention(self, sampling_locations, attention_weights, data, indices, theta_coords):
-        t, b, h, y, x = indices
+        # sampling_locations = T, B, n_zones, T, n_heads, area_size, area_size, n_points, 2
+        # attention_weights = T, B, n_zones, T, n_heads, area_size, area_size, n_points
+        # theta_coords = T, B, n_zones, 4
 
-        #sampling_locations = sampling_locations[t, b] # n_heads, T, n_heads, H, W, n_points, 2
-        attention_weights = attention_weights[t, b] # n_heads, T, n_heads, H, W, n_points
-        theta_coords = theta_coords[t, b] # n_heads, T, 4
+        t, b, z, x, y = indices
+
+        sampling_locations = sampling_locations[t, b] # n_zones, T, n_heads, area_size, area_size, n_points, 2
+        attention_weights = attention_weights[t, b] # n_zones, T, n_heads, area_size, area_size, n_points
+        theta_coords = theta_coords[t, b] # n_zones, 4
         data = data[:, b] # T, 1, H, W
+
+        sampling_locations = sampling_locations.permute(0, 1, 3, 4, 2, 5, 6)
+        sampling_locations = torch.flatten(sampling_locations, start_dim=4, end_dim=5) # n_zones, T, area_size, area_size, -1, 2
+
+        attention_weights = attention_weights.permute(0, 1, 3, 4, 2, 5)
+        attention_weights = torch.flatten(attention_weights, start_dim=4, end_dim=5) # n_zones, T, area_size, area_size, -1
 
         return sampling_locations, attention_weights, data, theta_coords
     
@@ -590,9 +601,9 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
         input_l, _ = self.get_only_labeled(data, target, labeled_binary)
 
         if self.epoch_iter_nb == self.num_val_batches_per_epoch - 1 and attention_weights is not None:
-            # sampling_locations = T, B, n_heads, T, n_heads, area_size, area_size, n_points, 2
-            # attention_weights = T, B, n_heads, T, n_heads, area_size, area_size, n_points
-            # theta_coords = T, B, n_heads, T, 4
+            # sampling_locations = T, B, n_zones, T, n_heads, area_size, area_size, n_points, 2
+            # attention_weights = T, B, n_zones, T, n_heads, area_size, area_size, n_points
+            # theta_coords = T, B, n_zones, 4
 
             indices_da = self.sample_indices_da(attention_weights)
             indices = self.sample_indices(cropped_target)
