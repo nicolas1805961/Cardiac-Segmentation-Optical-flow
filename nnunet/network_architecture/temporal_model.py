@@ -14,7 +14,7 @@ import sys
 import torch.nn as nn
 import matplotlib.pyplot as plt
 from ..lib.encoder import Encoder
-from ..lib.utils import ConvBlocks, Filter, ConvBlock, GetSeparability, GetCrossSimilarityMatrix, ReplicateChannels, To_image, From_image, rescale, CCA
+from ..lib.utils import DeformableTransformer, ConvBlocks, Filter, ConvBlock, GetSeparability, GetCrossSimilarityMatrix, ReplicateChannels, To_image, From_image, rescale, CCA
 from ..lib import swin_transformer_2
 from ..lib import decoder_alt
 import torchvision.transforms.functional as TF
@@ -28,10 +28,10 @@ from ..lib.vq_vae import VectorQuantizer, VectorQuantizerEMA, VanillaVAE, Quanti
 from torch.cuda.amp import autocast
 from nnunet.utilities.random_stuff import no_op
 from typing import Union, Tuple
-from ..lib.vit_transformer import SpatioTemporalTransformer, SpatialTransformerLayer, TransformerEncoderLayer, SlotAttention, TemporalTransformerLayer, CrossTransformerEncoderLayer, CrossRelativeSpatialTransformerLayer
+from ..lib.vit_transformer import ModulationTransformer, TransformerDecoder, SpatioTemporalTransformer, SpatialTransformerLayer, SlotTransformer, TransformerEncoderLayer, SlotAttention, CrossTransformerEncoderLayer, CrossRelativeSpatialTransformerLayer
 from batchgenerators.augmentations.utils import pad_nd_image
 from ..training.dataloading.dataset_loading import get_idx, select_idx
-from ..lib.position_embedding import PositionEmbeddingSine2d
+from ..lib.position_embedding import PositionEmbeddingSine2d, PositionEmbeddingSine1d
 from torchvision.transforms.functional import gaussian_blur
 from torch.nn.functional import interpolate
 
@@ -88,8 +88,6 @@ class VideoModel(SegmentationNetwork):
                 video_length,
                 proj_qkv,
                 area_size,
-                learn_indices,
-                softmax_indices,
                 image_size,
                 num_bottleneck_layers,
                 conv_layer,
@@ -116,8 +114,6 @@ class VideoModel(SegmentationNetwork):
         self.nb_memory_bus = nb_memory_bus
         self.video_length = video_length
         self.nb_layers = nb_layers
-        self.learn_indices = learn_indices
-        self.softmax_indices = softmax_indices
         self.merge_temporal_tokens = merge_temporal_tokens
         
         self.num_classes = 4
@@ -131,47 +127,33 @@ class VideoModel(SegmentationNetwork):
         dpr_decoder = [x[::-1] for x in dpr_encoder[::-1]]
         dpr_bottleneck = dpr[-1]
 
+        self.modulation_tokens = nn.Parameter(torch.randn(self.video_length, self.d_model))
+        self.memory_bus = nn.Parameter(torch.randn(self.video_length, self.d_model))
+
         self.encoder = Encoder(conv_layer=conv_layer, norm=norm_2d, out_dims=out_encoder_dims, device=device, in_dims=in_dims, conv_depth=conv_depth, dpr=dpr_encoder)
         in_dims[0] = self.num_classes
         conv_depth_decoder = conv_depth[::-1]
-        self.decoder = decoder_alt.VideoSegmentationDecoder(n_points=deformable_points, nb_zones=nb_zones, area_size=area_size, video_length=video_length, norm_1d=norm_1d, conv_layer_1d=conv_layer_1d, learn_indices=learn_indices, softmax_indices=softmax_indices, conv_layer=conv_layer, norm=norm_2d, similarity_down_scale=similarity_down_scale, filter_skip_co_segmentation=filter_skip_co_segmentation, concat_spatial_cross_attention=concat_spatial_cross_attention, spatial_cross_attention_num_heads=spatial_cross_attention_num_heads[::-1], shortcut=False, proj_qkv=proj_qkv, out_encoder_dims=out_encoder_dims[::-1], use_conv_mlp=use_conv_mlp, last_activation='identity', img_size=image_size, num_classes=self.num_classes, device=device, swin_abs_pos=False, in_encoder_dims=in_dims[::-1], merge=False, conv_depth=conv_depth_decoder, transformer_depth=0, dpr=dpr_decoder, rpe_mode=False, rpe_contextual_tensor=False, num_heads=num_heads, window_size=window_size, drop_path_rate=drop_path_rate, deep_supervision=self.do_ds)
-        self.pos = PositionEmbeddingSine2d(num_pos_feats=self.d_model // 2, normalize=True)
-
-        #self.extra_bottleneck_block_1 = conv_layer(in_dim=self.d_model, out_dim=self.d_model, nb_blocks=1, dpr=dpr_bottleneck, norm=norm_2d, kernel_size=3)
-        #self.extra_bottleneck_block_2 = conv_layer(in_dim=self.d_model, out_dim=self.d_model, nb_blocks=1, dpr=dpr_bottleneck, norm=norm_2d, kernel_size=3)
+        self.decoder = decoder_alt.VideoSegmentationDecoder(n_points=deformable_points, nb_zones=nb_zones, area_size=area_size, video_length=video_length, norm_1d=norm_1d, conv_layer_1d=conv_layer_1d, conv_layer=conv_layer, norm=norm_2d, similarity_down_scale=similarity_down_scale, filter_skip_co_segmentation=filter_skip_co_segmentation, concat_spatial_cross_attention=concat_spatial_cross_attention, spatial_cross_attention_num_heads=spatial_cross_attention_num_heads[::-1], shortcut=False, proj_qkv=proj_qkv, out_encoder_dims=out_encoder_dims[::-1], use_conv_mlp=use_conv_mlp, last_activation='identity', img_size=image_size, num_classes=self.num_classes, device=device, swin_abs_pos=False, in_encoder_dims=in_dims[::-1], merge=False, conv_depth=conv_depth_decoder, transformer_depth=0, dpr=dpr_decoder, rpe_mode=False, rpe_contextual_tensor=False, num_heads=num_heads, window_size=window_size, drop_path_rate=drop_path_rate, deep_supervision=self.do_ds)
 
         H, W = (int(image_size / 2**(self.num_stages)), int(image_size / 2**(self.num_stages)))
+        d_ffn = min(2048, self.d_model * 4)
 
-        temporal_transformer_layer = TemporalTransformerLayer(d_model=self.d_model, nhead=self.bottleneck_heads, dim_feedforward=min(2048, self.d_model * 4))
-        spatial_transformer_layer = TransformerEncoderLayer(d_model=self.d_model, nhead=self.bottleneck_heads, dim_feedforward=min(2048, self.d_model * 4))
-        slot_layer = SlotAttention(dim=self.d_model, iters=4, hidden_dim=self.d_model)
-        self.spatio_temporal_encoder = SpatioTemporalTransformer(conv_layer=None, dim=self.d_model, slot_layer=slot_layer, temporal_layer=temporal_transformer_layer, spatial_layer=spatial_transformer_layer, num_layers=self.nb_layers, nb_memory_bus=self.nb_memory_bus, norm_1d=norm_1d, video_length=self.video_length, conv_layer_1d=conv_layer_1d, area_size=area_size, use_patches=False)
+        #nb_blocks = ceil((video_length - 1) / 4)
+        nb_blocks = 0 if video_length == 1 else 1
+        conv_1d = conv_layer_1d(in_dim=self.d_model, out_dim=self.d_model, kernel_size=3, nb_blocks=nb_blocks, norm=norm_1d, dpr=[0.0] * nb_blocks)
         
-        self.slots_mu = nn.Parameter(torch.randn(1, 1, self.d_model))
-        self.slots_logsigma = nn.Parameter(torch.zeros(1, 1, self.d_model))
-        init.xavier_uniform_(self.slots_logsigma)
+        self.spatio_temporal_encoder = SpatioTemporalTransformer(dim=self.d_model, num_heads=self.bottleneck_heads, num_layers=self.nb_layers, d_ffn=d_ffn, conv_layer_1d=conv_1d, res=self.bottleneck_size[0], video_length=video_length)
+        self.modulation = ModulationTransformer(dim=self.d_model, num_heads=self.bottleneck_heads, num_layers=self.nb_layers, d_ffn=d_ffn, video_length=video_length)
+        self.transformerDecoder = TransformerDecoder(dim=self.d_model, num_layers=self.nb_layers, num_heads=self.bottleneck_heads, d_ffn=d_ffn, res=self.bottleneck_size[0])
 
-        self.transformer_decoder = decoder_alt.TransformerVideoDecoder(dim=self.d_model, 
-                                                                        num_heads=bottleneck_heads, 
-                                                                        deformable_points=deformable_points, 
-                                                                        video_length=video_length, 
-                                                                        num_stages=self.num_stages)
-        #self.proj_layers = nn.ModuleList()
-        #for i in reversed(range(self.num_stages)):
-        #    proj = nn.Linear(out_encoder_dims[i], self.d_model)
-        #    self.proj_layers.append(proj)
+        self.final_proj_layer = nn.Conv2d(out_encoder_dims[0], self.d_model, kernel_size=1)
+        #self.classification_linear = nn.Linear(self.d_model, self.video_length)
 
-        self.proj_layers = nn.ModuleList([nn.Identity()] * self.num_stages)
-        self.proj_layers[-1] = nn.Linear(out_encoder_dims[0], self.d_model)
-
-        #ffn_layers = []
-        #for i in range(self.num_stages):
-        #    ffn_layers.append(nn.Linear(self.d_model // 2**i, self.d_model // 2**(i+1)))
-        #    if i < self.num_stages - 1:
-        #        ffn_layers.append(nn.GELU())
-        #self.ffn = nn.Sequential(*ffn_layers)
-        #self.ffn = nn.Linear(self.d_model, self.d_model)
-        #self.out_proj = nn.Conv2d(in_channels=out_encoder_dims[0] * 2, out_channels=self.d_model, kernel_size=1)
+        self.skip_co_proj = nn.ModuleList()
+        proj_dims = [self.d_model] + out_encoder_dims[::-1]
+        for j in range(len(proj_dims) - 1):
+            proj = nn.Linear(proj_dims[j], proj_dims[j + 1])
+            self.skip_co_proj.append(proj)
     
     def get_mask(self, softmax_volume):
         "softmax_volume: B, T, C, H, W"
@@ -218,12 +200,42 @@ class VideoModel(SegmentationNetwork):
         output_feature_map = output_feature_map.view(T, B, self.nb_memory_bus, H * W).view(T, B, self.nb_memory_bus, H, W)
         return output_feature_map
 
+    def rescale(self, weights, spatial_tokens):
+        '''weights: B, T, C'''
+        T, B, C, H, W = spatial_tokens.shape
+        weights = F.softmax(weights, dim=1)
+        weights = weights.permute(1, 0, 2).view(T, B, C, 1, 1).repeat(1, 1, 1, H, W)
+        target = spatial_tokens * weights
+        target = target.mean(0) # B, C, H, W
+        #target = target.permute(0, 2, 3, 1).contiguous()
+        #target = target.view(B, H * W, C)
+        return target
+    
+    def rescale_skip_co(self, weights, skip_co_list):
+        '''weights: B, T, C'''
+        out_list = []
+        weight_list = []
+        for skip_co, layer in zip(reversed(skip_co_list), self.skip_co_proj):
+            weights = layer(weights)
+            weight_list.append(weights.mean(-1))
+            T, B, C, H, W = skip_co.shape
+            projected_weights = F.softmax(weights, dim=1)
+            projected_weights = projected_weights.permute(1, 0, 2).view(T, B, C, 1, 1).repeat(1, 1, 1, H, W)
+            target = skip_co * projected_weights
+            target = target.mean(0) # B, C, H, W
+            out_list.append(target)
+            #target = target.permute(0, 2, 3, 1).contiguous()
+            #target = target.view(B, H * W, C)
+        return out_list[::-1], weight_list[::-1]
+
     def forward(self, x):
         sampling_points = None
         out = {}
         encoded_list = []
-        skip_co_list = []
+        skip_co_list = [[] for i in range(3)]
         out_list = []
+        #pos_2d = self.spatial_pos.unsqueeze(0).repeat(x[0].shape[0], 1, 1)
+        
         for i in range(len(x)):
 
             #matplotlib.use('QtAgg')
@@ -233,88 +245,74 @@ class VideoModel(SegmentationNetwork):
             #plt.show()
 
             encoded, skip_connections = self.encoder(x[i])
+            
             assert torch.all(torch.isfinite(encoded))
 
-            #encoded = self.extra_bottleneck_block_1(encoded)
             encoded_list.append(encoded)
-            skip_co_list.append(skip_connections)
+            for s in range(self.num_stages):
+                skip_co_list[s].append(skip_connections[s])
         
+        skip_co_list = [torch.stack(skip_co_list[i], dim=0) for i in range(self.num_stages)]
         spatial_tokens = torch.stack(encoded_list, dim=0)
         T, B, C, H, W = spatial_tokens.shape
 
-        mu = self.slots_mu.expand(T * B, self.nb_memory_bus, -1)
-        sigma = self.slots_logsigma.exp().expand(T * B, self.nb_memory_bus, -1)
-        memory_bus = mu + sigma * torch.randn(mu.shape, device=spatial_tokens.device)
+        memory_bus, spatial_tokens = self.spatio_temporal_encoder(spatial_tokens, memory_bus=self.memory_bus) # memory_bus = B, T, C
 
-        spatial_tokens, memory_bus, advanced_pos = self.spatio_temporal_encoder(spatial_tokens, memory_bus) # memory_bus = T*B, M, C 
-        memory_bus = memory_bus.view(T, B, self.nb_memory_bus, C)
-        memory_bus = memory_bus.permute(1, 0, 2, 3).contiguous() # B, T, M, C
-        tokens = memory_bus.mean(dim=2)
-        memory_bus = memory_bus.view(B, T * self.nb_memory_bus, C)
-
-        if self.softmax_indices or self.learn_indices:
-            stage_list = []
-            for stage in range(self.num_stages):
-                video_list = [skip_co_list[i][stage] for i in range(self.video_length)]
-                video_volume = torch.stack(video_list, dim=0)
-                stage_list.append(video_volume)
-            skip_co_list = stage_list
-
-
-        sampling_point_list = []
-        attention_weight_list = []
-        theta_coords_list = []
-        out_level_list = []
-        for i in range(self.video_length):
-            #decoded = self.extra_bottleneck_block_2(spatial_tokens[i])
-            decoded = spatial_tokens[i]
-            if self.learn_indices:
-                prediction_list, sampling_points, attention_weights, theta_coords = self.decoder(decoded, skip_co_list, tokens=tokens, frame_index=i)
-                out_level_list.append(prediction_list)
-                sampling_point_list.append(sampling_points)
-                attention_weight_list.append(attention_weights)
-                theta_coords_list.append(theta_coords)
-            else:
-                prediction_list, _, _, _ = self.decoder(decoded, skip_co_list[i])
-                out_level_list.append(prediction_list)
-            seg = prediction_list[-1]
-            out_list.append(seg)
-            
+        target = self.rescale(memory_bus, spatial_tokens)
+        target = target.permute(0, 2, 3, 1).contiguous()
+        target = target.view(B, H * W, C)
         
-        s_list = []
-        for i, proj_layer in enumerate(self.proj_layers):
-            if isinstance(proj_layer, nn.Identity):
-                s_list.append(None)
-                continue
-            v_list = []
-            for j in range(self.video_length):
-                v_list.append(out_level_list[j][i])
-            v_list = torch.stack(v_list, dim=0)
-            v_list = v_list.permute(0, 1, 3, 4, 2)
-            v_list = proj_layer(v_list)
-            v_list = v_list.permute(0, 1, 4, 2, 3)
-            s_list.append(v_list)
+        weights_list = []
+        classification_target_list = []
+        for i in range(self.video_length):
+            #encoded = spatial_tokens[i]
+            modulation_token = self.modulation_tokens[i]
 
-        if self.learn_indices:
-            if attention_weight_list[0] is not None:
-                attention_weights = torch.stack(attention_weight_list, dim=0)
-            if sampling_point_list[0] is not None:
-                sampling_points = torch.stack(sampling_point_list, dim=0)
-            theta_coords = torch.stack(theta_coords_list, dim=0)
-        else:
-            attention_weights = sampling_points = theta_coords = None
+            weights = self.modulation(memory_bus=memory_bus, modulation_embedding=modulation_token) # B, T, C
+
+            #print(F.softmax(weights.mean(-1), dim=-1))
+            #print(i)
+            #print('***************************')
+            
+            encoded = self.rescale(weights, spatial_tokens)
+            #encoded_list.append(encoded)
+            skip_co, skip_co_weights = self.rescale_skip_co(weights, skip_co_list)
+            out_weights = skip_co_weights + [weights.mean(-1)]
+            out_weights = torch.stack(out_weights, dim=0) # L, B, class_dim
+            #skip_co = [skip_co_list[j][i] for j in range(self.num_stages)]
+            prediction_list, _, _, _ = self.decoder(encoded, skip_co)
+            seg = prediction_list[-1]
+            seg = self.final_proj_layer(seg)
+            out_list.append(seg)
+
+            weights_list.append(out_weights)
+            classification_target = torch.full(size=((self.num_stages + 1), B), fill_value=i, device=weights.device)
+            classification_target_list.append(classification_target)
+        
+        weights_list = torch.stack(weights_list, dim=-1) # L, B, class_dim, T
+        classification_target_list = torch.stack(classification_target_list, dim=-1) # L, B, T
+        weights_list = weights_list.view((self.num_stages + 1) * B, T, T)
+        classification_target_list = classification_target_list.view((self.num_stages + 1) * B, T)
+        
+        #spatial_tokens = torch.stack(encoded_list, dim=0).mean(0)
+        #spatial_tokens = spatial_tokens.permute(0, 2, 3, 1).contiguous()
+        #spatial_tokens = spatial_tokens.view(B, H * W, C)
+        slots = self.transformerDecoder(spatial_tokens=target) # B, M, C 
+        slots = slots.repeat(T, 1, 1)
 
         output_feature_map = torch.stack(out_list, dim=0)
 
-        memory_bus = self.transformer_decoder(memory_bus=memory_bus, skip_connection_list=s_list, advanced_pos=advanced_pos) # B, T*M, C
-        memory_bus = memory_bus.view(B, T, self.nb_memory_bus, C)
-        memory_bus = memory_bus.permute(1, 0, 2, 3).contiguous().view(T * B, self.nb_memory_bus, C)
-        output_feature_map = self.dot(memory_bus, s_list[-1])
+        #memory_bus = self.transformer_decoder(memory_bus=memory_bus, skip_connection_list=s_list, advanced_pos=advanced_pos) # B, T*M, C
+        #memory_bus = memory_bus.view(B, T, self.nb_memory_bus, C)
+        #memory_bus = memory_bus.permute(1, 0, 2, 3).contiguous().view(T * B, self.nb_memory_bus, C)
+        output_feature_map = self.dot(slots, output_feature_map)
             
         out['predictions'] = output_feature_map
-        out['attention_weights'] = attention_weights
-        out['sampling_points'] = sampling_points
-        out['theta_coords'] = theta_coords
+        out['attention_weights'] = None
+        out['sampling_points'] = None
+        out['theta_coords'] = None
+        out['classification_list'] = None
+        out['weights_list'] = (weights_list, classification_target_list)
             
         return out
     

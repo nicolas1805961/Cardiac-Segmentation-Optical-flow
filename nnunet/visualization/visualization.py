@@ -19,7 +19,6 @@ class Visualizer(object):
                 adversarial_loss,
                 middle_unlabeled,
                 middle,
-                learn_indices,
                 registered_seg,
                 writer,
                 area_size=None,
@@ -31,7 +30,6 @@ class Visualizer(object):
         self.affinity = False
         self.middle = middle
         self.registered_seg = registered_seg
-        self.learn_indices = learn_indices
         self.writer = writer
         self.dices = []
         self.eval_images = self.initialize_image_data()
@@ -52,10 +50,8 @@ class Visualizer(object):
             eval_images['confidence'] = None
         if self.affinity:
             eval_images['affinity'] = None
-        if self.learn_indices:
-            #eval_images['theta'] = None
-            eval_images['deformable_attention'] = None
-            eval_images['gradient'] = None
+        #eval_images['deformable_attention'] = None
+        eval_images['gradient'] = None
         if self.middle:
             eval_images['sim'] = None
             eval_images['weights'] = None

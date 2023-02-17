@@ -190,16 +190,17 @@ class MTLmodel(SegmentationNetwork):
             self.decoder = decoder_alt.SegmentationDecoder(conv_layer=conv_layer, norm=norm, similarity_down_scale=similarity_down_scale, filter_skip_co_segmentation=filter_skip_co_segmentation, directional_field=directional_field, attention_map=attention_map, reconstruction=reconstruction, reconstruction_skip=reconstruction_skip, concat_spatial_cross_attention=concat_spatial_cross_attention, attention_type=encoder_attention_type, spatial_cross_attention_num_heads=spatial_cross_attention_num_heads[::-1], shortcut=shortcut, proj_qkv=proj, out_encoder_dims=out_encoder_dims[::-1], use_conv_mlp=use_conv_mlp, last_activation='identity', img_size=image_size, num_classes=self.num_classes, device=device, swin_abs_pos=swin_abs_pos, in_encoder_dims=decoder_output_dims, merge=merge, conv_depth=conv_depth_decoder, transformer_depth=transformer_depth[::-1], dpr=dpr_decoder, rpe_mode=rpe_mode, rpe_contextual_tensor=rpe_contextual_tensor, num_heads=num_heads, window_size=window_size, drop_path_rate=drop_path_rate, deep_supervision=self.do_ds)
             
             self.pos = PositionEmbeddingSine2d(num_pos_feats=self.d_model // 2, normalize=True)
-
-            #self.positional_emb = nn.Parameter(torch.zeros(1, H * W, self.d_model), requires_grad=True)
-            #init.trunc_normal_(self.positional_emb, std=0.2)
+            #self.spatial_pos = nn.Parameter(torch.randn(size=(self.bottleneck_size[0]**2, self.d_model)))
             
             self.extra_bottleneck_block_1 = conv_layer(in_dim=self.d_model, out_dim=self.d_model, nb_blocks=1, dpr=dpr_bottleneck, norm=norm, kernel_size=3)
             if transformer_bottleneck:
                 encoder_layer = TransformerEncoderLayer(d_model=int(self.d_model), nhead=bottleneck_heads, dim_feedforward=4 * int(self.d_model))
                 self.bottleneck = TransformerEncoder(encoder_layer=encoder_layer, num_layers=self.num_bottleneck_layers)
             else:
-                self.bottleneck = conv_layer(in_dim=self.d_model, out_dim=self.d_model, nb_blocks=1, dpr=dpr_bottleneck, norm=norm, kernel_size=3)
+                self.bottleneck = nn.Sequential(nn.Conv2d(in_channels=self.d_model, out_channels=self.d_model, kernel_size=3, padding='same'),
+                                                norm(self.d_model),
+                                                nn.GELU())
+                #self.bottleneck = conv_layer(in_dim=self.d_model, out_dim=self.d_model, nb_blocks=1, dpr=dpr_bottleneck, norm=norm, kernel_size=3)
             self.extra_bottleneck_block_2 = conv_layer(in_dim=self.d_model, out_dim=self.d_model, nb_blocks=1, dpr=dpr_bottleneck, norm=norm, kernel_size=3)
 
             if classification:
@@ -429,7 +430,7 @@ class MTLmodel(SegmentationNetwork):
                 B, C, H, W = x_encoded.shape
                 pos = self.pos(shape_util=(B, H, W), device=x.device)
                 pos = torch.flatten(pos, start_dim=2).permute(0, 2, 1)
-                #pos = self.positional_emb.repeat(B, 1, 1)
+                #pos = self.spatial_pos.unsqueeze(0).repeat(B, 1, 1)
                 x_encoded = self.bottleneck(x_encoded, pos=pos)
             else:
                 x_encoded = self.bottleneck(x_encoded)

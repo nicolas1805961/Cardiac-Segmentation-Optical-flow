@@ -6,11 +6,10 @@ import matplotlib
 from torch.nn.functional import pad
 
 class Processor(object):
-    def __init__(self, crop_size, image_size, cropping_network, get_softmax, nb_layers) -> None:
+    def __init__(self, crop_size, image_size, cropping_network, nb_layers) -> None:
         self.crop_size = crop_size
         self.image_size = image_size
         self.cropping_network = cropping_network
-        self.get_softmax = get_softmax
         self.nb_layers = nb_layers
     
     def get_coords(self, data):
@@ -144,21 +143,16 @@ class Processor(object):
     
     def discretize(self, data_list):
         out_list = []
-        softmax_list = []
         for data in data_list:
             if torch.count_nonzero(data) == 0:
                 softmaxed = torch.zeros_like(data_list[0])
             else:
                 softmaxed = self.cropping_network(data)['pred']
                 softmaxed = torch.softmax(softmaxed, dim=1)
-            if self.get_softmax:
-                softmax_list.append(softmaxed)
             out = torch.argmax(softmaxed, dim=1)
             out_list.append(out)
         out_list = torch.stack(out_list, dim=1) # B, T, H, W
-        if self.get_softmax:
-            softmax_list = torch.stack(softmax_list, dim=1) # B, T, C, H, W
-        return out_list, softmax_list
+        return out_list
     
     def uncrop(self, output, padding_need, translation_dists):
         output_volume = torch.stack(output['labeled_data'], dim=1)
@@ -188,7 +182,7 @@ class Processor(object):
 
     def preprocess(self, data_list, idx):
         #matplotlib.use('QtAgg')
-        temp_volume, softmax_volume = self.discretize(data_list)
+        temp_volume = self.discretize(data_list)
 
         #fig, ax = plt.subplots(1, 2)
         #print(data_dict['registered_idx'])
@@ -221,35 +215,23 @@ class Processor(object):
         network_input = {'labeled_data': [cropped_volume[:, i] for i in range(cropped_volume.shape[1])]}
         return network_input, padding_need, translation_dists
     
-    def crop_and_pad(self, data_volume, mean_centroids, video_padding, softmax_volume=None):
-        network_input = {}
+    def crop_and_pad(self, data_volume, mean_centroids, video_padding):
         cropped_volume, padding_need = self.crop_data(data_volume, mean_centroids) # B, T, 1, 128, 128
-        if self.get_softmax:
-            cropped_softmax, _ = self.crop_data(softmax_volume, mean_centroids) # B, T, C, 128, 128
 
         video_padding = video_padding.permute(1, 0) # B, T
         cropped_volume[video_padding] = torch.zeros(size=(cropped_volume.shape[-2], cropped_volume.shape[-1]), dtype=cropped_volume.dtype, device=cropped_volume.device)
         assert torch.all(torch.isfinite(cropped_volume))
         assert cropped_volume.shape[-1] == self.crop_size, print(cropped_volume.shape[-1])
 
-        if self.get_softmax:
-            cropped_softmax[video_padding] = torch.zeros(size=(cropped_softmax.shape[-2], cropped_softmax.shape[-1]), dtype=cropped_softmax.dtype, device=cropped_softmax.device)
-            assert torch.all(torch.isfinite(cropped_softmax))
-            assert cropped_softmax.shape[-1] == self.crop_size, print(cropped_softmax.shape[-1])
-
-            network_input['mask_data'] = cropped_softmax
-        else:
-            network_input['mask_data'] = None
-
         cropped_volume = cropped_volume.transpose(0, 1)
         return cropped_volume, padding_need
 
     def preprocess_no_registration(self, data_list, video_padding):
-        temp_volume, softmax_volume = self.discretize(data_list) # B, T, H, W,  B, T, C, H, W
+        temp_volume = self.discretize(data_list) # B, T, H, W
 
         mean_centroids = self.get_mean_centroid(temp_volume) # B, 2
         data_volume = torch.stack(data_list, dim=1) # B, T, 1, H, W
 
-        cropped_volume, padding_need = self.crop_and_pad(data_volume, mean_centroids, video_padding, softmax_volume)
+        cropped_volume, padding_need = self.crop_and_pad(data_volume, mean_centroids, video_padding)
 
         return cropped_volume, padding_need, temp_volume, mean_centroids

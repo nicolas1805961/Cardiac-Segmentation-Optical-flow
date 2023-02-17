@@ -153,7 +153,6 @@ class nnMTLTrainerV2(nnUNetTrainer):
                                     middle_unlabeled=self.middle_unlabeled,
                                     middle=self.middle,
                                     registered_seg=self.registered_seg,
-                                    learn_indices=False,
                                     writer=self.writer)
 
         if inference:

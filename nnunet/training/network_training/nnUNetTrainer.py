@@ -966,7 +966,7 @@ class nnUNetTrainer(NetworkTrainer):
         self.network.train(current_mode)
     
 
-    def validate_video(self, processor, log_function, do_mirroring: bool = True, use_sliding_window: bool = True, step_size: float = 0.5,
+    def validate_video(self, processor, log_function, step, do_mirroring: bool = True, use_sliding_window: bool = True, step_size: float = 0.5,
                  save_softmax: bool = True, use_gaussian: bool = True, overwrite: bool = True,
                  validation_folder_name: str = 'validation_raw', debug: bool = True, all_in_gpu: bool = False,
                  segmentation_export_kwargs: dict = None, run_postprocessing_on_folds: bool = True, output_folder=None):
@@ -1042,13 +1042,20 @@ class nnUNetTrainer(NetworkTrainer):
             filtered = l_filtered + un_filtered
             filtered = sorted(filtered, key=lambda x: int(x[16:18]))
             filtered = np.array(filtered)
+            labeled_idx = np.where(filtered == k)[0][0]
+
+            if step > 1:
+                if labeled_idx % 2 == 0:
+                    filtered = filtered[0::step]
+                else:
+                    filtered = filtered[1::step]
+                labeled_idx = np.where(filtered == k)[0][0]
             
             if self.video_length > len(filtered):
                 padding_length = self.video_length - len(filtered)
                 video = filtered
             else:
                 padding_length = 0
-                labeled_idx = np.where(filtered == k)[0][0]
                 values = np.arange(len(filtered))
                 step = self.video_length // 2
                 start = min(max(labeled_idx - step, 0), len(filtered) - self.video_length)

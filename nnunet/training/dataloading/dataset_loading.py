@@ -1473,7 +1473,7 @@ class DataLoader2DMiddleUnlabeled(SlimDataLoaderBase):
 
 
 class DataLoaderVideoUnlabeled(SlimDataLoaderBase):
-    def __init__(self, data, patch_size, final_patch_size, batch_size, is_val, unlabeled_dataset, video_length, force_one_label, oversample_foreground_percent=0.0,
+    def __init__(self, data, patch_size, final_patch_size, batch_size, is_val, unlabeled_dataset, video_length, step, force_one_label, oversample_foreground_percent=0.0,
                  memmap_mode="r", pseudo_3d_slices=1, pad_mode="edge",
                  pad_kwargs_data=None, pad_sides=None):
         """
@@ -1515,6 +1515,7 @@ class DataLoaderVideoUnlabeled(SlimDataLoaderBase):
         self.need_to_pad = np.array(patch_size) - np.array(final_patch_size)
         self.memmap_mode = memmap_mode
         self.video_length = video_length
+        self.step = step
         self.percent = None
         self.force_one_label = force_one_label
         if pad_sides is not None:
@@ -1601,8 +1602,18 @@ class DataLoaderVideoUnlabeled(SlimDataLoaderBase):
 
             frames = sorted(frames, key=lambda x: int(x[16:18]))
             frames = np.array(frames)
-            
             labeled_idx = np.where(~np.char.endswith(frames, '_u'))[0]
+
+            if self.step > 1:
+                if np.all(labeled_idx % 2 == 0):
+                    frames = frames[0::self.step]
+                elif np.all(labeled_idx % 2 != 0):
+                    frames = frames[1::self.step]
+                else:
+                    start = np.random.randint(0, 2)
+                    frames = frames[start::self.step]
+                labeled_idx = np.where(~np.char.endswith(frames, '_u'))[0]
+
             values = np.arange(len(frames))
 
             if self.video_length > len(frames):
