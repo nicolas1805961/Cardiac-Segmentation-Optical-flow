@@ -12,7 +12,7 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
-
+import psutil
 import shutil
 from collections import OrderedDict
 from multiprocessing import Pool
@@ -974,7 +974,6 @@ class nnUNetTrainer(NetworkTrainer):
         """
         if debug=True then the temporary files generated for postprocessing determination will be kept
         """
-
         current_mode = self.network.training
         self.network.eval()
 
@@ -1057,8 +1056,8 @@ class nnUNetTrainer(NetworkTrainer):
             else:
                 padding_length = 0
                 values = np.arange(len(filtered))
-                step = self.video_length // 2
-                start = min(max(labeled_idx - step, 0), len(filtered) - self.video_length)
+                half_window = self.video_length // 2
+                start = min(max(labeled_idx - half_window, 0), len(filtered) - self.video_length)
                 frame_indices = values[start:start + self.video_length]
                 assert len(frame_indices) == self.video_length
                 video = filtered[frame_indices]

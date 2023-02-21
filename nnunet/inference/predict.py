@@ -12,10 +12,12 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
-
+import gc
 import argparse
 from copy import deepcopy
 from typing import Tuple, Union, List
+import psutil
+import sys
 
 import numpy as np
 from batchgenerators.augmentations.utils import resize_segmentation
@@ -41,59 +43,52 @@ from nnunet.training.model_restore import load_model_and_checkpoint_files
 from nnunet.training.network_training.nnUNetTrainer import nnUNetTrainer
 from nnunet.utilities.one_hot_encoding import to_one_hot
 
+def sizeof_fmt(num, suffix='B'):
+    for unit in ['','Ki','Mi','Gi','Ti','Pi','Ei','Zi']:
+        if abs(num) < 1024.0:
+            return "%3.1f %s%s" % (num, unit, suffix)
+        num /= 1024.0
+    return "%.1f %s%s" % (num, 'Yi', suffix)
 
-def preprocess_save(preprocess_fn, list_of_lists, output_files, segs_from_prev_stage, classes,
+
+def preprocess_save(preprocess_fn, l, output_file, segs_from_prev_stage, classes,
                              transpose_forward):
-    # suppress output
-    # sys.stdout = open(os.devnull, 'w')
 
-    errors_in = []
-    out_list = []
-    for i, l in enumerate(list_of_lists):
-        output_file = output_files[i]
-        print("preprocessing", output_file)
-        shutil.copy(l[0][:-12] + '.csv', output_file[:-7] + '.csv')
-        d, _, dct = preprocess_fn(l)
-        # print(output_file, dct)
-        if segs_from_prev_stage[i] is not None:
-            assert isfile(segs_from_prev_stage[i]) and segs_from_prev_stage[i].endswith(
+    print("preprocessing", output_file)
+    shutil.copy(l[0][:-12] + '.csv', output_file[:-7] + '.csv')
+    d, _, dct = preprocess_fn(l)
+    # print(output_file, dct)
+    if segs_from_prev_stage is not None:
+        assert isfile(segs_from_prev_stage) and segs_from_prev_stage.endswith(
                 ".nii.gz"), "segs_from_prev_stage" \
                             " must point to a " \
                             "segmentation file"
-            seg_prev = sitk.GetArrayFromImage(sitk.ReadImage(segs_from_prev_stage[i]))
-            # check to see if shapes match
-            img = sitk.GetArrayFromImage(sitk.ReadImage(l[0]))
-            assert all([i == j for i, j in zip(seg_prev.shape, img.shape)]), "image and segmentation from previous " \
+        seg_prev = sitk.GetArrayFromImage(sitk.ReadImage(segs_from_prev_stage))
+        # check to see if shapes match
+        img = sitk.GetArrayFromImage(sitk.ReadImage(l[0]))
+        assert all([i == j for i, j in zip(seg_prev.shape, img.shape)]), "image and segmentation from previous " \
                                                                                 "stage don't have the same pixel array " \
                                                                                 "shape! image: %s, seg_prev: %s" % \
-                                                                                (l[0], segs_from_prev_stage[i])
-            seg_prev = seg_prev.transpose(transpose_forward)
-            seg_reshaped = resize_segmentation(seg_prev, d.shape[1:], order=1)
-            seg_reshaped = to_one_hot(seg_reshaped, classes)
-            d = np.vstack((d, seg_reshaped)).astype(np.float32)
-        """There is a problem with python process communication that prevents us from communicating objects 
-        larger than 2 GB between processes (basically when the length of the pickle string that will be sent is 
-        communicated by the multiprocessing.Pipe object then the placeholder (I think) does not allow for long 
-        enough strings (lol). This could be fixed by changing i to l (for long) but that would require manually 
-        patching system python code. We circumvent that problem here by saving softmax_pred to a npy file that will 
-        then be read (and finally deleted) by the Process. save_segmentation_nifti_from_softmax can take either 
-        filename or np.ndarray and will handle this automatically"""
-        print(d.shape)
-        if np.prod(d.shape) > (2e9 / 4 * 0.85):  # *0.85 just to be save, 4 because float32 is 4 bytes
-            print(
-                "This output is too large for python process-process communication. "
-                "Saving output temporarily to disk")
-            np.save(output_file[:-7] + ".npy", d)
-            d = output_file[:-7] + ".npy"
-        out_list.append((output_file, (d, dct)))
-    if len(errors_in) > 0:
-        print("There were some errors in the following cases:", errors_in)
-        print("These cases were ignored.")
-    else:
-        print("This worker has ended successfully, no errors to report")
-    # restore output
-    # sys.stdout = sys.__stdout__
-    return out_list
+                                                                                (l[0], segs_from_prev_stage)
+        seg_prev = seg_prev.transpose(transpose_forward)
+        seg_reshaped = resize_segmentation(seg_prev, d.shape[1:], order=1)
+        seg_reshaped = to_one_hot(seg_reshaped, classes)
+        d = np.vstack((d, seg_reshaped)).astype(np.float32)
+    """There is a problem with python process communication that prevents us from communicating objects 
+    larger than 2 GB between processes (basically when the length of the pickle string that will be sent is 
+    communicated by the multiprocessing.Pipe object then the placeholder (I think) does not allow for long 
+    enough strings (lol). This could be fixed by changing i to l (for long) but that would require manually 
+    patching system python code. We circumvent that problem here by saving softmax_pred to a npy file that will 
+    then be read (and finally deleted) by the Process. save_segmentation_nifti_from_softmax can take either 
+    filename or np.ndarray and will handle this automatically"""
+    print(d.shape)
+    if np.prod(d.shape) > (2e9 / 4 * 0.85):  # *0.85 just to be save, 4 because float32 is 4 bytes
+        print(
+            "This output is too large for python process-process communication. "
+            "Saving output temporarily to disk")
+        np.save(output_file[:-7] + ".npy", d)
+        d = output_file[:-7] + ".npy"
+    return (output_file, (d, dct))
 
 def preprocess_save_to_queue(preprocess_fn, q, list_of_lists, output_files, segs_from_prev_stage, classes,
                              transpose_forward):
@@ -158,14 +153,15 @@ def preprocess_no_multithreading(trainer, list_of_lists, output_files, segs_from
 
     classes = list(range(1, trainer.num_classes))
     assert isinstance(trainer, nnUNetTrainer)
-    yield_list = preprocess_save(trainer.preprocess_patient,
-                            list_of_lists,
-                            output_files,
-                            segs_from_prev_stage,
-                            classes, 
-                            trainer.plans['transpose_forward'])
-
-    return yield_list
+    i = 0
+    while i < len(list_of_lists):
+        yield preprocess_save(trainer.preprocess_patient,
+                                list_of_lists[i],
+                                output_files[i],
+                                segs_from_prev_stage[i],
+                                classes, 
+                                trainer.plans['transpose_forward'])
+        i += 1
 
 
 def preprocess_multithreaded(trainer, list_of_lists, output_files, num_processes=2, segs_from_prev_stage=None):
@@ -281,12 +277,18 @@ def predict_cases(model, list_of_lists, output_filenames, folds, save_npz, num_t
     #                                         segs_from_prev_stage)
     yield_list = preprocess_no_multithreading(trainer, list_of_lists, cleaned_output_files,
                                              segs_from_prev_stage)
+
     print("starting prediction...")
     all_output_files = []
     #for preprocessed in preprocessing:
     for preprocessed in yield_list:
+        print(f"Max CPU Memory allocated: {psutil.Process(os.getpid()).memory_info().rss / 10e8} Gb")
+
+        #print([f'{a}: {sys.getsizeof(a) / 1e+8} GB' for a in dir(trainer) if not a.startswith('__') and not callable(getattr(trainer, a)) and sys.getsizeof(a) / 1e+8 > 0.5])
+        #print([f'{a}: {sys.getsizeof(a) / 1e+8} GB' for a in dir(trainer.network) if not a.startswith('__') and not callable(getattr(trainer.network, a)) and sys.getsizeof(a) / 1e+8 > 0.5])
+
         output_filename, (d, dct) = preprocessed
-        all_output_files.append(all_output_files)
+        #all_output_files.append(all_output_files)
         if isinstance(d, str):
             data = np.load(d)
             os.remove(d)
@@ -308,6 +310,12 @@ def predict_cases(model, list_of_lists, output_filenames, folds, save_npz, num_t
 
         if len(params) > 1:
             softmax /= len(params)
+        
+        #print(sys.getsizeof(softmax) / 1e8)
+        #print(sys.getsizeof(d) / 1e8)
+        #print(sys.getsizeof(dct) / 1e8)
+        #print(sys.getsizeof(results) / 1e8)
+        #print(sys.getsizeof(trainer) / 1e8)
 
         transpose_forward = trainer.plans.get('transpose_forward')
         if transpose_forward is not None:
@@ -340,12 +348,11 @@ def predict_cases(model, list_of_lists, output_filenames, folds, save_npz, num_t
             np.save(output_filename[:-7] + ".npy", softmax)
             softmax = output_filename[:-7] + ".npy"
 
-        results.append(pool.starmap_async(save_segmentation_nifti_from_softmax,
-                                          ((softmax, output_filename, dct, interpolation_order, region_class_order,
+        results.append(save_segmentation_nifti_from_softmax(softmax, output_filename, dct, interpolation_order, region_class_order,
                                             None, None,
-                                            npz_file, None, force_separate_z, interpolation_order_z),)
-                                          ))
-
+                                            npz_file, None, force_separate_z, interpolation_order_z))
+        del softmax, d, dct
+        gc.collect()
     print("inference done. Now waiting for the segmentation export to finish...")
     _ = [i.get() for i in results]
     # now apply postprocessing

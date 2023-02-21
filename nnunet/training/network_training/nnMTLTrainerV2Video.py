@@ -85,7 +85,7 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
     """
 
     def __init__(self, plans_file, fold, output_folder=None, dataset_directory=None, batch_dice=True, stage=None,
-                 unpack_data=True, deterministic=True, fp16=False, middle=False, video=False):
+                 unpack_data=True, deterministic=True, fp16=False, middle=False, video=False, inference=False):
         super().__init__(plans_file, fold, output_folder, dataset_directory, batch_dice, stage, unpack_data,
                          deterministic, fp16)
 
@@ -137,11 +137,16 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
                                     writer=self.writer,
                                     area_size=self.area_size[-1],
                                     crop_size=self.crop_size)
-
-        if output_folder.count(os.sep) < 2:
+            
+        if inference:
             self.output_folder = output_folder
         else:
             self.output_folder = self.log_dir
+
+        #if output_folder.count(os.sep) < 2:
+        #    self.output_folder = output_folder
+        #else:
+        #    self.output_folder = self.log_dir
 
         self.setup_loss_functions(loss_weights)
         
@@ -310,7 +315,8 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
         for k, v in loaded_state_dict.items():
             for module_name, module in model.named_modules():
                 if list(module.children()) == []:
-                    if isinstance(module, nn.BatchNorm2d) and module_name in k:
+                    #if isinstance(module, nn.BatchNorm2d) and module_name in k:
+                    if module_name in k:
                         new_state_dict[k] = v
 
         missing_keys, unexpected_keys = model.load_state_dict(new_state_dict, strict=False)
@@ -349,7 +355,7 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
         in_shape_crop = torch.randn(self.config['batch_size'], 1, self.image_size, self.image_size)
         cropping_conv_layer, _ = self.get_conv_layer(self.cropper_config)
         cropping_network = build_2d_model(self.cropper_config, conv_layer=cropping_conv_layer, norm=getattr(torch.nn, self.cropper_config['norm']), log_function=self.print_to_log_file, image_size=self.image_size, window_size=self.window_size, middle=False, num_classes=num_classes)
-        cropping_network.load_state_dict(torch.load(os.path.join(self.cropper_weights_folder_path, 'model_final_checkpoint.model'))['state_dict'])
+        cropping_network.load_state_dict(torch.load(os.path.join(self.cropper_weights_folder_path, 'model_final_checkpoint.model'))['state_dict'], strict=True)
         cropping_network.eval()
         cropping_network.do_ds = False
         models['cropping_model'] = (cropping_network, in_shape_crop)
@@ -815,6 +821,13 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
                 x, padding_need, pseudo_labels, mean_centroids = self.processor.preprocess_no_registration(data_list=data_list, video_padding=video_padding)
                 #network_input, padding_need, translation_dists = self.processor.preprocess(data_list=data_list, idx=data_dict['registered_idx'])
             self.optimizer.zero_grad()
+
+            #if not do_backprop:
+            #    matplotlib.use('QtAgg')
+            #    fig, ax = plt.subplots(1, self.video_length)
+            #    for i in range(self.video_length):
+            #        ax[i].imshow(x[i, 0, 0].cpu(), cmap='gray')
+            #    plt.show()
 
             #for module in self.network.modules():
             #    if isinstance(module, nn.BatchNorm2d):

@@ -12,7 +12,6 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
-
 import argparse
 import torch
 
@@ -20,6 +19,14 @@ from nnunet.inference.predict import predict_from_folder
 from nnunet.paths import default_plans_identifier, network_training_output_dir, default_cascade_trainer, default_trainer
 from batchgenerators.utilities.file_and_folder_operations import join, isdir
 from nnunet.utilities.task_name_id_conversion import convert_id_to_task_name
+import os
+import torch
+import warnings
+
+torch.autograd.set_detect_anomaly(True)
+warnings.filterwarnings("default")
+
+os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 
 
 def main():
@@ -93,7 +100,7 @@ def main():
     "Determines many background processes will be used for data preprocessing. Reduce this if you "
     "run into out of memory (RAM) problems. Default: 6")
 
-    parser.add_argument("--num_threads_nifti_save", required=False, default=2, type=int, help=
+    parser.add_argument("--num_threads_nifti_save", required=False, default=1, type=int, help=
     "Determines many background processes will be used for segmentation export. Reduce this if you "
     "run into out of memory (RAM) problems. Default: 2")
 

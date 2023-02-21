@@ -127,8 +127,11 @@ class VideoModel(SegmentationNetwork):
         dpr_decoder = [x[::-1] for x in dpr_encoder[::-1]]
         dpr_bottleneck = dpr[-1]
 
-        self.modulation_tokens = nn.Parameter(torch.randn(self.video_length, self.d_model))
+        #self.modulation_tokens = nn.Parameter(torch.randn(self.video_length, self.d_model))
+        self.object_tokens = nn.Parameter(torch.randn(self.nb_memory_bus, self.d_model))
         self.memory_bus = nn.Parameter(torch.randn(self.video_length, self.d_model))
+        self.pos_2d = nn.Parameter(torch.randn(self.bottleneck_size[0]**2, self.d_model))
+        self.pos_1d = nn.Parameter(torch.randn(self.video_length, self.d_model))
 
         self.encoder = Encoder(conv_layer=conv_layer, norm=norm_2d, out_dims=out_encoder_dims, device=device, in_dims=in_dims, conv_depth=conv_depth, dpr=dpr_encoder)
         in_dims[0] = self.num_classes
@@ -142,9 +145,9 @@ class VideoModel(SegmentationNetwork):
         nb_blocks = 0 if video_length == 1 else 1
         conv_1d = conv_layer_1d(in_dim=self.d_model, out_dim=self.d_model, kernel_size=3, nb_blocks=nb_blocks, norm=norm_1d, dpr=[0.0] * nb_blocks)
         
-        self.spatio_temporal_encoder = SpatioTemporalTransformer(dim=self.d_model, num_heads=self.bottleneck_heads, num_layers=self.nb_layers, d_ffn=d_ffn, conv_layer_1d=conv_1d, res=self.bottleneck_size[0], video_length=video_length)
-        self.modulation = ModulationTransformer(dim=self.d_model, num_heads=self.bottleneck_heads, num_layers=self.nb_layers, d_ffn=d_ffn, video_length=video_length)
-        self.transformerDecoder = TransformerDecoder(dim=self.d_model, num_layers=self.nb_layers, num_heads=self.bottleneck_heads, d_ffn=d_ffn, res=self.bottleneck_size[0])
+        self.spatio_temporal_encoder = SpatioTemporalTransformer(dim=self.d_model, num_heads=self.bottleneck_heads, num_layers=self.nb_layers, d_ffn=d_ffn, conv_layer_1d=conv_1d)
+        self.modulation = ModulationTransformer(dim=self.d_model, num_heads=self.bottleneck_heads, num_layers=self.nb_layers, d_ffn=d_ffn)
+        self.transformerDecoder = TransformerDecoder(dim=self.d_model, num_layers=self.nb_layers, num_heads=self.bottleneck_heads, d_ffn=d_ffn)
 
         self.final_proj_layer = nn.Conv2d(out_encoder_dims[0], self.d_model, kernel_size=1)
         #self.classification_linear = nn.Linear(self.d_model, self.video_length)
@@ -256,7 +259,7 @@ class VideoModel(SegmentationNetwork):
         spatial_tokens = torch.stack(encoded_list, dim=0)
         T, B, C, H, W = spatial_tokens.shape
 
-        memory_bus, spatial_tokens = self.spatio_temporal_encoder(spatial_tokens, memory_bus=self.memory_bus) # memory_bus = B, T, C
+        memory_bus, spatial_tokens = self.spatio_temporal_encoder(spatial_tokens, memory_bus=self.memory_bus, pos_2d=self.pos_2d, pos_1d=self.pos_1d) # memory_bus = B, T, C
 
         target = self.rescale(memory_bus, spatial_tokens)
         target = target.permute(0, 2, 3, 1).contiguous()
@@ -265,10 +268,10 @@ class VideoModel(SegmentationNetwork):
         weights_list = []
         classification_target_list = []
         for i in range(self.video_length):
-            #encoded = spatial_tokens[i]
-            modulation_token = self.modulation_tokens[i]
+            encoded = spatial_tokens[i]
+            #modulation_token = self.modulation_tokens[i]
 
-            weights = self.modulation(memory_bus=memory_bus, modulation_embedding=modulation_token) # B, T, C
+            weights, encoded = self.modulation(memory_bus=memory_bus, spatial_tokens=encoded, pos_1d=self.pos_1d, pos_2d=self.pos_2d) # B, T, C
 
             #print(F.softmax(weights.mean(-1), dim=-1))
             #print(i)
@@ -297,7 +300,7 @@ class VideoModel(SegmentationNetwork):
         #spatial_tokens = torch.stack(encoded_list, dim=0).mean(0)
         #spatial_tokens = spatial_tokens.permute(0, 2, 3, 1).contiguous()
         #spatial_tokens = spatial_tokens.view(B, H * W, C)
-        slots = self.transformerDecoder(spatial_tokens=target) # B, M, C 
+        slots = self.transformerDecoder(object_tokens=self.object_tokens, spatial_tokens=target, pos_2d=self.pos_2d) # B, M, C 
         slots = slots.repeat(T, 1, 1)
 
         output_feature_map = torch.stack(out_list, dim=0)

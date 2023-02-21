@@ -12,6 +12,9 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
+import sys
+import psutil
+import os
 import numpy as np
 from batchgenerators.augmentations.utils import pad_nd_image
 from nnunet.utilities.random_stuff import no_op
@@ -700,6 +703,7 @@ class SegmentationNetwork(NeuralNetwork):
             aggregated_results = np.zeros([self.num_classes] + list(data.shape[1:]), dtype=np.float32)
             aggregated_nb_of_predictions = np.zeros([self.num_classes] + list(data.shape[1:]), dtype=np.float32)
 
+
         for x in steps[0]:
             lb_x = x
             ub_x = x + patch_size[0]
@@ -811,6 +815,7 @@ class SegmentationNetwork(NeuralNetwork):
                                           get_flops = False) -> Tuple[np.ndarray, np.ndarray]:
         if all_in_gpu:
             raise NotImplementedError
+        
 
         assert len(x.shape) == 4, "data must be c, x, y, z"
 
@@ -833,7 +838,6 @@ class SegmentationNetwork(NeuralNetwork):
             if s == 0:
                 out_flop = flop_list
                 out_inference = inference_time
-
 
             predicted_segmentation.append(pred_seg[None])
             softmax_pred.append(softmax_pres[None])

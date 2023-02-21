@@ -5,6 +5,8 @@
 # Written by Ze Liu
 # --------------------------------------------------------
 
+import psutil
+import os
 from nnunet.analysis import flop_count_operators
 import matplotlib
 from copy import copy
@@ -435,32 +437,13 @@ class MTLmodel(SegmentationNetwork):
             else:
                 x_encoded = self.bottleneck(x_encoded)
             x_encoded = self.extra_bottleneck_block_2(x_encoded)
-            
-            if self.separability:
-                separability = self.get_separability(x_encoded)
-            if self.classification:
-                #classification_out = self.reduce(x_encoded)
-                classification_out = self.classification_conv(x_encoded)
-                classification_out = torch.flatten(classification_out, start_dim=1)
-                classification_out = self.classification_net(classification_out)
-            
-            x_bottleneck = x_encoded
-            if self.reconstruction:
-                reconstructed = self.reconstruction(x_bottleneck)
 
             seg = self.decoder(x_encoded, encoder_skip_connections)
-
-            if self.affinity:
-                aff = self.affinity_decoder(x_encoded)
-                seg_aff = self.SegAffinityComputer(seg[0])
             
             if not self.do_ds:
                 seg = seg[0]
-                if self.reconstruction:
-                    reconstructed = reconstructed[0]
 
-            out = {'pred': seg, 
-                    'reconstructed': reconstructed}
+            out = {'pred': seg}
 
             return out
     
@@ -806,7 +789,7 @@ class MTLmodel(SegmentationNetwork):
     
 
     def _internal_maybe_mirror_and_pred_2D(self, x: Union[np.ndarray, torch.tensor], mirror_axes: tuple,
-                                            get_time_stats,
+                                            get_time_stats=False,
                                            do_mirroring: bool = True,
                                            mult: np.ndarray or torch.tensor = None):
         # if cuda available:
@@ -847,7 +830,6 @@ class MTLmodel(SegmentationNetwork):
         else:
             out_flop = inference_time = None
 
-
         for m in range(mirror_idx):
             if m == 0:
                 pred = self.inference_apply_nonlin(self(x)['pred'])
@@ -864,6 +846,8 @@ class MTLmodel(SegmentationNetwork):
             if m == 3 and (0 in mirror_axes) and (1 in mirror_axes):
                 pred = self.inference_apply_nonlin(self(torch.flip(x, (3, 2)))['pred'])
                 result_torch += 1 / num_results * torch.flip(pred, (3, 2))
+            
+            del pred
 
         if mult is not None:
             result_torch[:, :] *= mult
