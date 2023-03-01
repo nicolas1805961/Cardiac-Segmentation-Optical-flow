@@ -50,6 +50,8 @@ def main():
                                            "cross-validation. Running this script requires all models to have been run "
                                            "already. This script will summarize the results of the five folds of all "
                                            "models in one json each for easy interpretability")
+    parser.add_argument("-b", '--base_folder', type=str, required=True, 
+                        help='Base folder where to find folds')
 
     parser.add_argument("-m", '--models', nargs="+", required=False, default=['2d', '3d_lowres', '3d_fullres',
                                                                               '3d_cascade_fullres'])
@@ -78,6 +80,7 @@ def main():
     tr = args.tr
     trc = args.ctr
     pl = args.pl
+    base_folder = args.base_folder
     disable_ensembling = args.disable_ensembling
     disable_postprocessing = args.disable_postprocessing
     folds = tuple(int(i) for i in args.folds)
@@ -103,7 +106,8 @@ def main():
                 task_name = find_task_name(get_output_folder_name(m), t)
                 id_task_mapping[t] = task_name
 
-            output_folder = get_output_folder_name(m, id_task_mapping[t], trainer, pl)
+            output_folder = base_folder
+            #output_folder = get_output_folder_name(m, id_task_mapping[t], trainer, pl)
             if not isdir(output_folder):
                 raise RuntimeError("Output folder for model %s is missing, expected: %s" % (m, output_folder))
 
@@ -214,13 +218,13 @@ def main():
                                    id_task_mapping[t] + "\n"
                 print(predict_str)
 
-        summary_folder = join(network_training_output_dir, "ensembles", id_task_mapping[t])
-        maybe_mkdir_p(summary_folder)
-        with open(join(summary_folder, "prediction_commands.txt"), 'w') as f:
+        #summary_folder = join(network_training_output_dir, "ensembles", id_task_mapping[t])
+        #maybe_mkdir_p(summary_folder)
+        with open(join(output_folder, "prediction_commands.txt"), 'w') as f:
             f.write(predict_str)
 
         num_classes = len([i for i in all_results[best_model].keys() if i != 'mean' and i != '0'])
-        with open(join(summary_folder, "summary.csv"), 'w') as f:
+        with open(join(output_folder, "summary.csv"), 'w') as f:
             f.write("model")
             for c in range(1, num_classes + 1):
                 f.write(",class%d" % c)

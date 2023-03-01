@@ -300,8 +300,15 @@ class VideoModel(SegmentationNetwork):
         #spatial_tokens = torch.stack(encoded_list, dim=0).mean(0)
         #spatial_tokens = spatial_tokens.permute(0, 2, 3, 1).contiguous()
         #spatial_tokens = spatial_tokens.view(B, H * W, C)
-        slots = self.transformerDecoder(object_tokens=self.object_tokens, spatial_tokens=target, pos_2d=self.pos_2d) # B, M, C 
+
+        slots = self.transformerDecoder(object_tokens=self.object_tokens, spatial_tokens=target, memory_bus=memory_bus, pos_2d=self.pos_2d, pos_1d=self.pos_1d) # B, M, C 
+        #slots = self.transformerDecoder(object_tokens=self.object_tokens, spatial_tokens=target, pos_2d=self.pos_2d) # B, M, C 
         slots = slots.repeat(T, 1, 1)
+
+        #dots = dots[:, :, :(H*W)]
+        #dots = dots.view(B, self.nb_memory_bus, H, W)
+        #target = target.permute(0, 2, 1).contiguous()
+        #target = target.view(B, C, H, W).mean(1)
 
         output_feature_map = torch.stack(out_list, dim=0)
 
@@ -309,13 +316,15 @@ class VideoModel(SegmentationNetwork):
         #memory_bus = memory_bus.view(B, T, self.nb_memory_bus, C)
         #memory_bus = memory_bus.permute(1, 0, 2, 3).contiguous().view(T * B, self.nb_memory_bus, C)
         output_feature_map = self.dot(slots, output_feature_map)
-            
+        
         out['predictions'] = output_feature_map
         out['attention_weights'] = None
         out['sampling_points'] = None
         out['theta_coords'] = None
         out['classification_list'] = None
         out['weights_list'] = (weights_list, classification_target_list)
+        out['dots'] = None
+        out['target'] = None
             
         return out
     

@@ -54,7 +54,7 @@ class Evaluator:
         "Hausdorff Distance",
         "Hausdorff Distance 95",
         #"Avg. Surface Distance",
-        #"Avg. Symmetric Surface Distance"
+        "Avg. Symmetric Surface Distance"
     ]
 
     def __init__(self,

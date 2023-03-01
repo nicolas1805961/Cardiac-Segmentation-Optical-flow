@@ -26,7 +26,7 @@ adversarial_loss_weight: 1.0
 v1: True
 
 log_images: True
-transformer_bottleneck: False
+transformer_bottleneck: True
 device: 'cuda:0'
 simple_decoder: False
 deep_supervision: True

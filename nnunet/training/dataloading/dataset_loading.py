@@ -1542,6 +1542,13 @@ class DataLoaderVideoUnlabeled(SlimDataLoaderBase):
     def get_do_oversample(self, batch_idx):
         return not batch_idx < round(self.batch_size * (1 - self.oversample_foreground_percent))
     
+    def select_deep_supervision(self, x):
+        if self.deep_supervision:
+            return x[0]
+        else:
+            return x
+    
+    
     def get_slice_nb(self, random_slice, case_all_data):
         if random_slice == 0:
             middle_slice = 1

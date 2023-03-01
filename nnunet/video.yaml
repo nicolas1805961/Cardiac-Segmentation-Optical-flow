@@ -3,15 +3,14 @@ separability: False
 separability_loss_weight: 1.0
 convolutional_patch_embedding: True
 
-selection_loss_weight: 0.1
+selection_loss_weight: 0.0
 step: 1
-fine_tuning: False
 force_one_label: True
 feature_extractor: False
 video_length: 1
 crop: True
 nb_memory_bus: 4 # 4
-cropper_weights_folder_path: 'ACDC_output\only_sfb'
+cropper_weights_folder_path: 'ACDC_output\Baseline\fold_0'
 video_weights_folder_path: 'pretrained'
 crop_size: 128
 nb_layers: 2

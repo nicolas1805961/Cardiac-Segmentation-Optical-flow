@@ -36,6 +36,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 import cv2 as cv
 import sys
 from matplotlib import cm
+import matplotlib.pylab as pl
 import matplotlib.pyplot as plt
 from copy import copy
 from time import time, sleep, strftime
@@ -112,6 +113,8 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
         self.ds_loss_weights = None
         self.use_progress_bar=True
         self.one_vs_all = True
+
+        self.fine_tuning = True if self.video_length > 1 else False
 
         self.deep_supervision = self.config['deep_supervision']
 
@@ -365,7 +368,7 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
         #in_shape_mask = in_shape_mask.view(self.config['batch_size'], self.video_length, 1, self.crop_size, self.crop_size)
 
         self.network = build_video_model(self.config, conv_layer=conv_layer, conv_layer_1d=conv_layer_1d, norm_2d=norm_2d, norm_1d=norm_1d, log_function=self.print_to_log_file, image_size=self.crop_size, window_size=8)
-        if self.config['fine_tuning']:
+        if self.fine_tuning:
             self.load_video_weights(self.network)
         model_input_data = torch.randn(self.video_length, self.config['batch_size'], 1, self.crop_size, self.crop_size)
         models['temporal_model'] = (self.network, model_input_data)
@@ -451,7 +454,7 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
             return gradient_image, data
 
     
-    def start_online_evaluation_video(self, pred, x, target, video_cropped_input=None, gradient_image=None, gradient_x=None, theta_coords=None, attention_weights=None, sampling_locations=None, coords=None, coords_da=None):
+    def start_online_evaluation_video(self, pred, x, target, dots=None, target_feature_map=None, video_cropped_input=None, gradient_image=None, gradient_x=None, theta_coords=None, attention_weights=None, sampling_locations=None, coords=None, coords_da=None):
         """attention_weights: T, -1
             sampling_locations: T, -1, 2
             video_cropped_input: T, 1, H, W
@@ -477,9 +480,12 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
 
                     current_pred = torch.argmax(output_softmax[b], dim=0)
                     current_target = target[b, 0]
-                    self.vis.set_up_image_seg(seg_dice=seg_dice[b].mean(), gt=current_target, pred=current_pred, x=current_x)
-
-                    self.vis.set_up_image_gradient(gradient=gradient_image, x=gradient_x, gradient_coords=coords)
+                    self.vis.set_up_image_seg_best(seg_dice=seg_dice[b].mean(), gt=current_target, pred=current_pred, x=current_x)
+                    self.vis.set_up_image_seg_worst(seg_dice=seg_dice[b].mean(), gt=current_target, pred=current_pred, x=current_x)
+                    self.vis.set_up_image_best_gradient(seg_dice=seg_dice[b].mean(), gradient=gradient_image, x=gradient_x, gradient_coords=coords)
+                    self.vis.set_up_image_worst_gradient(seg_dice=seg_dice[b].mean(), gradient=gradient_image, x=gradient_x, gradient_coords=coords)
+                    #self.vis.set_up_image_slot(seg_dice=seg_dice[b].mean(), dot=dots[b], x=video_cropped_input[:, b, 0])
+                    #self.vis.set_up_image_target(seg_dice=seg_dice[b].mean(), target=target_feature_map[b], x=video_cropped_input[:, b, 0])
 
                 if self.epoch_iter_nb == self.num_val_batches_per_epoch - 1 and attention_weights is not None:
                     self.vis.set_up_image_deformable_attention(locations=sampling_locations, weights=attention_weights, x=video_cropped_input[:, 0], coords=coords_da, theta_coords=theta_coords)
@@ -515,18 +521,19 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
         self.print_to_log_file("(interpret this as an estimate for the Dice of the different classes. This is not exact.)")
         self.print_to_log_file("Average global foreground Dice:", [np.round(i, 4) for i in global_dc_per_class_seg])
 
-        if '029' in self.dataset_directory:
-            class_dice = {'LV': global_dc_per_class_seg[0], 'MYO': global_dc_per_class_seg[1]}
-        else:
-            class_dice = {'RV': global_dc_per_class_seg[0], 'MYO': global_dc_per_class_seg[1], 'LV': global_dc_per_class_seg[2]}
+        class_dice = {'RV': global_dc_per_class_seg[0], 'MYO': global_dc_per_class_seg[1], 'LV': global_dc_per_class_seg[2]}
         overfit_data = {'Train': torch.tensor(self.train_loss).mean().item(), 'Val': torch.tensor(self.val_loss).mean().item()}
         self.writer.add_scalars('Epoch/Train_vs_val_loss', overfit_data, self.epoch)
         self.writer.add_scalars('Epoch/Class dice', class_dice, self.epoch)            
 
         if self.log_images:
             cmap, norm = self.vis.get_custom_colormap()
-            self.vis.log_seg_images(colormap=cmap, norm=norm, epoch=self.epoch)
-            self.vis.log_gradient_images(colormap=cm.plasma, epoch=self.epoch)
+            self.vis.log_best_seg_images(colormap=cmap, norm=norm, epoch=self.epoch)
+            self.vis.log_worst_seg_images(colormap=cmap, norm=norm, epoch=self.epoch)
+            self.vis.log_best_gradient_images(colormap=cm.plasma, epoch=self.epoch)
+            self.vis.log_worst_gradient_images(colormap=cm.plasma, epoch=self.epoch)
+            #self.vis.log_slot_images(colormap=cmap, epoch=self.epoch)
+            #self.vis.log_target_images(colormap=cm.plasma, epoch=self.epoch)
                 #self.vis.log_deformable_attention_images(colormap=cm.plasma, epoch=self.epoch)
             #    self.vis.log_theta_images(epoch=self.epoch, area_size=self.area_size)
 
@@ -592,7 +599,7 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
 
         return sampling_locations, attention_weights, data, theta_coords
     
-    def run_online_evaluation_video(self, data, target, pred, labeled_binary, cropped_input, cropped_target, attention_weights=None, sampling_locations=None, theta_coords=None):
+    def run_online_evaluation_video(self, data, target, pred, labeled_binary, cropped_input, cropped_target, dots=None, target_feature_map=None, attention_weights=None, sampling_locations=None, theta_coords=None):
         """
         due to deep supervision the return value and the reference are now lists of tensors. We only need the full
         resolution output because this is what we are interested in in the end. The others are ignored
@@ -824,6 +831,7 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
 
             #if not do_backprop:
             #    matplotlib.use('QtAgg')
+            #    print(padding_need)
             #    fig, ax = plt.subplots(1, self.video_length)
             #    for i in range(self.video_length):
             #        ax[i].imshow(x[i, 0, 0].cpu(), cmap='gray')
@@ -844,8 +852,7 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
 
         else:
             self.optimizer.zero_grad()
-            network_input = {'labeled_data': data_list}
-            output = self.network(network_input)
+            output = self.network(data)
 
         if self.force_one_label:
             self.compute_losses_video(output=output, target=target, labeled_binary=labeled_binary, pseudo_labels=None)
@@ -889,7 +896,15 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
 
         if run_online_evaluation and self.log_images:
             cropped_target, _ = self.processor.crop_and_pad(data_volume=target.transpose(0, 1), mean_centroids=mean_centroids, video_padding=video_padding)
-            self.run_online_evaluation_video(data=data, target=target, pred=output, labeled_binary=labeled_binary, cropped_input=x, attention_weights=cropped_output['attention_weights'], sampling_locations=cropped_output['sampling_points'], theta_coords=cropped_output['theta_coords'], cropped_target=cropped_target)
+            self.run_online_evaluation_video(data=data, 
+                                             target=target, 
+                                             pred=output, 
+                                             labeled_binary=labeled_binary, 
+                                             cropped_input=x, 
+                                             attention_weights=cropped_output['attention_weights'], 
+                                             sampling_locations=cropped_output['sampling_points'], 
+                                             theta_coords=cropped_output['theta_coords'], 
+                                             cropped_target=cropped_target)
         del data_list, target_list
 
         if do_backprop:
@@ -1299,7 +1314,7 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
 
             # train one epoch
             self.network.train()
-            if self.config['fine_tuning']:
+            if self.fine_tuning:
                 self.freeze_batchnorm_layers(self.network)
 
             if self.use_progress_bar:
@@ -1334,7 +1349,7 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
 
                     if self.also_val_in_tr_mode:
                         self.network.train()
-                        if self.config['fine_tuning']:
+                        if self.fine_tuning:
                             self.freeze_batchnorm_layers(self.network)
                         # validation with train=True
                         val_losses = []

@@ -11,7 +11,26 @@ from cv2 import rectangle
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 from matplotlib.figure import Figure
 import matplotlib
+import matplotlib.pylab as pl
+import matplotlib.pyplot as plt
 
+
+def find_elbow(data, theta):
+
+    # make rotation matrix
+    co = np.cos(theta)
+    si = np.sin(theta)
+    rotation_matrix = np.array(((co, -si), (si, co)))
+
+    # rotate data vector
+    rotated_vector = data.dot(rotation_matrix)
+
+    # return index of elbow
+    return np.where(rotated_vector == rotated_vector[:, 1].min())[0][0]
+
+def get_data_radiant(data):
+  return np.arctan2(data[:, 1].max() - data[:, 1].min(), 
+                    data[:, 0].max() - data[:, 0].min())
 
 class Visualizer(object):
     def __init__(self, 
@@ -44,14 +63,18 @@ class Visualizer(object):
         log_images_nb = 8
         eval_images = {'rec': None,
                         'df': None,
-                        'seg': None}
+                        'best_seg': None,
+                        'worst_seg': None}
         
         if self.unlabeled and self.adversarial_loss:
             eval_images['confidence'] = None
         if self.affinity:
             eval_images['affinity'] = None
         #eval_images['deformable_attention'] = None
-        eval_images['gradient'] = None
+        eval_images['best_gradient'] = None
+        eval_images['worst_gradient'] = None
+        eval_images['slot'] = None
+        eval_images['target'] = None
         if self.middle:
             eval_images['sim'] = None
             eval_images['weights'] = None
@@ -102,12 +125,20 @@ class Visualizer(object):
                     score = -1
                     data.append(payload)
                     scores.append(score)
-            elif key == 'seg':
+            elif key == 'best_seg':
                 for i in range(log_images_nb):
                     payload = {'input': None,
                                 'pred': None,
                                 'gt': None}
                     score = -1
+                    data.append(payload)
+                    scores.append(score)
+            elif key == 'worst_seg':
+                for i in range(log_images_nb):
+                    payload = {'input': None,
+                                'pred': None,
+                                'gt': None}
+                    score = 100
                     data.append(payload)
                     scores.append(score)
             elif key == 'confidence':
@@ -180,10 +211,29 @@ class Visualizer(object):
                 score = -1
                 data.append(payload)
                 scores.append(score)
-            elif key == 'gradient':
+            elif key == 'best_gradient':
                 payload = {'input': None,
                             'gradient': None,
                             'coords': None}
+                score = -1
+                data.append(payload)
+                scores.append(score)
+            elif key == 'worst_gradient':
+                payload = {'input': None,
+                            'gradient': None,
+                            'coords': None}
+                score = 100
+                data.append(payload)
+                scores.append(score)
+            elif key == 'slot':
+                payload = {'input': None,
+                            'dot': None}
+                score = -1
+                data.append(payload)
+                scores.append(score)
+            elif key == 'target':
+                payload = {'input': None,
+                            'target': None}
                 score = -1
                 data.append(payload)
                 scores.append(score)
@@ -219,6 +269,18 @@ class Visualizer(object):
         bounds = np.linspace(0, 4, 5)
         norm = mpl.colors.BoundaryNorm(bounds, 4)
         return newcmp, norm
+
+    def get_custom_colormap_alpha(self, color):
+        color = color.reshape(1, 3)
+        a = np.linspace(0, 1, 256)
+        z = np.zeros((1, 4))
+        z[0, -1] = 1.0
+        a = z * a[:, None]
+        a[:, :-1] = 1.0
+        color = np.concatenate([color, np.ones((1, 1))], axis=1)
+        color = color * a
+        newcmp = ListedColormap(color)
+        return newcmp
     
     def get_weights_ready(self, w, downscale):
         w = torch.mean(w, dim=1, keepdim=True)
@@ -461,41 +523,167 @@ class Visualizer(object):
         self.writer.add_images(os.path.join('Directional_field', 'ground_truth_directional_field').replace('\\', '/'), gt_df_list, epoch, dataformats='NHWC')
         self.writer.add_images(os.path.join('Directional_field', 'predicted_directional_field').replace('\\', '/'), pred_df_list, epoch, dataformats='NHWC')
 
-    def log_seg_images(self, colormap, norm, epoch):
-        input_list = [x['input'] for x in self.eval_images['seg'][0]]
+    def log_best_seg_images(self, colormap, norm, epoch):
+        input_list = [x['input'] for x in self.eval_images['best_seg'][0]]
         input_list = [self.get_images_ready_for_display(x, colormap=None) for x in input_list]
         input_list = np.stack(input_list, axis=0)
 
-        gt_list = [x['gt'] for x in self.eval_images['seg'][0]]
+        gt_list = [x['gt'] for x in self.eval_images['best_seg'][0]]
         gt_list = [self.get_seg_images_ready_for_display(x, colormap, norm) for x in gt_list]
         gt_list = np.stack(gt_list, axis=0)
 
-        pred_list = [x['pred'] for x in self.eval_images['seg'][0]]
+        pred_list = [x['pred'] for x in self.eval_images['best_seg'][0]]
         pred_list = [self.get_seg_images_ready_for_display(x, colormap, norm) for x in pred_list]
         pred_list = np.stack(pred_list, axis=0)
 
-        self.writer.add_images(os.path.join('Segmentation', 'input').replace('\\', '/'), input_list, epoch, dataformats='NHWC')
-        self.writer.add_images(os.path.join('Segmentation', 'ground_truth').replace('\\', '/'), gt_list, epoch, dataformats='NHWC')
-        self.writer.add_images(os.path.join('Segmentation', 'prediction').replace('\\', '/'), pred_list, epoch, dataformats='NHWC')
+        self.writer.add_images(os.path.join('Best segmentations', 'input').replace('\\', '/'), input_list, epoch, dataformats='NHWC')
+        self.writer.add_images(os.path.join('Best segmentations', 'ground_truth').replace('\\', '/'), gt_list, epoch, dataformats='NHWC')
+        self.writer.add_images(os.path.join('Best segmentations', 'prediction').replace('\\', '/'), pred_list, epoch, dataformats='NHWC')
     
-    def log_gradient_images(self, colormap, epoch):
-        t, x, y = self.eval_images['gradient'][0, 0]['coords']
-        input_video = self.eval_images['gradient'][0, 0]['input']
-        gradient_image = self.eval_images['gradient'][0, 0]['gradient']
+    def log_worst_seg_images(self, colormap, norm, epoch):
+        input_list = [x['input'] for x in self.eval_images['worst_seg'][0]]
+        input_list = [self.get_images_ready_for_display(x, colormap=None) for x in input_list]
+        input_list = np.stack(input_list, axis=0)
+
+        gt_list = [x['gt'] for x in self.eval_images['worst_seg'][0]]
+        gt_list = [self.get_seg_images_ready_for_display(x, colormap, norm) for x in gt_list]
+        gt_list = np.stack(gt_list, axis=0)
+
+        pred_list = [x['pred'] for x in self.eval_images['worst_seg'][0]]
+        pred_list = [self.get_seg_images_ready_for_display(x, colormap, norm) for x in pred_list]
+        pred_list = np.stack(pred_list, axis=0)
+
+        self.writer.add_images(os.path.join('Worst segmentations', 'input').replace('\\', '/'), input_list, epoch, dataformats='NHWC')
+        self.writer.add_images(os.path.join('Worst segmentations', 'ground_truth').replace('\\', '/'), gt_list, epoch, dataformats='NHWC')
+        self.writer.add_images(os.path.join('Worst segmentations', 'prediction').replace('\\', '/'), pred_list, epoch, dataformats='NHWC')
+    
+    def log_best_gradient_images(self, colormap, epoch):
+        t, x, y = self.eval_images['best_gradient'][0, 0]['coords']
+        input_video = self.eval_images['best_gradient'][0, 0]['input']
+        gradient_image = self.eval_images['best_gradient'][0, 0]['gradient']
+
+        data = np.sort(gradient_image.reshape(-1))
+        vmax = data[-1]
+        vmin = data[0]
+        data = np.stack([np.arange(len(data)), data], axis=-1)
+        elbow_index = find_elbow(data, get_data_radiant(data))
+        p = data[elbow_index, 1]
 
         blended_list = []
         for i in range(len(input_video)):
             frame = self.get_images_ready_for_display(input_video[i], colormap=None)
             frame = np.tile(frame, (1, 1, 3))
-            current_gradient_image = self.get_images_ready_for_display(gradient_image[i], colormap=colormap)
-            blended = cv.addWeighted(frame, 0.5, current_gradient_image, 0.5, 0.0)
+
+            mask = (gradient_image[i] < p).astype(np.uint8)
+            filtered_gradient_image = (1 - mask) * gradient_image[i]
+
+            current_gradient_image = self.get_images_ready_for_display(filtered_gradient_image, colormap=colormap, vmin=vmin, vmax=vmax)
+            mask = mask[:, :, None]
+            blended = mask * frame + (1 - mask) * current_gradient_image
+            #blended = cv.addWeighted(frame, 0.5, current_gradient_image, 0.5, 0.0)
             if i == t:
                 blended = cv.line(blended, (x - 2, y - 2), (x + 2, y + 2), color=(0, 255, 0), thickness=1, lineType=cv.LINE_AA) # R, G, B
                 blended = cv.line(blended, (x - 2, y + 2), (x + 2, y - 2), color=(0, 255, 0), thickness=1, lineType=cv.LINE_AA)
             blended_list.append(blended)
         blended_list = np.stack(blended_list, axis=0)
 
-        self.writer.add_images(os.path.join('Gradient image', 'gradient_image').replace('\\', '/'), blended_list, epoch, dataformats='NHWC')
+        self.writer.add_images(os.path.join('Best gradient image', 'gradient_image').replace('\\', '/'), blended_list, epoch, dataformats='NHWC')
+
+    
+    def log_worst_gradient_images(self, colormap, epoch):
+        t, x, y = self.eval_images['worst_gradient'][0, 0]['coords']
+        input_video = self.eval_images['worst_gradient'][0, 0]['input']
+        gradient_image = self.eval_images['worst_gradient'][0, 0]['gradient']
+
+        data = np.sort(gradient_image.reshape(-1))
+        vmax = data[-1]
+        vmin = data[0]
+        data = np.stack([np.arange(len(data)), data], axis=-1)
+        elbow_index = find_elbow(data, get_data_radiant(data))
+        p = data[elbow_index, 1]
+
+        blended_list = []
+        for i in range(len(input_video)):
+            frame = self.get_images_ready_for_display(input_video[i], colormap=None)
+            frame = np.tile(frame, (1, 1, 3))
+
+            mask = (gradient_image[i] < p).astype(np.uint8)
+            filtered_gradient_image = (1 - mask) * gradient_image[i]
+
+            current_gradient_image = self.get_images_ready_for_display(filtered_gradient_image, colormap=colormap, vmin=vmin, vmax=vmax)
+            mask = mask[:, :, None]
+            blended = mask * frame + (1 - mask) * current_gradient_image
+            #blended = cv.addWeighted(frame, 0.5, current_gradient_image, 0.5, 0.0)
+            if i == t:
+                blended = cv.line(blended, (x - 2, y - 2), (x + 2, y + 2), color=(0, 255, 0), thickness=1, lineType=cv.LINE_AA) # R, G, B
+                blended = cv.line(blended, (x - 2, y + 2), (x + 2, y - 2), color=(0, 255, 0), thickness=1, lineType=cv.LINE_AA)
+            blended_list.append(blended)
+        blended_list = np.stack(blended_list, axis=0)
+
+        self.writer.add_images(os.path.join('Worst gradient image', 'gradient_image').replace('\\', '/'), blended_list, epoch, dataformats='NHWC')
+
+
+    def log_slot_images(self, colormap, epoch):
+        input_video = self.eval_images['slot'][0, 0]['input']
+        dot = self.eval_images['slot'][0, 0]['dot']
+
+        #matplotlib.use('QtAgg')
+        #fig, ax = plt.subplots(1, 1)
+        #ax.imshow(dot[0], cmap='plasma')
+        #plt.show()
+        
+        dot_list = []
+        for i in range(4):
+            current_dot = cv.resize(dot[i], (self.crop_size, self.crop_size), interpolation=cv.INTER_LINEAR)
+            dot_list.append(current_dot)
+        dot = np.stack(dot_list, axis=0)
+        dot = dot[:, :, :, None]
+
+        #np.testing.assert_allclose(dot.sum(0), 1.0)
+
+        #rng = np.random.RandomState(42)
+        #idx = rng.randint(0, colormap.N, size=(4,))
+        colors = np.array(colormap.colors)[:, :-1]
+        #colors = colors[idx]
+        colors = colors.reshape(4, 1, 1, 3)
+
+        dot = dot * colors
+        dot = dot.sum(0)
+        dot = self.get_images_ready_for_display(dot, colormap=None)
+
+        frame_list = []
+        for i in range(len(input_video)):
+            frame = self.get_images_ready_for_display(input_video[i], colormap=None)
+            frame = np.tile(frame, (1, 1, 3))
+            frame_list.append(frame)
+        frame_list = np.stack(frame_list, axis=0)
+
+        self.writer.add_images(os.path.join('Slot attention', 'video').replace('\\', '/'), frame_list, epoch, dataformats='NHWC')
+        self.writer.add_images(os.path.join('Slot attention', 'slot_attention').replace('\\', '/'), dot, epoch, dataformats='HWC')
+    
+
+    def log_target_images(self, colormap, epoch):
+        input_video = self.eval_images['target'][0, 0]['input']
+        target = self.eval_images['target'][0, 0]['target']
+
+        #matplotlib.use('QtAgg')
+        #fig, ax = plt.subplots(1, 1)
+        #ax.imshow(dot[0], cmap='plasma')
+        #plt.show()
+        
+        target = cv.resize(target, (self.crop_size, self.crop_size), interpolation=cv.INTER_LINEAR)
+        target = self.get_images_ready_for_display(target, colormap=colormap)
+
+        frame_list = []
+        for i in range(len(input_video)):
+            frame = self.get_images_ready_for_display(input_video[i], colormap=None)
+            frame = np.tile(frame, (1, 1, 3))
+            frame_list.append(frame)
+        frame_list = np.stack(frame_list, axis=0)
+
+        self.writer.add_images(os.path.join('Target feature map', 'video').replace('\\', '/'), frame_list, epoch, dataformats='NHWC')
+        self.writer.add_images(os.path.join('Target feature map', 'target').replace('\\', '/'), target, epoch, dataformats='HWC')
+
 
     def rescale(self, sampling_locations, theta_coords, coords):
         t, b, h, y, x = coords
@@ -761,29 +949,83 @@ class Visualizer(object):
         self.writer.add_images(os.path.join('Confidence', 'confidence_map').replace('\\', '/'), confidence_list, epoch, dataformats='NHWC')
         self.writer.add_images(os.path.join('Confidence', 'prediction').replace('\\', '/'), pred_list, epoch, dataformats='NHWC')
 
-    def set_up_image_seg(self, seg_dice, gt, pred, x):
+    def set_up_image_seg_best(self, seg_dice, gt, pred, x):
         seg_dice = seg_dice.cpu().numpy()
         gt = gt.cpu().numpy()
         pred = pred.cpu().numpy()
         x = x.cpu().numpy()
 
-        if self.eval_images['seg'][1, 0] <= seg_dice:
+        if self.eval_images['best_seg'][1, 0] <= seg_dice:
 
-            self.eval_images['seg'][0, 0]['gt'] = gt.astype(np.float32)
-            self.eval_images['seg'][0, 0]['pred'] = pred.astype(np.float32)
-            self.eval_images['seg'][0, 0]['input'] = x.astype(np.float32)
-            self.eval_images['seg'][1, 0] = seg_dice
+            self.eval_images['best_seg'][0, 0]['gt'] = gt.astype(np.float32)
+            self.eval_images['best_seg'][0, 0]['pred'] = pred.astype(np.float32)
+            self.eval_images['best_seg'][0, 0]['input'] = x.astype(np.float32)
+            self.eval_images['best_seg'][1, 0] = seg_dice
 
-            sorted_indices = self.eval_images['seg'][1, :].argsort()
-            self.eval_images['seg'] = self.eval_images['seg'][:, sorted_indices]
+            sorted_indices = self.eval_images['best_seg'][1, :].argsort()
+            self.eval_images['best_seg'] = self.eval_images['best_seg'][:, sorted_indices]
     
-    def set_up_image_gradient(self, gradient, x, gradient_coords):
+    def set_up_image_seg_worst(self, seg_dice, gt, pred, x):
+        seg_dice = seg_dice.cpu().numpy()
+        gt = gt.cpu().numpy()
+        pred = pred.cpu().numpy()
+        x = x.cpu().numpy()
+
+        if self.eval_images['worst_seg'][1, -1] > seg_dice:
+
+            self.eval_images['worst_seg'][0, -1]['gt'] = gt.astype(np.float32)
+            self.eval_images['worst_seg'][0, -1]['pred'] = pred.astype(np.float32)
+            self.eval_images['worst_seg'][0, -1]['input'] = x.astype(np.float32)
+            self.eval_images['worst_seg'][1, -1] = seg_dice
+
+            sorted_indices = self.eval_images['worst_seg'][1, :].argsort()
+            self.eval_images['worst_seg'] = self.eval_images['worst_seg'][:, sorted_indices]
+    
+    def set_up_image_best_gradient(self, seg_dice, gradient, x, gradient_coords):
+        seg_dice = seg_dice.cpu().numpy()
         gradient = gradient.cpu().numpy()
         x = x.cpu().numpy()
 
-        self.eval_images['gradient'][0, 0]['coords'] = gradient_coords
-        self.eval_images['gradient'][0, 0]['gradient'] = gradient.astype(np.float32)
-        self.eval_images['gradient'][0, 0]['input'] = x.astype(np.float32)
+        if self.eval_images['best_gradient'][1, 0] <= seg_dice:
+
+            self.eval_images['best_gradient'][0, 0]['coords'] = gradient_coords
+            self.eval_images['best_gradient'][0, 0]['gradient'] = gradient.astype(np.float32)
+            self.eval_images['best_gradient'][0, 0]['input'] = x.astype(np.float32)
+            self.eval_images['best_gradient'][1, 0] = seg_dice
+    
+    def set_up_image_worst_gradient(self, seg_dice, gradient, x, gradient_coords):
+        seg_dice = seg_dice.cpu().numpy()
+        gradient = gradient.cpu().numpy()
+        x = x.cpu().numpy()
+
+        if self.eval_images['worst_gradient'][1, 0] > seg_dice:
+
+            self.eval_images['worst_gradient'][0, 0]['coords'] = gradient_coords
+            self.eval_images['worst_gradient'][0, 0]['gradient'] = gradient.astype(np.float32)
+            self.eval_images['worst_gradient'][0, 0]['input'] = x.astype(np.float32)
+            self.eval_images['worst_gradient'][1, -1] = seg_dice
+    
+    def set_up_image_slot(self, seg_dice, dot, x):
+        seg_dice = seg_dice.cpu().numpy()
+        dot = dot.cpu().numpy()
+        x = x.cpu().numpy()
+
+        if self.eval_images['slot'][1, 0] <= seg_dice:
+
+            self.eval_images['slot'][0, 0]['dot'] = dot.astype(np.float32)
+            self.eval_images['slot'][0, 0]['input'] = x.astype(np.float32)
+            self.eval_images['slot'][1, 0] = seg_dice
+    
+    def set_up_image_target(self, seg_dice, target, x):
+        seg_dice = seg_dice.cpu().numpy()
+        target = target.cpu().numpy()
+        x = x.cpu().numpy()
+
+        if self.eval_images['target'][1, 0] <= seg_dice:
+
+            self.eval_images['target'][0, 0]['target'] = target.astype(np.float32)
+            self.eval_images['target'][0, 0]['input'] = x.astype(np.float32)
+            self.eval_images['target'][1, 0] = seg_dice
     
     def set_up_image_deformable_attention(self, locations, weights, x, coords, theta_coords):
         locations = locations.cpu().numpy()

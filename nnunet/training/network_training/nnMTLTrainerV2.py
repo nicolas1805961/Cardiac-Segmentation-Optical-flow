@@ -831,10 +831,8 @@ class nnMTLTrainerV2(nnUNetTrainer):
         self.print_to_log_file("(interpret this as an estimate for the Dice of the different classes. This is not exact.)")
         self.print_to_log_file("Average global foreground Dice:", [np.round(i, 4) for i in global_dc_per_class_seg])
 
-        if '029' in self.dataset_directory:
-            class_dice = {'LV': global_dc_per_class_seg[0], 'MYO': global_dc_per_class_seg[1]}
-        else:
-            class_dice = {'RV': global_dc_per_class_seg[0], 'MYO': global_dc_per_class_seg[1], 'LV': global_dc_per_class_seg[2]}
+
+        class_dice = {'RV': global_dc_per_class_seg[0], 'MYO': global_dc_per_class_seg[1], 'LV': global_dc_per_class_seg[2]}
         overfit_data = {'Train': torch.tensor(self.train_loss).mean().item(), 'Val': torch.tensor(self.val_loss).mean().item()}
         self.writer.add_scalars('Epoch/Train_vs_val_loss', overfit_data, self.epoch)
         self.writer.add_scalars('Epoch/Class dice', class_dice, self.epoch)            
@@ -1807,7 +1805,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
                     test_keys = np.array(all_keys_sorted)[test_idx]
                     splits[-1]['train'] = train_keys
                     splits[-1]['val'] = test_keys
-                elif '029' in self.dataset_directory:
+                elif '029' in self.dataset_directory or '030' in self.dataset_directory:
                     print("Creating new 5-fold cross-validation split...")
                     all_keys_sorted = np.sort(list(self.dataset.keys()))
                     factor = 'manufacturer'
