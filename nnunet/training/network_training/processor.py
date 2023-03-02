@@ -89,17 +89,21 @@ class Processor(object):
         return torch.stack(batch_list, dim=0)
     
     def get_mean_centroid(self, data):
+        B, T, H, W = data.shape
         mean_centroid_list = []
         for b in range(len(data)):
             current_data = data[b]
             current_flattened_data = torch.flatten(current_data, start_dim=1)
             mask = torch.count_nonzero(current_flattened_data, dim=-1) != 0
-            current_data = current_data[mask]
-            coords = masks_to_boxes(current_data)
-            x = coords[:, 0] + ((coords[:, 2] - coords[:, 0]) / 2)
-            y = coords[:, 1] + ((coords[:, 3] - coords[:, 1]) / 2)
-            coords = torch.stack([x, y], dim=-1)
-            mean_centroid = coords.mean(dim=0)
+            if torch.count_nonzero(mask) < T / 2:
+                mean_centroid = torch.tensor([H / 2, W / 2], device=data.device).view(2)
+            else:
+                current_data = current_data[mask]
+                coords = masks_to_boxes(current_data)
+                x = coords[:, 0] + ((coords[:, 2] - coords[:, 0]) / 2)
+                y = coords[:, 1] + ((coords[:, 3] - coords[:, 1]) / 2)
+                coords = torch.stack([x, y], dim=-1)
+                mean_centroid = coords.mean(dim=0)
             mean_centroid_list.append(mean_centroid)
         return torch.stack(mean_centroid_list, dim=0).int()
     

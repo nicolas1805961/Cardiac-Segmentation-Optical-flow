@@ -145,8 +145,8 @@ class VideoModel(SegmentationNetwork):
         nb_blocks = 0 if video_length == 1 else 1
         conv_1d = conv_layer_1d(in_dim=self.d_model, out_dim=self.d_model, kernel_size=3, nb_blocks=nb_blocks, norm=norm_1d, dpr=[0.0] * nb_blocks)
         
-        self.spatio_temporal_encoder = SpatioTemporalTransformer(dim=self.d_model, num_heads=self.bottleneck_heads, num_layers=self.nb_layers, d_ffn=d_ffn, conv_layer_1d=conv_1d)
-        self.modulation = ModulationTransformer(dim=self.d_model, num_heads=self.bottleneck_heads, num_layers=self.nb_layers, d_ffn=d_ffn)
+        self.spatio_temporal_encoder = SpatioTemporalTransformer(dim=self.d_model, num_heads=self.bottleneck_heads, num_layers=self.nb_layers, d_ffn=d_ffn)
+        self.modulation = ModulationTransformer(dim=self.d_model, num_heads=self.bottleneck_heads, num_layers=self.nb_layers, d_ffn=d_ffn, conv_layer_1d=conv_1d)
         self.transformerDecoder = TransformerDecoder(dim=self.d_model, num_layers=self.nb_layers, num_heads=self.bottleneck_heads, d_ffn=d_ffn)
 
         self.final_proj_layer = nn.Conv2d(out_encoder_dims[0], self.d_model, kernel_size=1)
@@ -259,7 +259,7 @@ class VideoModel(SegmentationNetwork):
         spatial_tokens = torch.stack(encoded_list, dim=0)
         T, B, C, H, W = spatial_tokens.shape
 
-        memory_bus, spatial_tokens = self.spatio_temporal_encoder(spatial_tokens, memory_bus=self.memory_bus, pos_2d=self.pos_2d, pos_1d=self.pos_1d) # memory_bus = B, T, C
+        memory_bus, spatial_tokens = self.spatio_temporal_encoder(spatial_tokens, memory_bus=self.memory_bus, pos_2d=self.pos_2d) # memory_bus = B, T, C
 
         target = self.rescale(memory_bus, spatial_tokens)
         target = target.permute(0, 2, 3, 1).contiguous()
@@ -301,12 +301,11 @@ class VideoModel(SegmentationNetwork):
         #spatial_tokens = spatial_tokens.permute(0, 2, 3, 1).contiguous()
         #spatial_tokens = spatial_tokens.view(B, H * W, C)
 
-        slots = self.transformerDecoder(object_tokens=self.object_tokens, spatial_tokens=target, memory_bus=memory_bus, pos_2d=self.pos_2d, pos_1d=self.pos_1d) # B, M, C 
+        slots, attn_weights = self.transformerDecoder(object_tokens=self.object_tokens, spatial_tokens=target, pos_2d=self.pos_2d) # B, M, C 
         #slots = self.transformerDecoder(object_tokens=self.object_tokens, spatial_tokens=target, pos_2d=self.pos_2d) # B, M, C 
         slots = slots.repeat(T, 1, 1)
 
-        #dots = dots[:, :, :(H*W)]
-        #dots = dots.view(B, self.nb_memory_bus, H, W)
+        attn_weights = attn_weights.view(B, self.nb_memory_bus, H, W)
         #target = target.permute(0, 2, 1).contiguous()
         #target = target.view(B, C, H, W).mean(1)
 
@@ -323,7 +322,7 @@ class VideoModel(SegmentationNetwork):
         out['theta_coords'] = None
         out['classification_list'] = None
         out['weights_list'] = (weights_list, classification_target_list)
-        out['dots'] = None
+        out['attn_weights'] = attn_weights
         out['target'] = None
             
         return out

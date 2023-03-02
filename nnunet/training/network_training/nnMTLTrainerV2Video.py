@@ -454,7 +454,7 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
             return gradient_image, data
 
     
-    def start_online_evaluation_video(self, pred, x, target, dots=None, target_feature_map=None, video_cropped_input=None, gradient_image=None, gradient_x=None, theta_coords=None, attention_weights=None, sampling_locations=None, coords=None, coords_da=None):
+    def start_online_evaluation_video(self, pred, x, target, attn_weights=None, target_feature_map=None, video_cropped_input=None, gradient_image=None, gradient_x=None, theta_coords=None, attention_weights=None, sampling_locations=None, coords=None, coords_da=None):
         """attention_weights: T, -1
             sampling_locations: T, -1, 2
             video_cropped_input: T, 1, H, W
@@ -484,8 +484,8 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
                     self.vis.set_up_image_seg_worst(seg_dice=seg_dice[b].mean(), gt=current_target, pred=current_pred, x=current_x)
                     self.vis.set_up_image_best_gradient(seg_dice=seg_dice[b].mean(), gradient=gradient_image, x=gradient_x, gradient_coords=coords)
                     self.vis.set_up_image_worst_gradient(seg_dice=seg_dice[b].mean(), gradient=gradient_image, x=gradient_x, gradient_coords=coords)
-                    #self.vis.set_up_image_slot(seg_dice=seg_dice[b].mean(), dot=dots[b], x=video_cropped_input[:, b, 0])
-                    #self.vis.set_up_image_target(seg_dice=seg_dice[b].mean(), target=target_feature_map[b], x=video_cropped_input[:, b, 0])
+                    self.vis.set_up_image_slot(seg_dice=seg_dice[b].mean(), dot=attn_weights[b], x=video_cropped_input[:, b, 0])
+                        #self.vis.set_up_image_target(seg_dice=seg_dice[b].mean(), target=target_feature_map[b], x=video_cropped_input[:, b, 0])
 
                 if self.epoch_iter_nb == self.num_val_batches_per_epoch - 1 and attention_weights is not None:
                     self.vis.set_up_image_deformable_attention(locations=sampling_locations, weights=attention_weights, x=video_cropped_input[:, 0], coords=coords_da, theta_coords=theta_coords)
@@ -532,7 +532,7 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
             self.vis.log_worst_seg_images(colormap=cmap, norm=norm, epoch=self.epoch)
             self.vis.log_best_gradient_images(colormap=cm.plasma, epoch=self.epoch)
             self.vis.log_worst_gradient_images(colormap=cm.plasma, epoch=self.epoch)
-            #self.vis.log_slot_images(colormap=cmap, epoch=self.epoch)
+            self.vis.log_slot_images(colormap=cmap, epoch=self.epoch)
             #self.vis.log_target_images(colormap=cm.plasma, epoch=self.epoch)
                 #self.vis.log_deformable_attention_images(colormap=cm.plasma, epoch=self.epoch)
             #    self.vis.log_theta_images(epoch=self.epoch, area_size=self.area_size)
@@ -599,7 +599,7 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
 
         return sampling_locations, attention_weights, data, theta_coords
     
-    def run_online_evaluation_video(self, data, target, pred, labeled_binary, cropped_input, cropped_target, dots=None, target_feature_map=None, attention_weights=None, sampling_locations=None, theta_coords=None):
+    def run_online_evaluation_video(self, data, target, pred, labeled_binary, cropped_input, cropped_target, attn_weights=None, target_feature_map=None, attention_weights=None, sampling_locations=None, theta_coords=None):
         """
         due to deep supervision the return value and the reference are now lists of tensors. We only need the full
         resolution output because this is what we are interested in in the end. The others are ignored
@@ -638,7 +638,8 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
                                                     attention_weights=attention_weights,
                                                     sampling_locations=sampling_locations,
                                                     coords=coords,
-                                                    coords_da=indices_da)
+                                                    coords_da=indices_da,
+                                                    attn_weights=attn_weights)
 
     def validate(self, do_mirroring: bool = True, use_sliding_window: bool = True,
                  step_size: float = 0.5, save_softmax: bool = True, use_gaussian: bool = True, overwrite: bool = True,
@@ -879,11 +880,19 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
                                 print(param_name)
                                 print(param.is_leaf)
                                 print(param.requires_grad)
-
         
-        #for param_name, param in self.network.named_parameters():
-        #    print(param_name)
-        #    print(param.mean())
+            #decoder_nb = 0
+            #spatio_temporal_nb = 0
+            #for param_name, param in self.network.named_parameters():
+            #    if 'transformerDecode' in param_name:
+            #        print(f'{param_name}: {param.numel()}, {param.requires_grad}')
+            #        decoder_nb += param.numel()
+            #    elif 'spatio_tempora' in param_name:
+            #        print(f'{param_name}: {param.numel()}, {param.requires_grad}')
+            #        spatio_temporal_nb += param.numel()
+            #print(f'decoder_nb: {decoder_nb}')
+            #print(f'spatio_temporal_nb: {spatio_temporal_nb}')
+
 
         #matplotlib.use('QtAgg')
         #fig, ax = plt.subplots(4, self.video_length)
@@ -904,7 +913,8 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
                                              attention_weights=cropped_output['attention_weights'], 
                                              sampling_locations=cropped_output['sampling_points'], 
                                              theta_coords=cropped_output['theta_coords'], 
-                                             cropped_target=cropped_target)
+                                             cropped_target=cropped_target,
+                                             attn_weights=cropped_output['attn_weights'])
         del data_list, target_list
 
         if do_backprop:

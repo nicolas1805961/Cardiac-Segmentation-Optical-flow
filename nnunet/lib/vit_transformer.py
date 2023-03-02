@@ -331,67 +331,67 @@ class CrossRelativeAttention(nn.Module):
         return out
 
 
-class TransformerDecoder(nn.Module):
-
-    def __init__(self, decoder_layer, num_layers, num_frames, norm=None, return_intermediate=False):
-        super().__init__()
-        self.layers = _get_clones(decoder_layer, num_layers)
-        self.num_layers = num_layers
-        self.num_frames = num_frames
-        self.norm = norm
-        self.return_intermediate = return_intermediate
-
-    def pad_zero(self, x, pad, dim=0):
-        if x is None:
-            return None
-        pad_shape = list(x.shape)
-        pad_shape[dim] = pad
-        return torch.cat((x, x.new_zeros(pad_shape)), dim=dim)
-
-    def forward(self, tgt, memory, memory_bus, memory_pos,
-                tgt_mask: Optional[Tensor] = None,
-                memory_mask: Optional[Tensor] = None,
-                tgt_key_padding_mask: Optional[Tensor] = None,
-                memory_key_padding_mask: Optional[Tensor] = None,
-                pos: Optional[Tensor] = None,
-                query_pos: Optional[Tensor] = None,
-                is_train: bool = True):
-        output = tgt
-
-        return_intermediate = (self.return_intermediate and is_train)
-        intermediate = []
-
-        M, bt, c = memory_bus.shape
-        bs = bt // self.num_frames if is_train else 1
-        t = bt // bs
-
-        memory_bus = memory_bus.view(M, bs, t, c).permute(2,0,1,3).flatten(0,1) # TMxBxC
-        memory = torch.cat((memory, memory_bus))
-
-        memory_pos = memory_pos[None, :, None, :].repeat(t,1,bs,1).flatten(0,1) # TMxBxC
-        pos = torch.cat((pos, memory_pos))
-
-        memory_key_padding_mask = self.pad_zero(memory_key_padding_mask, t*M, dim=1) # B, THW
-
-        for layer in self.layers:
-            output = layer(output, memory, tgt_mask=tgt_mask,
-                           memory_mask=memory_mask,
-                           tgt_key_padding_mask=tgt_key_padding_mask,
-                           memory_key_padding_mask=memory_key_padding_mask,
-                           pos=pos, query_pos=query_pos)
-            if return_intermediate:
-                intermediate.append(self.norm(output))
-
-        if self.norm is not None:
-            output = self.norm(output)
-            if return_intermediate:
-                intermediate.pop()
-                intermediate.append(output)
-
-        if return_intermediate:
-            return torch.stack(intermediate)
-
-        return output.unsqueeze(0)
+#class TransformerDecoder(nn.Module):
+#
+#    def __init__(self, decoder_layer, num_layers, num_frames, norm=None, return_intermediate=False):
+#        super().__init__()
+#        self.layers = _get_clones(decoder_layer, num_layers)
+#        self.num_layers = num_layers
+#        self.num_frames = num_frames
+#        self.norm = norm
+#        self.return_intermediate = return_intermediate
+#
+#    def pad_zero(self, x, pad, dim=0):
+#        if x is None:
+#            return None
+#        pad_shape = list(x.shape)
+#        pad_shape[dim] = pad
+#        return torch.cat((x, x.new_zeros(pad_shape)), dim=dim)
+#
+#    def forward(self, tgt, memory, memory_bus, memory_pos,
+#                tgt_mask: Optional[Tensor] = None,
+#                memory_mask: Optional[Tensor] = None,
+#                tgt_key_padding_mask: Optional[Tensor] = None,
+#                memory_key_padding_mask: Optional[Tensor] = None,
+#                pos: Optional[Tensor] = None,
+#                query_pos: Optional[Tensor] = None,
+#                is_train: bool = True):
+#        output = tgt
+#
+#        return_intermediate = (self.return_intermediate and is_train)
+#        intermediate = []
+#
+#        M, bt, c = memory_bus.shape
+#        bs = bt // self.num_frames if is_train else 1
+#        t = bt // bs
+#
+#        memory_bus = memory_bus.view(M, bs, t, c).permute(2,0,1,3).flatten(0,1) # TMxBxC
+#        memory = torch.cat((memory, memory_bus))
+#
+#        memory_pos = memory_pos[None, :, None, :].repeat(t,1,bs,1).flatten(0,1) # TMxBxC
+#        pos = torch.cat((pos, memory_pos))
+#
+#        memory_key_padding_mask = self.pad_zero(memory_key_padding_mask, t*M, dim=1) # B, THW
+#
+#        for layer in self.layers:
+#            output = layer(output, memory, tgt_mask=tgt_mask,
+#                           memory_mask=memory_mask,
+#                           tgt_key_padding_mask=tgt_key_padding_mask,
+#                           memory_key_padding_mask=memory_key_padding_mask,
+#                           pos=pos, query_pos=query_pos)
+#            if return_intermediate:
+#                intermediate.append(self.norm(output))
+#
+#        if self.norm is not None:
+#            output = self.norm(output)
+#            if return_intermediate:
+#                intermediate.pop()
+#                intermediate.append(output)
+#
+#        if return_intermediate:
+#            return torch.stack(intermediate)
+#
+#        return output.unsqueeze(0)
 
 
 #class TransformerEncoderLayer(nn.Module):
@@ -590,53 +590,91 @@ class SlotTransformer(nn.Module):
         return memory_bus
 
 
+#class SpatioTemporalTransformer(nn.Module):
+#    def __init__(self, dim, num_heads, num_layers, conv_layer_1d, d_ffn, dropout=0.0):
+#        super().__init__()
+#        self.num_layers = num_layers
+#        
+#        spatial_attn_layer = TransformerEncoderLayer(d_model=dim, nhead=num_heads, dim_feedforward=d_ffn)
+#        self.spatial_attention = _get_clones(spatial_attn_layer, num_layers)
+#
+#        temporal_attn_layer = TransformerEncoderLayer(d_model=dim, nhead=num_heads, dim_feedforward=d_ffn)
+#        self.temporal_attention = _get_clones(temporal_attn_layer, num_layers)
+#
+#        self.conv_1d = _get_clones(conv_layer_1d, num_layers)
+#        
+#        self.pos_weight = nn.Parameter(torch.randn(1, dim))
+#
+#
+#    def forward(self, spatial_tokens, memory_bus, pos_2d, pos_1d):
+#        shape = spatial_tokens.shape
+#        T, B, C, H, W = shape
+#
+#        pos_2d = pos_2d.view(1, H * W, C).repeat(T * B, 1, 1)
+#        pos_1d = pos_1d.view(1, T, C).repeat(B, 1, 1)
+#        pos_weight = self.pos_weight.view(1, 1, C).repeat(T * B, 1, 1)
+#
+#        memory_bus = memory_bus.view(T, 1, 1, C).repeat(1, B, 1, 1).view(T * B, 1, C)
+#        spatial_tokens = spatial_tokens.permute(0, 1, 3, 4, 2).contiguous()
+#        spatial_tokens = spatial_tokens.view(T * B, H, W, C).view(T * B, H * W, C)
+#
+#        for i in range(self.num_layers):
+#            src = torch.cat([memory_bus, spatial_tokens], dim=1)
+#            pos = torch.cat([pos_weight, pos_2d], dim=1)
+#            src = self.spatial_attention[i](src=src, pos=pos)
+#
+#            spatial_tokens = src[:, 1:] # T*B, H*W, C
+#            memory_bus = src[:, 0] # T*B, C
+#            memory_bus = memory_bus.view(T, B, C)
+#            memory_bus = memory_bus.permute(1, 2, 0).contiguous() # B, C, T
+#
+#            memory_bus = self.conv_1d[i](memory_bus) # B, C, T
+#            memory_bus = memory_bus.permute(0, 2, 1).contiguous() # B, T, C
+#
+#            memory_bus = self.temporal_attention[i](src=memory_bus, pos=pos_1d) # B, T, C
+#
+#            memory_bus = memory_bus.permute(1, 0, 2).contiguous() # T, B, C
+#            memory_bus = memory_bus.view(T * B, C).unsqueeze(1) # T * B, 1, C
+#
+#        memory_bus = memory_bus.view(T, B, 1, C).squeeze(2) # T, B, C
+#        memory_bus = memory_bus.permute(1, 0, 2).contiguous() # B, T, C
+#        spatial_tokens = spatial_tokens.permute(0, 2, 1).contiguous() # T*B, C, H*W
+#        spatial_tokens = spatial_tokens.view(T, B, C, H*W).view(T, B, C, H, W)
+#        return memory_bus, spatial_tokens
+
+
 class SpatioTemporalTransformer(nn.Module):
-    def __init__(self, dim, num_heads, num_layers, conv_layer_1d, d_ffn, dropout=0.0):
+    def __init__(self, dim, num_heads, num_layers, d_ffn, dropout=0.0):
         super().__init__()
         self.num_layers = num_layers
         
         spatial_attn_layer = TransformerEncoderLayer(d_model=dim, nhead=num_heads, dim_feedforward=d_ffn)
         self.spatial_attention = _get_clones(spatial_attn_layer, num_layers)
-
-        temporal_attn_layer = TransformerEncoderLayer(d_model=dim, nhead=num_heads, dim_feedforward=d_ffn)
-        self.temporal_attention = _get_clones(temporal_attn_layer, num_layers)
-
-        self.conv_1d = _get_clones(conv_layer_1d, num_layers)
         
         self.pos_weight = nn.Parameter(torch.randn(1, dim))
 
 
-    def forward(self, spatial_tokens, memory_bus, pos_2d, pos_1d):
+    def forward(self, spatial_tokens, memory_bus, pos_2d):
         shape = spatial_tokens.shape
         T, B, C, H, W = shape
 
         pos_2d = pos_2d.view(1, H * W, C).repeat(T * B, 1, 1)
-        pos_1d = pos_1d.view(1, T, C).repeat(B, 1, 1)
         pos_weight = self.pos_weight.view(1, 1, C).repeat(T * B, 1, 1)
 
         memory_bus = memory_bus.view(T, 1, 1, C).repeat(1, B, 1, 1).view(T * B, 1, C)
         spatial_tokens = spatial_tokens.permute(0, 1, 3, 4, 2).contiguous()
         spatial_tokens = spatial_tokens.view(T * B, H, W, C).view(T * B, H * W, C)
 
+        src = torch.cat([memory_bus, spatial_tokens], dim=1)
+        pos = torch.cat([pos_weight, pos_2d], dim=1)
+
         for i in range(self.num_layers):
-            src = torch.cat([memory_bus, spatial_tokens], dim=1)
-            pos = torch.cat([pos_weight, pos_2d], dim=1)
             src = self.spatial_attention[i](src=src, pos=pos)
 
-            spatial_tokens = src[:, 1:] # T*B, H*W, C
-            memory_bus = src[:, 0] # T*B, C
-            memory_bus = memory_bus.view(T, B, C)
-            memory_bus = memory_bus.permute(1, 2, 0).contiguous() # B, C, T
+        memory_bus = src[:, 0] # T*B, C
+        spatial_tokens = src[:, 1:] # T*B, H*W, C
+        memory_bus = memory_bus.view(T, B, C)
 
-            memory_bus = self.conv_1d[i](memory_bus) # B, C, T
-            memory_bus = memory_bus.permute(0, 2, 1).contiguous() # B, T, C
-
-            memory_bus = self.temporal_attention[i](src=memory_bus, pos=pos_1d) # B, T, C
-
-            memory_bus = memory_bus.permute(1, 0, 2).contiguous() # T, B, C
-            memory_bus = memory_bus.view(T * B, C).unsqueeze(1) # T * B, 1, C
-
-        memory_bus = memory_bus.view(T, B, 1, C).squeeze(2) # T, B, C
         memory_bus = memory_bus.permute(1, 0, 2).contiguous() # B, T, C
         spatial_tokens = spatial_tokens.permute(0, 2, 1).contiguous() # T*B, C, H*W
         spatial_tokens = spatial_tokens.view(T, B, C, H*W).view(T, B, C, H, W)
@@ -673,12 +711,14 @@ class SpatioTemporalTransformer(nn.Module):
 
 
 class ModulationTransformer(nn.Module):
-    def __init__(self, dim, num_heads, num_layers, d_ffn, dropout=0.0):
+    def __init__(self, dim, num_heads, num_layers, d_ffn, conv_layer_1d, dropout=0.0):
         super().__init__()
         self.num_layers = num_layers
 
         temporal_attn_layer = TransformerEncoderLayer(d_model=dim, nhead=num_heads, dim_feedforward=d_ffn)
         self.temporal_attention = _get_clones(temporal_attn_layer, num_layers)
+
+        self.conv_1d = _get_clones(conv_layer_1d, num_layers)
 
     def forward(self, memory_bus, spatial_tokens, pos_1d, pos_2d):
         B, T, C = memory_bus.shape
@@ -689,10 +729,15 @@ class ModulationTransformer(nn.Module):
         
         pos_1d = pos_1d.view(1, T, C).repeat(B, 1, 1)
         pos_2d = pos_2d.view(1, H*W, C).repeat(B, 1, 1)
+        pos = torch.cat([pos_1d, pos_2d], dim=1)
 
         for i in range(self.num_layers):
+            memory_bus = memory_bus.permute(0, 2, 1).contiguous() # B, C, T
+
+            memory_bus = self.conv_1d[i](memory_bus) # B, C, T
+            memory_bus = memory_bus.permute(0, 2, 1).contiguous() # B, T, C
+
             src = torch.cat([memory_bus, spatial_tokens], dim=1)
-            pos = torch.cat([pos_1d, pos_2d], dim=1)
             src = self.temporal_attention[i](src=src, pos=pos)
 
             memory_bus = src[:, :T] # B, T, C
@@ -702,97 +747,13 @@ class ModulationTransformer(nn.Module):
 
 
 
-class TransformerDecoderLayer(nn.Module):
-    def __init__(self, dim, num_heads, d_ffn, dropout=0.0, nb_memory_bus=4):
-        super().__init__()
-        self.nb_memory_bus = nb_memory_bus
-
-        #self.cross_attn_layer = SlotAttention(dim=dim)
-        self.cross_attn_layer = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads, batch_first=True, dropout=dropout)
-        self.norm1 = nn.LayerNorm(dim)
-        self.dropout1 = nn.Dropout(dropout)
-
-        self.self_attn_layer = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads, batch_first=True, dropout=dropout)
-        self.norm2 = nn.LayerNorm(dim)
-        self.dropout2 = nn.Dropout(dropout)
-
-        # ffn
-        self.linear1 = nn.Linear(dim, d_ffn)
-        self.activation = nn.GELU()
-        self.dropout3 = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(d_ffn, dim)
-        self.dropout4 = nn.Dropout(dropout)
-        self.norm3 = nn.LayerNorm(dim)
-
-    def forward_ffn(self, tgt):
-        tgt2 = self.linear2(self.dropout3(self.activation(self.linear1(tgt))))
-        tgt = tgt + self.dropout4(tgt2)
-        tgt = self.norm3(tgt)
-        return tgt
-    
-    def with_pos_embed(self, x, pos):
-        return x + pos
-
-    def forward(self, query, key, query_pos, key_pos):
-        tgt2 = self.cross_attn_layer(query=self.with_pos_embed(query, query_pos), key=self.with_pos_embed(key, key_pos), value=key)[0]
-        #tgt2 = self.cross_attention[i](query=self.with_pos_embed(object_tokens, memory_pos), key=self.with_pos_embed(spatial_tokens, pos_2d), value=spatial_tokens)[0]
-        query = query + self.dropout1(tgt2)
-        query = self.norm1(query)
-
-        tgt2 = self.self_attn_layer(query=self.with_pos_embed(query, query_pos), key=self.with_pos_embed(query, query_pos), value=query)[0]
-        query = query + self.dropout2(tgt2)
-        query = self.norm2(query)
-
-        query = self.forward_ffn(query)
-
-        #spatial_tokens = self.from_slot[i](query=spatial_tokens, key=object_tokens, value=object_tokens, query_pos=spatial_pos, key_pos=memory_pos)
-
-        #spatial_tokens = spatial_tokens.permute(0, 2, 1).view(T, B, C, H * W).view(T, B, C, H, W)
-        #object_tokens = object_tokens.permute(1, 0, 2).contiguous() # T, B, C
-        return query
-    
-
-class TransformerDecoder(nn.Module):
-    def __init__(self, dim, num_heads, num_layers, d_ffn, nb_memory_bus=4):
-        super().__init__()
-        self.nb_memory_bus = nb_memory_bus
-        self.num_layers = num_layers
-        self.memory_pos = nn.Parameter(torch.randn(self.nb_memory_bus, dim))
-
-        layer = TransformerDecoderLayer(dim=dim, num_heads=num_heads, d_ffn=d_ffn, nb_memory_bus=nb_memory_bus)
-        self.layers = _get_clones(layer, num_layers)
-    
-
-    def forward(self, object_tokens, spatial_tokens, memory_bus, pos_2d, pos_1d):
-        B, L, C = spatial_tokens.shape
-        B, T, C = memory_bus.shape
-
-        query = object_tokens[None, :, :].repeat(B, 1, 1)
-        key = torch.cat([spatial_tokens, memory_bus], dim=1)
-        query_pos = self.memory_pos
-        query_pos = query_pos[None, :, :].repeat(B, 1, 1)
-
-        pos_2d = pos_2d.view(1, L, C).repeat(B, 1, 1)
-        pos_1d = pos_1d.view(1, T, C).repeat(B, 1, 1)
-
-        key_pos = torch.cat([pos_2d, pos_1d], dim=1)
-
-        for layer in self.layers:
-            query = layer(query, key, query_pos, key_pos)
-
-        #spatial_tokens = spatial_tokens.permute(0, 2, 1).view(T, B, C, H * W).view(T, B, C, H, W)
-        #query = query.permute(1, 0, 2).contiguous() # T, B, C
-        return query
-    
-
-
 #class TransformerDecoderLayer(nn.Module):
 #    def __init__(self, dim, num_heads, d_ffn, dropout=0.0, nb_memory_bus=4):
 #        super().__init__()
 #        self.nb_memory_bus = nb_memory_bus
 #
 #        #self.cross_attn_layer = SlotAttention(dim=dim)
-#        self.cross_attn_layer = SlotAttention(dim=dim)
+#        self.cross_attn_layer = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads, batch_first=True, dropout=dropout)
 #        self.norm1 = nn.LayerNorm(dim)
 #        self.dropout1 = nn.Dropout(dropout)
 #
@@ -818,7 +779,8 @@ class TransformerDecoder(nn.Module):
 #        return x + pos
 #
 #    def forward(self, query, key, query_pos, key_pos):
-#        tgt2 = self.cross_attn_layer(query=query, key=key, value=key, query_pos=query_pos, key_pos=key_pos)[0]
+#        tgt2 = self.cross_attn_layer(query=self.with_pos_embed(query, query_pos), key=self.with_pos_embed(key, key_pos), value=key)[0]
+#        #tgt2 = self.cross_attention[i](query=self.with_pos_embed(object_tokens, memory_pos), key=self.with_pos_embed(spatial_tokens, pos_2d), value=spatial_tokens)[0]
 #        query = query + self.dropout1(tgt2)
 #        query = self.norm1(query)
 #
@@ -833,34 +795,82 @@ class TransformerDecoder(nn.Module):
 #        #spatial_tokens = spatial_tokens.permute(0, 2, 1).view(T, B, C, H * W).view(T, B, C, H, W)
 #        #object_tokens = object_tokens.permute(1, 0, 2).contiguous() # T, B, C
 #        return query
-#    
-#
-#class TransformerDecoder(nn.Module):
-#    def __init__(self, dim, num_heads, num_layers, d_ffn, nb_memory_bus=4):
-#        super().__init__()
-#        self.nb_memory_bus = nb_memory_bus
-#        self.num_layers = num_layers
-#        self.memory_pos = nn.Parameter(torch.randn(self.nb_memory_bus, dim))
-#
-#        layer = TransformerDecoderLayer(dim=dim, num_heads=num_heads, d_ffn=d_ffn, nb_memory_bus=nb_memory_bus)
-#        self.layers = _get_clones(layer, num_layers)
-#    
-#
-#    def forward(self, object_tokens, spatial_tokens, pos_2d):
-#        B, L, C = spatial_tokens.shape
-#
-#        query = object_tokens[None, :, :].repeat(B, 1, 1)
-#        query_pos = self.memory_pos
-#        query_pos = query_pos[None, :, :].repeat(B, 1, 1)
-#
-#        pos_2d = pos_2d.view(1, L, C).repeat(B, 1, 1)
-#
-#        for layer in self.layers:
-#            query = layer(query, spatial_tokens, query_pos, pos_2d)
-#
-#        #spatial_tokens = spatial_tokens.permute(0, 2, 1).view(T, B, C, H * W).view(T, B, C, H, W)
-#        #query = query.permute(1, 0, 2).contiguous() # T, B, C
-#        return query
+    
+
+class TransformerDecoder(nn.Module):
+    def __init__(self, dim, num_heads, num_layers, d_ffn, nb_object_bus=4):
+        super().__init__()
+        self.nb_object_bus = nb_object_bus
+        self.num_layers = num_layers
+        self.object_pos = nn.Parameter(torch.randn(self.nb_object_bus, dim))
+
+        layer = TransformerDecoderLayer(dim=dim, num_heads=num_heads, d_ffn=d_ffn)
+        #layer = TransformerEncoderLayer(d_model=dim, nhead=num_heads, dim_feedforward=d_ffn)
+        self.layers = _get_clones(layer, num_layers)
+    
+
+    def forward(self, object_tokens, spatial_tokens, pos_2d):
+        B, L, C = spatial_tokens.shape
+
+        query = object_tokens[None, :, :].repeat(B, 1, 1)
+        query_pos = self.object_pos[None, :, :].repeat(B, 1, 1)
+        pos_2d = pos_2d.view(1, L, C).repeat(B, 1, 1)
+
+        for layer in self.layers:
+            query, attn_weights = layer(query=query, key=spatial_tokens, query_pos=query_pos, key_pos=pos_2d)
+
+        #spatial_tokens = spatial_tokens.permute(0, 2, 1).view(T, B, C, H * W).view(T, B, C, H, W)
+        #query = query.permute(1, 0, 2).contiguous() # T, B, C
+        return query, attn_weights
+    
+
+
+class TransformerDecoderLayer(nn.Module):
+    def __init__(self, dim, num_heads, d_ffn, dropout=0.0):
+        super().__init__()
+
+        #self.cross_attn_layer = SlotAttention(dim=dim)
+        self.cross_attn_layer = SlotAttention(dim=dim)
+        self.norm1 = nn.LayerNorm(dim)
+        self.dropout1 = nn.Dropout(dropout)
+
+        self.self_attn_layer = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads, batch_first=True, dropout=dropout)
+        self.norm2 = nn.LayerNorm(dim)
+        self.dropout2 = nn.Dropout(dropout)
+
+        # ffn
+        self.linear1 = nn.Linear(dim, d_ffn)
+        self.activation = nn.GELU()
+        self.dropout3 = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(d_ffn, dim)
+        self.dropout4 = nn.Dropout(dropout)
+        self.norm3 = nn.LayerNorm(dim)
+
+    def forward_ffn(self, tgt):
+        tgt2 = self.linear2(self.dropout3(self.activation(self.linear1(tgt))))
+        tgt = tgt + self.dropout4(tgt2)
+        tgt = self.norm3(tgt)
+        return tgt
+    
+    def with_pos_embed(self, x, pos):
+        return x + pos
+
+    def forward(self, query, key, query_pos, key_pos):
+        tgt2 = self.self_attn_layer(query=self.with_pos_embed(query, query_pos), key=self.with_pos_embed(query, query_pos), value=query)[0]
+        query = query + self.dropout1(tgt2)
+        query = self.norm1(query)
+
+        tgt2, attn_weights = self.cross_attn_layer(query=query, key=key, value=key, query_pos=query_pos, key_pos=key_pos)
+        query = query + self.dropout2(tgt2)
+        query = self.norm2(query)
+
+        query = self.forward_ffn(query)
+
+        #spatial_tokens = self.from_slot[i](query=spatial_tokens, key=object_tokens, value=object_tokens, query_pos=spatial_pos, key_pos=memory_pos)
+
+        #spatial_tokens = spatial_tokens.permute(0, 2, 1).view(T, B, C, H * W).view(T, B, C, H, W)
+        #object_tokens = object_tokens.permute(1, 0, 2).contiguous() # T, B, C
+        return query, attn_weights
 
 
 class ChannelAttention(nn.Module):
