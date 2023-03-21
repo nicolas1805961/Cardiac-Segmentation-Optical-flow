@@ -526,7 +526,7 @@ class nnUNetTrainer(NetworkTrainer):
         return ret
     
 
-    def predict_preprocessed_data_return_seg_and_softmax_video(self, data, idx, video_padding, processor, do_mirroring: bool = True,
+    def predict_preprocessed_data_return_seg_and_softmax_video(self, data, idx, processor, do_mirroring: bool = True,
                                                          mirror_axes: Tuple[int] = None,
                                                          use_sliding_window: bool = True, step_size: float = 0.5,
                                                          use_gaussian: bool = True, pad_border_mode: str = 'constant',
@@ -560,7 +560,7 @@ class nnUNetTrainer(NetworkTrainer):
 
         current_mode = self.network.training
         self.network.eval()
-        ret = self.network.predict_3D_video(data, idx=idx, video_padding=video_padding, processor=processor, do_mirroring=do_mirroring, mirror_axes=mirror_axes,
+        ret = self.network.predict_3D_video(data, idx=idx, processor=processor, do_mirroring=do_mirroring, mirror_axes=mirror_axes,
                                       use_sliding_window=use_sliding_window, step_size=step_size,
                                       patch_size=self.patch_size, regions_class_order=self.regions_class_order,
                                       use_gaussian=use_gaussian, pad_border_mode=pad_border_mode,
@@ -1050,24 +1050,31 @@ class nnUNetTrainer(NetworkTrainer):
                     filtered = filtered[1::step]
                 labeled_idx = np.where(filtered == k)[0][0]
             
-            if self.video_length > len(filtered):
-                padding_length = self.video_length - len(filtered)
-                video = filtered
-            else:
-                padding_length = 0
-                values = np.arange(len(filtered))
-                half_window = self.video_length // 2
-                start = min(max(labeled_idx - half_window, 0), len(filtered) - self.video_length)
-                frame_indices = values[start:start + self.video_length]
-                assert len(frame_indices) == self.video_length
-                video = filtered[frame_indices]
 
-            video_padding = np.ones(shape=(self.video_length, 1), dtype=bool)
+            values = np.arange(len(filtered))
+            before = self.video_length // 2
+            after = before + (self.video_length % 2)
+            values = np.pad(values, (before, after), mode='wrap')
+            mask = np.isin(values, labeled_idx)
+            possible_indices = np.argwhere(mask)
+            possible_indices = possible_indices[np.logical_and(possible_indices >= before, possible_indices <= len(values) - after)]
+            m = np.random.choice(possible_indices)
+            start = m - before
+            end = m + after
+            assert start >= 0
+            assert end <= len(values)
+            #start = min(max(labeled_idx - half_window, 0), len(filtered) - self.video_length)
+            #frame_indices = values[start:start + self.video_length]
+            frame_indices = values[start:end]
+            assert len(frame_indices) == self.video_length
+            video = filtered[frame_indices]
+
             data = np.zeros(shape=(self.video_length, 1) + properties['size_after_resampling'])
 
+            labeled_idx = None
             if overwrite or (not isfile(join(output_folder, fname + ".nii.gz"))) or (save_softmax and not isfile(join(output_folder, fname + ".npz"))):
                 for idx, frame in enumerate(video):
-                    video_idx = idx + (padding_length // 2)
+                    video_idx = idx
                     if frame == k:
                         labeled_idx = video_idx
                     if '_u' in frame:
@@ -1076,7 +1083,6 @@ class nnUNetTrainer(NetworkTrainer):
                         current_data = np.load(self.dataset_val[frame]['data_file'])['data']
                         current_data[-1][current_data[-1] == -1] = 0
                         data[video_idx] = current_data[:-1]
-                    video_padding[video_idx] = False
                     #self.print_to_log_file(k, data.shape)
 
                 #matplotlib.use('QtAgg')
@@ -1089,7 +1095,6 @@ class nnUNetTrainer(NetworkTrainer):
 
                 softmax_pred = self.predict_preprocessed_data_return_seg_and_softmax_video(data=data,
                                                                                      idx=labeled_idx,
-                                                                                     video_padding=video_padding,
                                                                                      processor=processor,
                                                                                      do_mirroring=do_mirroring,
                                                                                      mirror_axes=mirror_axes,

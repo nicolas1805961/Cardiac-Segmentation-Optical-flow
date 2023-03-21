@@ -14,6 +14,7 @@
 
 from collections import OrderedDict
 import numpy as np
+import sys
 from numpy.random import RandomState
 from multiprocessing import Pool
 from math import ceil, floor
@@ -439,7 +440,7 @@ class DataLoader3D(SlimDataLoaderBase):
 class DataLoader2D(SlimDataLoaderBase):
     def __init__(self, data, patch_size, final_patch_size, batch_size, oversample_foreground_percent=0.0,
                  memmap_mode="r", pseudo_3d_slices=1, pad_mode="edge",
-                 pad_kwargs_data=None, pad_sides=None, classification=False):
+                 pad_kwargs_data=None, pad_sides=None):
         """
         This is the basic data loader for 2D networks. It uses preprocessed data as produced by my (Fabian) preprocessing.
         You can load the data with load_dataset(folder) where folder is the folder where the npz files are located. If there
@@ -482,12 +483,6 @@ class DataLoader2D(SlimDataLoaderBase):
             self.need_to_pad += pad_sides
         self.pad_sides = pad_sides
         self.data_shape, self.seg_shape = self.determine_shapes()
-        self.classification = classification
-        if classification:
-            lut = []
-            for t in range(5):
-                lut.append(np.full((20,), fill_value=t))
-            self.lut = np.concatenate(lut, axis=0)
 
     def determine_shapes(self):
         num_seg = 1
@@ -511,14 +506,8 @@ class DataLoader2D(SlimDataLoaderBase):
         data = np.zeros(self.data_shape, dtype=np.float32)
         seg = np.zeros(self.seg_shape, dtype=np.float32)
 
-        classification = np.zeros((self.batch_size,), dtype=np.int32) if self.classification else None
-
         case_properties = []
         for j, i in enumerate(selected_keys):
-            if self.classification:
-                nb = int(i.split('patient')[-1][:3])
-                classification[j] = self.lut[nb - 1]
-
             if 'properties' in self._data[i].keys():
                 properties = self._data[i]['properties']
             else:
@@ -659,14 +648,14 @@ class DataLoader2D(SlimDataLoaderBase):
             seg[j] = case_all_data_segonly
 
         keys = selected_keys
-        return {'data': data, 'seg': seg, 'properties': case_properties, "keys": keys, "classification": classification}
+        return {'data': data, 'seg': seg, 'properties': case_properties, "keys": keys}
 
 
 
 class DataLoader2DUnlabeled(SlimDataLoaderBase):
     def __init__(self, data, patch_size, final_patch_size, batch_size, oversample_foreground_percent=0.0,
                  memmap_mode="r", pseudo_3d_slices=1, pad_mode="edge",
-                 pad_kwargs_data=None, pad_sides=None, classification=False):
+                 pad_kwargs_data=None, pad_sides=None):
         """
         This is the basic data loader for 2D networks. It uses preprocessed data as produced by my (Fabian) preprocessing.
         You can load the data with load_dataset(folder) where folder is the folder where the npz files are located. If there
@@ -709,12 +698,6 @@ class DataLoader2DUnlabeled(SlimDataLoaderBase):
             self.need_to_pad += pad_sides
         self.pad_sides = pad_sides
         self.data_shape = self.determine_shapes()
-        self.classification = classification
-        if classification:
-            lut = []
-            for t in range(5):
-                lut.append(np.full((20,), fill_value=t))
-            self.lut = np.concatenate(lut, axis=0)
 
     def determine_shapes(self):
         num_seg = 0
@@ -736,14 +719,8 @@ class DataLoader2DUnlabeled(SlimDataLoaderBase):
 
         data = np.zeros(self.data_shape, dtype=np.float32)
 
-        classification = np.zeros((self.batch_size,), dtype=np.int32) if self.classification else None
-
         case_properties = []
         for j, i in enumerate(selected_keys):
-            if self.classification:
-                nb = int(i.split('patient')[-1][:3])
-                classification[j] = self.lut[nb - 1]
-
             if 'properties' in self._data[i].keys():
                 properties = self._data[i]['properties']
             else:
@@ -876,7 +853,7 @@ class DataLoader2DUnlabeled(SlimDataLoaderBase):
             data[j] = case_all_data_donly
 
         keys = selected_keys
-        return {'data': data, 'seg': None, 'properties': case_properties, "keys": keys, "classification": classification}
+        return {'data': data, 'seg': None, 'properties': case_properties, "keys": keys}
 
 
 class DataLoader2DMiddle(SlimDataLoaderBase):
@@ -1588,7 +1565,6 @@ class DataLoaderVideoUnlabeled(SlimDataLoaderBase):
             filtered = l_filtered + un_filtered
             list_of_frames.append(filtered)
 
-        video_padding = np.ones(shape=(self.video_length, self.batch_size), dtype=bool)
         labeled_binary = np.zeros(shape=(self.video_length, self.batch_size), dtype=bool)
         data = np.zeros(shape=(self.video_length, self.batch_size, self.data_shape[1], self.data_shape[2], self.data_shape[3]))
         seg = np.zeros(shape=(self.video_length, self.batch_size, self.data_shape[1], self.data_shape[2], self.data_shape[3]))
@@ -1623,28 +1599,34 @@ class DataLoaderVideoUnlabeled(SlimDataLoaderBase):
 
             values = np.arange(len(frames))
 
-            if self.video_length > len(frames):
-                padding_length = self.video_length - len(frames)
-                video = frames
+            if self.is_val:
+                before = self.video_length // 2
+                after = before + (self.video_length % 2)
+                values = np.pad(values, (before, after), mode='wrap')
+                mask = np.isin(values, labeled_idx)
+                possible_indices = np.argwhere(mask)
+                possible_indices = possible_indices[np.logical_and(possible_indices >= before, possible_indices <= len(values) - after)]
+                m = np.random.choice(possible_indices)
+                #start = min(max(s - step, 0), len(frames) - self.video_length)
+                start = m - before
+                end = m + after
+                assert start >= 0
+                assert end <= len(values)
+                frame_indices = values[start:end]
+                assert len(frame_indices) == self.video_length
+                #eval_idx = int(np.where(indices == s)[0])
             else:
-                padding_length = 0
-                if self.is_val:
-                    s = np.random.choice(labeled_idx)
-                    step = self.video_length // 2
-                    start = min(max(s - step, 0), len(frames) - self.video_length)
-                    frame_indices = values[start:start + self.video_length]
-                    assert len(frame_indices) == self.video_length
-                    #eval_idx = int(np.where(indices == s)[0])
-                else:
-                    windows = sliding_window_view(values, self.video_length)
-                    if self.force_one_label:
-                        mask = np.isin(windows, labeled_idx)
-                        mask = np.any(mask, axis=1)
-                        windows = windows[mask]
-                    window_idx = np.random.choice(len(windows))
-                    frame_indices = windows[window_idx]
-                    assert len(frame_indices) == self.video_length
-                video = frames[frame_indices]
+                values = np.pad(values, (10000, 10000), mode='wrap')
+                windows = sliding_window_view(values, self.video_length)
+                if self.force_one_label:
+                    mask = np.isin(windows, labeled_idx)
+                    mask = np.any(mask, axis=1)
+                    windows = windows[mask]
+                    np.set_printoptions(threshold=sys.maxsize)
+                window_idx = np.random.choice(len(windows))
+                frame_indices = windows[window_idx]
+                assert len(frame_indices) == self.video_length
+            video = frames[frame_indices]
 
             seed = np.random.randint(0, 4294967296, dtype=np.int64)
             for idx, t in enumerate(video):
@@ -1717,7 +1699,7 @@ class DataLoaderVideoUnlabeled(SlimDataLoaderBase):
                 slice_data = slice_data[:, valid_bbox_x_lb:valid_bbox_x_ub,
                                 valid_bbox_y_lb:valid_bbox_y_ub]
                 
-                video_idx = idx + (padding_length // 2)
+                video_idx = idx
 
                 if '_u' in t:
                     slice_data_donly = np.pad(slice_data, ((0, 0),
@@ -1738,7 +1720,6 @@ class DataLoaderVideoUnlabeled(SlimDataLoaderBase):
                     labeled_binary[video_idx, j] = True
 
                 data[video_idx, j] = slice_data_donly
-                video_padding[video_idx, j] = False
 
         keys = selected_keys
         data = [data[i] for i in range(self.video_length)]
@@ -1755,7 +1736,7 @@ class DataLoaderVideoUnlabeled(SlimDataLoaderBase):
         #        ax[1, i].imshow(seg[i][0, 0], cmap='gray')
         #    plt.show()
 
-        return {'data': data, 'seg': seg, 'properties': case_properties, "keys": keys, "labeled_binary": labeled_binary, "video_padding": video_padding}
+        return {'data': data, 'seg': seg, 'properties': case_properties, "keys": keys, "labeled_binary": labeled_binary}
 
 if __name__ == "__main__":
     t = "Task002_Heart"

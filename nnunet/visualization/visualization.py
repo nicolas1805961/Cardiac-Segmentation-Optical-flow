@@ -75,6 +75,7 @@ class Visualizer(object):
         eval_images['worst_gradient'] = None
         eval_images['slot'] = None
         eval_images['target'] = None
+        eval_images['attention_map'] = None
         if self.middle:
             eval_images['sim'] = None
             eval_images['weights'] = None
@@ -234,6 +235,12 @@ class Visualizer(object):
             elif key == 'target':
                 payload = {'input': None,
                             'target': None}
+                score = -1
+                data.append(payload)
+                scores.append(score)
+            elif key == 'attention_map':
+                payload = {'input': None,
+                            'attn_weights': None}
                 score = -1
                 data.append(payload)
                 scores.append(score)
@@ -660,6 +667,23 @@ class Visualizer(object):
 
         self.writer.add_images(os.path.join('Slot attention', 'video').replace('\\', '/'), frame_list, epoch, dataformats='NHWC')
         self.writer.add_images(os.path.join('Slot attention', 'slot_attention').replace('\\', '/'), dot, epoch, dataformats='HWC')
+
+
+    def log_attn_map_images(self, colormap, epoch):
+        x = self.eval_images['attention_map'][0, 0]['input'] # H, W
+        attn_weights = self.eval_images['attention_map'][0, 0]['attn_weights'] # H, W
+
+        #matplotlib.use('QtAgg')
+        #fig, ax = plt.subplots(1, 1)
+        #ax.imshow(dot[0], cmap='plasma')
+        #plt.show()
+        
+        attn_weights = cv.resize(attn_weights, x.shape, interpolation=cv.INTER_LINEAR)
+        attn_weights = self.get_images_ready_for_display(attn_weights, colormap=colormap)
+        x = self.get_images_ready_for_display(x, colormap=None)
+
+        self.writer.add_images(os.path.join('Attention map', 'Input').replace('\\', '/'), x, epoch, dataformats='HWC')
+        self.writer.add_images(os.path.join('Attention map', 'Attention weights').replace('\\', '/'), attn_weights, epoch, dataformats='HWC')
     
 
     def log_target_images(self, colormap, epoch):
@@ -1015,6 +1039,17 @@ class Visualizer(object):
             self.eval_images['slot'][0, 0]['dot'] = dot.astype(np.float32)
             self.eval_images['slot'][0, 0]['input'] = x.astype(np.float32)
             self.eval_images['slot'][1, 0] = seg_dice
+    
+    def set_up_image_attn_weights(self, seg_dice, attn_weights, x):
+        seg_dice = seg_dice.cpu().numpy()
+        attn_weights = attn_weights.cpu().numpy()
+        x = x.cpu().numpy()
+
+        if self.eval_images['attention_map'][1, 0] <= seg_dice:
+
+            self.eval_images['attention_map'][0, 0]['attn_weights'] = attn_weights.astype(np.float32)
+            self.eval_images['attention_map'][0, 0]['input'] = x.astype(np.float32)
+            self.eval_images['attention_map'][1, 0] = seg_dice
     
     def set_up_image_target(self, seg_dice, target, x):
         seg_dice = seg_dice.cpu().numpy()

@@ -65,7 +65,7 @@ from torch import nn
 from torch.cuda.amp import autocast
 from nnunet.training.learning_rate.poly_lr import poly_lr
 from batchgenerators.utilities.file_and_folder_operations import *
-from nnunet.lib.training_utils import build_2d_model, build_confidence_network, read_config, build_discriminator, build_discriminator, build_video_model
+from nnunet.lib.training_utils import build_UDA_model, build_2d_model, build_confidence_network, read_config, build_discriminator, build_discriminator, build_video_model
 from nnunet.lib.loss import DirectionalFieldLoss, MaximizeDistanceLoss, AverageDistanceLoss
 from pathlib import Path
 from monai.losses import DiceFocalLoss, DiceLoss
@@ -82,7 +82,7 @@ import shutil
 from nnunet.visualization.visualization import Visualizer
 from nnunet.training.network_training.processor import Processor
 
-class nnMTLTrainerV2Video(nnUNetTrainer):
+class nnMTLTrainerV2UDA(nnUNetTrainer):
     """
     Info for Fabian: same as internal nnUNetTrainerV2_2
     """
@@ -92,17 +92,7 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
         super().__init__(plans_file, fold, output_folder, dataset_directory, batch_dice, stage, unpack_data,
                          deterministic, fp16)
 
-        self.cropper_config = read_config(os.path.join(Path.cwd(), 'adversarial_acdc.yaml'), False, False)
-        self.config = read_config(os.path.join(Path.cwd(), 'video.yaml'), False, True)
-        self.cropper_weights_folder_path = os.path.join('ACDC_output', 'Baseline', 'fold_0')
-        self.video_length = self.config['video_length']
-        self.crop = self.config['crop']
-        self.feature_extractor = self.config['feature_extractor']
-        self.crop_size = self.config['crop_size']
-        self.force_one_label = self.config['force_one_label']
-        self.video_weights_folder_path = self.config['video_weights_folder_path']
-        self.area_size = self.config['area_size']
-        self.step = self.config['step']
+        self.config = read_config(os.path.join(Path.cwd(), 'uda.yaml'), False, False)
         
         self.image_size = self.config['patch_size'][0]
         self.window_size = 7 if self.image_size == 224 else 9 if self.image_size == 288 else None
@@ -116,10 +106,6 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
         self.use_progress_bar=True
         self.one_vs_all = True
 
-        self.fine_tuning = True if self.video_length > 1 else False
-
-        self.deep_supervision = self.config['deep_supervision']
-
         self.iter_nb = 0
         self.epoch_iter_nb = 0
 
@@ -127,8 +113,7 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
         self.train_loss = []
         
         loss_weights = torch.tensor(self.config['224_loss_weights'], device=self.config['device'])
-        self.selection_loss_weight = self.config['selection_loss_weight']
-        self.heatmap_loss_weight = self.config['heatmap_loss_weight']
+        self.consistency_loss_weight = self.config['consistency_loss_weight']
 
         timestr = strftime("%Y-%m-%d_%HH%M")
         self.log_dir = os.path.join(copy(self.output_folder), timestr)
@@ -162,13 +147,10 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
         self.table = self.initialize_table()
 
         self.loss_data = self.setup_loss_data()
-        self.info_loss = nn.CrossEntropyLoss()
 
     def setup_loss_data(self):
         loss_data = {'segmentation': [1.0, float('nan')]}
-        loss_data['selection'] = [self.selection_loss_weight, float('nan')]
-        if self.heatmap_loss_weight > 0.0:
-            loss_data['heatmap'] = [self.heatmap_loss_weight, float('nan')]
+        loss_data['consistency'] = [self.consistency_loss_weight, float('nan')]
         return loss_data
     
     def setup_loss_functions(self, loss_weights):
@@ -182,7 +164,7 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
             self.segmentation_loss = DC_and_CE_loss({'batch_dice': True, 'smooth': 1e-5, 'do_bg': False}, {})
         elif self.config['loss'] == 'ce':
             self.segmentation_loss = RobustCrossEntropyLoss(weight=loss_weights)
-        self.heatmap_loss = nn.MSELoss()
+        self.consistency_loss = nn.MSELoss()
 
 
     def initialize_table(self):
@@ -295,46 +277,12 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
     def get_conv_layer(self, config):
         if config['conv_layer'] == 'RFR':
             conv_layer = RFR
-            conv_layer_1d = RFR_1d
         elif config['conv_layer'] == 'resblock':
             conv_layer = Resblock
-            conv_layer_1d = Resblock1D
         else:
             conv_layer = ConvBlocks
-            conv_layer_1d = ConvBlocks1D
-        return conv_layer, conv_layer_1d
-
-    def freeze_batchnorm_layers(self, model):
-        for module in model.modules():
-            if isinstance(module, nn.BatchNorm2d):
-                if hasattr(module, 'weight'):
-                    module.weight.requires_grad_(False)
-                if hasattr(module, 'bias'):
-                    module.bias.requires_grad_(False)
-                module.eval()
-
-    def load_video_weights(self, model):
-        weight_path = os.path.join(self.video_weights_folder_path, 'model_final_checkpoint.model')
-        loaded_state_dict = torch.load(weight_path)['state_dict']
-        #print(loaded_state_dict.keys())
-        current_model_dict = model.state_dict()
-        #print(current_model_dict.keys())
-
-        new_state_dict = copy(current_model_dict)
-        for k, v in loaded_state_dict.items():
-            for module_name, module in model.named_modules():
-                if list(module.children()) == []:
-                    #if isinstance(module, nn.BatchNorm2d) and module_name in k:
-                    if module_name in k:
-                        new_state_dict[k] = v
-
-        missing_keys, unexpected_keys = model.load_state_dict(new_state_dict, strict=False)
-
-        for missing_key in missing_keys:
-            assert "conv_1d" in missing_key, f'Missing key: {missing_key}'
-        assert len(unexpected_keys) == 0, f'Unexpected_keys: {unexpected_keys}'
-
-        self.freeze_batchnorm_layers(model)
+        return conv_layer
+    
 
     def initialize_network(self):
         """
@@ -349,46 +297,27 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
         """
         models = {}
 
-        num_classes = 3 if '029' in self.dataset_directory else 4
-
         wanted_norm = self.config['norm']
         if wanted_norm == 'batchnorm':
-            norm_2d = nn.BatchNorm2d
-            norm_1d = nn.InstanceNorm1d
+            norm = nn.BatchNorm2d
         elif wanted_norm == 'instancenorm':
-            norm_2d = nn.InstanceNorm2d
-            norm_1d = nn.InstanceNorm1d
+            norm = nn.InstanceNorm2d
         
-        conv_layer, conv_layer_1d = self.get_conv_layer(self.config)
+        conv_layer = self.get_conv_layer(self.config)
 
-        in_shape_crop = torch.randn(self.config['batch_size'], 1, self.image_size, self.image_size)
-        cropping_conv_layer, _ = self.get_conv_layer(self.cropper_config)
-        cropping_network = build_2d_model(self.cropper_config, conv_layer=cropping_conv_layer, norm=getattr(torch.nn, self.cropper_config['norm']), log_function=self.print_to_log_file, image_size=self.image_size, window_size=self.window_size, middle=False, num_classes=num_classes)
-        cropping_network.load_state_dict(torch.load(os.path.join(self.cropper_weights_folder_path, 'model_final_checkpoint.model'))['state_dict'], strict=True)
-        cropping_network.eval()
-        cropping_network.do_ds = False
-        models['cropping_model'] = (cropping_network, in_shape_crop)
+        self.student = build_UDA_model(config=self.config, conv_layer=conv_layer, norm=norm, image_size=self.image_size)
+        self.teacher = build_UDA_model(config=self.config, conv_layer=conv_layer, norm=norm, image_size=self.image_size)
 
-        #end_idx = int((self.crop_size / 2**len(self.config['conv_depth']))**2)
-        #in_shape_mask[:, :, :, :end_idx] = 1
-        #in_shape_mask = in_shape_mask.view(self.config['batch_size'], self.video_length, 1, self.crop_size, self.crop_size)
-
-        self.network = build_video_model(self.config, conv_layer=conv_layer, conv_layer_1d=conv_layer_1d, norm_2d=norm_2d, norm_1d=norm_1d, log_function=self.print_to_log_file, image_size=self.crop_size, window_size=8)
-        if self.fine_tuning:
-            self.load_video_weights(self.network)
-        model_input_data = torch.randn(self.video_length, self.config['batch_size'], 1, self.crop_size, self.crop_size)
-        models['temporal_model'] = (self.network, model_input_data)
-
-        self.processor = Processor(crop_size=self.crop_size, image_size=self.image_size, cropping_network=cropping_network, nb_layers=len(self.config['conv_depth']))
+        model_input_data = torch.randn(self.config['batch_size'], 1, self.self.image_size, self.self.image_size)
+        models['student'] = (self.student, model_input_data)
+        models['teacher'] = (self.teacher, model_input_data)
 
         self.count_parameters(self.config, models)
 
-        #nb_inputs = 2 if self.middle else 1
-        #model_input_size = [(self.config['batch_size'], 1, self.image_size, self.image_size)] * nb_inputs
-
         if torch.cuda.is_available():
             self.network.cuda()
-        self.network.inference_apply_nonlin = softmax_helper
+        self.student.inference_apply_nonlin = softmax_helper
+        self.teacher.inference_apply_nonlin = softmax_helper
 
     def get_optimizer_scheduler(self, net, lr, decay):
         if self.feature_extractor:
@@ -460,7 +389,7 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
             return gradient_image, data
 
     
-    def start_online_evaluation_video(self, pred, x, target, attn_weights=None, target_feature_map=None, video_cropped_input=None, gradient_image=None, gradient_x=None, theta_coords=None, attention_weights=None, sampling_locations=None, coords=None, coords_da=None):
+    def start_online_evaluation(self, pred, x, target, attn_weights=None, gradient_image=None, gradient_x=None, coords=None):
         """attention_weights: T, -1
             sampling_locations: T, -1, 2
             video_cropped_input: T, 1, H, W
@@ -490,14 +419,7 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
                     self.vis.set_up_image_seg_worst(seg_dice=seg_dice[b].mean(), gt=current_target, pred=current_pred, x=current_x)
                     self.vis.set_up_image_best_gradient(seg_dice=seg_dice[b].mean(), gradient=gradient_image, x=gradient_x, gradient_coords=coords)
                     self.vis.set_up_image_worst_gradient(seg_dice=seg_dice[b].mean(), gradient=gradient_image, x=gradient_x, gradient_coords=coords)
-                    #self.vis.set_up_image_slot(seg_dice=seg_dice[b].mean(), dot=attn_weights[b], x=video_cropped_input[:, b, 0])
-                    #self.vis.set_up_image_target(seg_dice=seg_dice[b].mean(), target=target_feature_map[b], x=video_cropped_input[:, b, 0])
-
-                if self.epoch_iter_nb == self.num_val_batches_per_epoch - 1 and attention_weights is not None:
-                    self.vis.set_up_image_deformable_attention(locations=sampling_locations, weights=attention_weights, x=video_cropped_input[:, 0], coords=coords_da, theta_coords=theta_coords)
-                        
-                        #current_theta = theta[t]
-                        #self.vis.set_up_image_theta(seg_dice=seg_dice[t].mean(), theta=current_theta, x=current_cropped)
+                    self.vis.set_up_image_attn_weights(seg_dice=seg_dice[b].mean(), attn_weights=attn_weights[b], x=current_x)
                 
     
     def get_dc_per_class(self, key):
@@ -538,6 +460,7 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
             self.vis.log_worst_seg_images(colormap=cmap, norm=norm, epoch=self.epoch)
             self.vis.log_best_gradient_images(colormap=cm.plasma, epoch=self.epoch)
             self.vis.log_worst_gradient_images(colormap=cm.plasma, epoch=self.epoch)
+            self.vis.log_attn_map_images(colormap=cm.plasma, epoch=self.epoch)
             #self.vis.log_slot_images(colormap=cmap, epoch=self.epoch)
             #self.vis.log_target_images(colormap=cm.plasma, epoch=self.epoch)
                 #self.vis.log_deformable_attention_images(colormap=cm.plasma, epoch=self.epoch)
@@ -585,27 +508,7 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
         return (t, b, z, x, y)
 
     
-    def setup_deformable_attention(self, sampling_locations, attention_weights, data, indices, theta_coords):
-        # sampling_locations = T, B, n_zones, T, n_heads, area_size, area_size, n_points, 2
-        # attention_weights = T, B, n_zones, T, n_heads, area_size, area_size, n_points
-        # theta_coords = T, B, n_zones, 4
-
-        t, b, z, x, y = indices
-
-        sampling_locations = sampling_locations[t, b] # n_zones, T, n_heads, area_size, area_size, n_points, 2
-        attention_weights = attention_weights[t, b] # n_zones, T, n_heads, area_size, area_size, n_points
-        theta_coords = theta_coords[t, b] # n_zones, 4
-        data = data[:, b] # T, 1, H, W
-
-        sampling_locations = sampling_locations.permute(0, 1, 3, 4, 2, 5, 6)
-        sampling_locations = torch.flatten(sampling_locations, start_dim=4, end_dim=5) # n_zones, T, area_size, area_size, -1, 2
-
-        attention_weights = attention_weights.permute(0, 1, 3, 4, 2, 5)
-        attention_weights = torch.flatten(attention_weights, start_dim=4, end_dim=5) # n_zones, T, area_size, area_size, -1
-
-        return sampling_locations, attention_weights, data, theta_coords
-    
-    def run_online_evaluation_video(self, data, target, pred, labeled_binary, cropped_input, cropped_target, attn_weights=None, target_feature_map=None, attention_weights=None, sampling_locations=None, theta_coords=None):
+    def run_online_evaluation(self, data, target, pred, attn_weights=None):
         """
         due to deep supervision the return value and the reference are now lists of tensors. We only need the full
         resolution output because this is what we are interested in in the end. The others are ignored
@@ -616,35 +519,18 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
         gradient_image = None
         gradient_x = None
         coords = None
-        indices_da = None
 
-        output_l, target_l = self.get_only_labeled(pred, target, labeled_binary)
-        input_l, _ = self.get_only_labeled(data, target, labeled_binary)
-
-        indices = self.sample_indices(cropped_target)
-        gradient_image, gradient_x = self.get_gradient_images(cropped_input, indices)
+        indices = self.sample_indices(target)
+        gradient_image, gradient_x = self.get_gradient_images(data, indices)
         coords = (indices[0], indices[4], indices[3]) # (t, x, y)
-        
-        if self.epoch_iter_nb == self.num_val_batches_per_epoch - 1 and attention_weights is not None:
-            # sampling_locations = T, B, n_zones, T, n_heads, area_size, area_size, n_points, 2
-            # attention_weights = T, B, n_zones, T, n_heads, area_size, area_size, n_points
-            # theta_coords = T, B, n_zones, 4
-
-            indices_da = self.sample_indices_da(attention_weights)
-            sampling_locations, attention_weights, cropped_input, theta_coords = self.setup_deformable_attention(sampling_locations, attention_weights, cropped_input, indices_da, theta_coords)
             
 
-        return self.start_online_evaluation_video(pred=output_l,
-                                                    x=input_l, 
-                                                    target=target_l,
-                                                    video_cropped_input=cropped_input,
+        return self.start_online_evaluation_video(pred=pred,
+                                                    x=data, 
+                                                    target=target,
                                                     gradient_image=gradient_image,
                                                     gradient_x=gradient_x,
-                                                    theta_coords=theta_coords,
-                                                    attention_weights=attention_weights,
-                                                    sampling_locations=sampling_locations,
                                                     coords=coords,
-                                                    coords_da=indices_da,
                                                     attn_weights=attn_weights)
 
     def validate(self, do_mirroring: bool = True, use_sliding_window: bool = True,
@@ -689,30 +575,8 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
         self.network.do_ds = ds
         return ret
         
-    def get_only_labeled(self, output, target, labeled_binary):
-        tuple_indices = torch.nonzero(labeled_binary, as_tuple=True)
 
-        #output = torch.flatten(output, start_dim=0, end_dim=1)
-        #target = torch.flatten(target, start_dim=0, end_dim=1)
-        #labeled_binary = torch.flatten(labeled_binary, start_dim=0, end_dim=1)
-
-        output_l = output[tuple_indices[0], tuple_indices[1]]
-        target_l = target[tuple_indices[0], tuple_indices[1]]
-
-        return output_l, target_l
-
-    def compute_losses_video(self, output_seg, target, labeled_binary, output_heat=None, pseudo_labels=None):
-        assert torch.all(torch.any(labeled_binary, dim=0))
-        nb_frames = len(output_seg)
-        assert nb_frames == len(target)
-
-        output_seg_l, target_seg_l = self.get_only_labeled(output_seg, target, labeled_binary) # N, 1, crop_size, crop_size
-        #input_l, _ = self.get_only_labeled(input_list, target_list, labeled_binary)
-
-        #print(input_l.shape)
-        #print(target_l.shape)
-        #print(output_l.shape)
-#
+    def compute_losses(self, source_gt, source_pred, student_target_pred, teacher_target_pred):
         #matplotlib.use("QtAgg")
         #fig, ax = plt.subplots(2, len(output_l))
         #for i in range(len(output_l)):
@@ -724,30 +588,10 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
         #        ax[1, i].imshow(target_l[i, 0].cpu(), cmap='gray')  
         #plt.show() 
 
-        if pseudo_labels is not None:
-            pseudo_labels = pseudo_labels.unsqueeze(2)
-            target_un = torch.flatten(pseudo_labels, start_dim=0, end_dim=1)
-            output_un = output[~labeled_binary]
-            target_un = target_un[~labeled_binary]
-            seg_loss_un = self.segmentation_loss(output_un, target_un)
-            assert len(output_l) + len(output_un) == nb_frames
-
-            if len(output_l) > 0:
-                seg_loss_l = self.segmentation_loss(output_l, target_l)
-                self.loss_data['segmentation'][1] = 0.5 * seg_loss_un + 0.5 * seg_loss_l
-            else:
-                self.loss_data['segmentation'][1] = seg_loss_un
-        else:
-            assert len(output_seg_l) > 0
-
-            seg_loss_l = self.segmentation_loss(output_seg_l, target_seg_l)
-            self.loss_data['segmentation'][1] = seg_loss_l
-            if output_heat is not None:
-                heatmap_gt = self.get_heatmap_gt(target_seg_l)
-                output_heat_l, _ = self.get_only_labeled(output_heat, target, labeled_binary)
-                assert output_heat_l.shape == heatmap_gt.shape
-                seg_loss_l = self.heatmap_loss(output_heat_l, heatmap_gt)
-                self.loss_data['heatmap'][1] = seg_loss_l    
+        seg_loss = self.segmentation_loss(source_pred, source_gt)
+        self.loss_data['segmentation'][1] = seg_loss
+        consistency_loss = self.consistency_loss(student_target_pred, teacher_target_pred)
+        self.loss_data['consistency'][1] = consistency_loss    
 
 
     def select_deep_supervision(self, x):
@@ -767,60 +611,8 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
             l += classification_loss
         #self.writer.add_scalar('Iteration/Info loss', l, self.iter_nb)
 
-    def get_weights_info(self, input_tuple):
-        weights = input_tuple[0]
-        target = input_tuple[1]
-        B, T = target.shape
-        B, C, T = weights.shape
-        
-        w_std = F.softmax(weights, dim=1)
-        w_std_time = w_std.std(dim=-1) # B, Class_dim
-        w_std_weights = w_std.std(dim=1) # B, T
 
-        selection_loss = self.info_loss(weights, target)
-
-        self.loss_data['selection'][1] = selection_loss
-        
-        #self.writer.add_scalar('Iteration/selection_loss', selection_loss, self.iter_nb)
-        self.writer.add_scalar('Iteration/std_across_time', w_std_time.mean(), self.iter_nb)
-        self.writer.add_scalar('Iteration/std_across_weights', w_std_weights.mean(), self.iter_nb)
-    
-
-    def get_heatmap_gt(self, target):
-        target[target > 0] = 1
-        target = target.squeeze(1) # N, crop_size, crop_size
-        heatmaps = torch.zeros_like(target).float()
-        
-        print(target.shape)
-        reduced_target = torch.flatten(target, start_dim=1)
-        mask = torch.count_nonzero(reduced_target, dim=-1) > 0
-        non_null_idx = torch.where(mask)[0]
-        print(mask)
-        print(non_null_idx)
-        filtered_target = target[mask]
-        print(target.shape)
-
-        if torch.any(mask):
-            coords = masks_to_boxes(filtered_target)
-            x = coords[:, 0] + ((coords[:, 2] - coords[:, 0]) / 2)
-            y = coords[:, 1] + ((coords[:, 3] - coords[:, 1]) / 2)
-            centroids = torch.stack([x, y], dim=-1) # N, 2
-            centroids = torch.round(centroids).long() # N, 2
-            heatmaps[non_null_idx, centroids[:, 0], centroids[:, 1]] = 1.
-            heatmaps = gaussian_blur(heatmaps, kernel_size=15)
-
-        matplotlib.use('QtAgg')
-        fig, ax = plt.subplots(2, 2)
-        ax[0, 0].imshow(heatmaps[0].cpu(), cmap='plasma')
-        ax[0, 1].imshow(target[0].cpu(), cmap='gray')
-        ax[1, 0].imshow(heatmaps[1].cpu(), cmap='plasma')
-        ax[1, 1].imshow(target[1].cpu(), cmap='gray')
-        plt.show()
-
-        return heatmaps.unsqueeze(1)
-
-
-    def run_iteration_video(self, data_generator, do_backprop=True, run_online_evaluation=False):
+    def run_iteration(self, source_data_generator, target_data_generator, do_backprop=True, run_online_evaluation=False):
         """
         gradient clipping improves training stability
 
@@ -829,28 +621,25 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
         :param run_online_evaluation:
         :return:
         """
-        theta = cropped_volume = None
 
-        data_dict = next(data_generator)
-        data_list = data_dict['data']
-        target_list = data_dict['target']
+        source_data_dict = next(source_data_generator)
+        source = source_data_dict['data']
+        source_gt = source_data_dict['target']
 
-        labeled_binary = data_dict['labeled_binary']
-        labeled_binary = maybe_to_torch(labeled_binary).bool()
+        target_data_dict = next(target_data_generator)
+        target = target_data_dict['data']
+
+        source = maybe_to_torch(source)
         if torch.cuda.is_available():
-            labeled_binary = to_cuda(labeled_binary)
-
-        for i, data in enumerate(data_list):
-            data = maybe_to_torch(data)
-            if torch.cuda.is_available():
-                data = to_cuda(data)
-            data_list[i] = data
+            source = to_cuda(source)
         
-        for i, target in enumerate(target_list):
-            target = maybe_to_torch(target)
-            if torch.cuda.is_available():
-                target = to_cuda(target)
-            target_list[i] = target
+        target = maybe_to_torch(target)
+        if torch.cuda.is_available():
+            target = to_cuda(target)
+        
+        source_gt = maybe_to_torch(source_gt)
+        if torch.cuda.is_available():
+            source_gt = to_cuda(source_gt)
 
         #matplotlib.use('QtAgg')
         #fig, ax = plt.subplots(2, len(data_list))
@@ -860,39 +649,18 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
         #    ax[1, i].imshow(target_list[i][0, 0].cpu(), cmap='gray')
         #plt.show()
 
-        data_list = [self.select_deep_supervision(d) for d in data_list]
-        data = torch.stack(data_list, dim=0)
-        target_list = [self.select_deep_supervision(t) for t in target_list]
-        target = torch.stack(target_list, dim=0)
 
-        with torch.no_grad():
-            x, padding_need, pseudo_labels, mean_centroids = self.processor.preprocess_no_registration(data_list=data_list)
-            cropped_target, _ = self.processor.crop_and_pad(data_volume=target.transpose(0, 1), mean_centroids=mean_centroids)
-            #network_input, padding_need, translation_dists = self.processor.preprocess(data_list=data_list, idx=data_dict['registered_idx'])
         self.optimizer.zero_grad()
 
-        #if not do_backprop:
-        #    matplotlib.use('QtAgg')
-        #    print(padding_need)
-        #    fig, ax = plt.subplots(1, self.video_length)
-        #    for i in range(self.video_length):
-        #        ax[i].imshow(x[i, 0, 0].cpu(), cmap='gray')
-        #    plt.show()
+        out_student_source = self.student(source)
+        out_student_target = self.student(target)
+        with torch.no_grad():
+            out_teacher_target = self.teacher(target)
 
-        #for module in self.network.modules():
-        #    if isinstance(module, nn.BatchNorm2d):
-        #        print(module.training)
-
-        cropped_output = self.network(x)
-        #self.get_classification_loss(cropped_output['classification_list'])
-        self.get_weights_info(cropped_output['weights_list'])
-
-        #output_seg = self.processor.uncrop(output_seg, padding_need, translation_dists)
-
-        if self.force_one_label:
-            self.compute_losses_video(output_seg=cropped_output['predictions'], output_heat=cropped_output['heatmap'], target=cropped_target, labeled_binary=labeled_binary, pseudo_labels=None)
-        else:
-            self.compute_losses_video(output_seg=cropped_output['predictions'], output_heat=cropped_output['heatmap'], target=cropped_target, labeled_binary=labeled_binary, pseudo_labels=pseudo_labels)
+        self.compute_losses(source_gt=source_gt, 
+                            source_pred=out_student_source['predictions'], 
+                            student_target_pred=out_student_target['predictions'],
+                            teacher_target_pred=out_teacher_target['predictions'])
         
         l = self.consolidate_only_one_loss_data(self.loss_data, log=do_backprop)
         #del loss_data
@@ -938,19 +706,10 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
         #plt.show()
 
         if run_online_evaluation and self.log_images:
-            output_seg = self.processor.uncrop_no_registration(cropped_output['predictions'], padding_need)
-            assert output_seg.shape[-1] == self.image_size, print(output_seg.shape[-1])
-            self.run_online_evaluation_video(data=data, 
-                                             target=target, 
-                                             pred=output_seg, 
-                                             labeled_binary=labeled_binary, 
-                                             cropped_input=x, 
-                                             attention_weights=cropped_output['attention_weights'], 
-                                             sampling_locations=cropped_output['sampling_points'], 
-                                             theta_coords=cropped_output['theta_coords'], 
-                                             cropped_target=cropped_target,
-                                             attn_weights=None)
-        del data_list, target_list
+            self.run_online_evaluation(data=source,
+                                       target=source_gt,
+                                       pred=out_student_source['predictions'],
+                                       attn_weights=out_student_target['attention_map'])
 
         if do_backprop:
             self.iter_nb += 1
@@ -1329,7 +1088,7 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
         return continue_training
 
     
-    def run_training_mtl_video(self):
+    def run_training_uda(self):
         if not torch.cuda.is_available():
             self.print_to_log_file("WARNING!!! You are attempting to run training on a CPU (torch.cuda.is_available() is False). This can be VERY slow!")
 
@@ -1359,8 +1118,6 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
 
             # train one epoch
             self.network.train()
-            if self.fine_tuning:
-                self.freeze_batchnorm_layers(self.network)
 
             if self.use_progress_bar:
                 with trange(self.num_batches_per_epoch) as tbar:
@@ -1368,13 +1125,13 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
                         self.epoch_iter_nb = b
                         tbar.set_description("Epoch {}/{}".format(self.epoch+1, self.max_num_epochs))
 
-                        l = self.run_iteration_video(self.tr_gen, do_backprop=True)
+                        l = self.run_iteration(self.tr_gen, do_backprop=True)
 
                         tbar.set_postfix(loss=l)
                         train_losses_epoch.append(l)
             else:
                 for _ in range(self.num_batches_per_epoch):
-                    l = self.run_iteration_video(self.tr_gen, True)
+                    l = self.run_iteration(self.tr_gen, True)
                     train_losses_epoch.append(l)
 
             self.all_tr_losses.append(np.mean(train_losses_epoch))
@@ -1387,20 +1144,18 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
                     val_losses = []
                     for b in range(self.num_val_batches_per_epoch):
                         self.epoch_iter_nb = b
-                        l = self.run_iteration_video(self.val_gen, do_backprop=False, run_online_evaluation=True)
+                        l = self.run_iteration(self.val_gen, do_backprop=False, run_online_evaluation=True)
                         val_losses.append(l)
                     self.all_val_losses.append(np.mean(val_losses))
                     self.print_to_log_file("validation loss: %.4f" % self.all_val_losses[-1])
 
                     if self.also_val_in_tr_mode:
                         self.network.train()
-                        if self.fine_tuning:
-                            self.freeze_batchnorm_layers(self.network)
                         # validation with train=True
                         val_losses = []
                         for b in range(self.num_val_batches_per_epoch):
                             self.epoch_iter_nb = b
-                            l = self.run_iteration_video(self.val_gen, do_backprop=False)
+                            l = self.run_iteration(self.val_gen, do_backprop=False)
                             val_losses.append(l)
                         self.all_val_losses_tr_mode.append(np.mean(val_losses))
                         self.print_to_log_file("validation loss (train=True): %.4f" % self.all_val_losses_tr_mode[-1])
@@ -1449,7 +1204,7 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
         ds = self.network.do_ds
         #self.network.do_ds = True
         self.save_debug_information()
-        ret = self.run_training_mtl_video()
+        ret = self.run_training_uda()
         self.network.do_ds = ds
         return ret
 
@@ -1462,12 +1217,12 @@ class nnMTLTrainerV2Video(nnUNetTrainer):
     def get_basic_generators(self):
         self.load_dataset()
         self.do_split()
-        dl_un_tr = None
-        dl_un_val = None
-        dl_tr = DataLoaderVideoUnlabeled(self.dataset_tr, self.basic_generator_patch_size, self.patch_size, self.batch_size, unlabeled_dataset=self.dataset_un_tr, is_val=False, video_length=self.video_length, step=self.step, force_one_label=self.force_one_label,
-                                    oversample_foreground_percent=self.oversample_foreground_percent,
-                                    pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
-        dl_val = DataLoaderVideoUnlabeled(self.dataset_val, self.patch_size, self.patch_size, self.batch_size, unlabeled_dataset=self.dataset_un_val, is_val=True, video_length=self.video_length, step=self.step, force_one_label=self.force_one_label,
-                                    oversample_foreground_percent=self.oversample_foreground_percent,
-                                    pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
-        return dl_tr, dl_val, dl_un_tr, dl_un_val
+        dl_tr_source = DataLoader2D(self.dataset_source_tr, self.basic_generator_patch_size, self.patch_size, self.batch_size,
+                                oversample_foreground_percent=self.oversample_foreground_percent,
+                                pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r', classification=self.classification)
+        
+        dl_tr_target = DataLoader2DUnlabeled(self.dataset_un_tr, self.basic_generator_patch_size, self.patch_size, self.batch_size,
+                                            oversample_foreground_percent=self.oversample_foreground_percent,
+                                            pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
+        
+        return dl_tr_source, dl_tr_target

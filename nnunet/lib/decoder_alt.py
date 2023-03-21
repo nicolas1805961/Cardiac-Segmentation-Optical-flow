@@ -768,6 +768,96 @@ class SegmentationDecoder(nn.Module):
         return output_list
 
 
+class SegmentationDecoder2(nn.Module):
+    r""" Swin Transformer
+        A PyTorch impl of : `Swin Transformer: Hierarchical Vision Transformer using Shifted Windows`  -
+          https://arxiv.org/pdf/2103.14030
+
+    Args:
+        img_size (int | tuple(int)): Input image size. Default 224
+        patch_size (int | tuple(int)): Patch size. Default: 4
+        in_chans (int): Number of input image channels. Default: 3
+        num_classes (int): Number of classes for classification head. Default: 1000
+        embed_dim (int): Patch embedding dimension. Default: 96
+        depths (tuple(int)): Depth of each Swin Transformer layer.
+        num_heads (tuple(int)): Number of attention heads in different layers.
+        window_size (int): Window size. Default: 7
+        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim. Default: 4
+        qkv_bias (bool): If True, add a learnable bias to query, key, value. Default: True
+        qk_scale (float): Override default qk scale of head_dim ** -0.5 if set. Default: None
+        drop_rate (float): Dropout rate. Default: 0
+        attn_drop_rate (float): Attention dropout rate. Default: 0
+        drop_path_rate (float): Stochastic depth rate. Default: 0.1
+        norm_layer (nn.Module): Normalization layer. Default: nn.LayerNorm.
+        ape (bool): If True, add absolute position embedding to the patch embedding. Default: False
+        patch_norm (bool): If True, add normalization after patch embedding. Default: True
+        use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False
+    """
+
+    def __init__(self,
+                conv_depth,
+                conv_layer,
+                dpr,
+                in_encoder_dims, 
+                out_encoder_dims,
+                num_classes,
+                img_size,
+                norm,
+                last_activation='identity',
+                **kwargs):
+        super().__init__()
+
+        self.num_stages = len(conv_depth)
+        self.img_size = img_size
+        self.num_classes = num_classes
+        
+        # build decoder layers
+        self.layers = nn.ModuleList()
+        self.upsample_layers = nn.ModuleList()
+
+        for i_layer in range(self.num_stages):
+            in_dim = out_encoder_dims[i_layer] * 2 if i_layer == 0 else in_encoder_dims[i_layer - 1]
+
+            upsample_layer = PatchExpand(norm=norm, in_dim=in_dim, out_dim=out_encoder_dims[i_layer], swin_abs_pos=False)
+
+            #out_dim = out_encoder_dims[i_layer] * 2 if i_layer == self.num_stages - 1 else in_encoder_dims[i_layer]
+            out_dim = out_encoder_dims[i_layer] if i_layer == self.num_stages - 1 else in_encoder_dims[i_layer]
+            layer_up = conv_layer(in_dim=out_encoder_dims[i_layer] * 2, 
+                            out_dim=out_dim,
+                            nb_blocks=conv_depth[i_layer], 
+                            kernel_size=3,
+                            dpr=dpr[i_layer],
+                            norm=norm)
+            self.layers.append(layer_up)
+            self.upsample_layers.append(upsample_layer)
+
+        #self.norm = nn.LayerNorm(out_encoder_dims[0] * 2)
+        #self.norm_up = norm_layer(self.embed_dim)
+        if last_activation == 'sigmoid':
+            self.last_activation = torch.nn.Sigmoid()
+        elif last_activation == 'softmax':
+            self.last_activation = torch.nn.Softmax(dim=1)
+        elif last_activation == 'identity':
+            self.last_activation = nn.Identity()
+    
+
+    def forward(self, x, encoder_skip_connections):
+
+        for i, (layer_up,
+                upsample_layer,
+                encoder_skip_connection,
+                ) in enumerate(zip(
+                    self.layers,
+                    self.upsample_layers,
+                    reversed(encoder_skip_connections)
+                    )):
+            x = upsample_layer(x)
+            x = torch.cat((encoder_skip_connection, x), dim=1)
+            x = layer_up(x)
+
+        return x
+
+
 class VideoSegmentationDecoder(nn.Module):
     r""" Swin Transformer
         A PyTorch impl of : `Swin Transformer: Hierarchical Vision Transformer using Shifted Windows`  -

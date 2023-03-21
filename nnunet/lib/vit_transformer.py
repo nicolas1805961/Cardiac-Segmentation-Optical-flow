@@ -798,39 +798,73 @@ class ModulationTransformer(nn.Module):
     
 
 class TransformerDecoder(nn.Module):
-    def __init__(self, dim, num_heads, num_layers, d_ffn, nb_object_bus=4):
+    def __init__(self, dim, num_heads, num_layers, d_ffn, nb_object_bus):
         super().__init__()
         self.nb_object_bus = nb_object_bus
         self.num_layers = num_layers
         self.object_pos = nn.Parameter(torch.randn(self.nb_object_bus, dim))
+        self.object_tokens = nn.Parameter(torch.randn(self.nb_object_bus, dim))
 
         layer = TransformerDecoderLayer(dim=dim, num_heads=num_heads, d_ffn=d_ffn)
         #layer = TransformerEncoderLayer(d_model=dim, nhead=num_heads, dim_feedforward=d_ffn)
         self.layers = _get_clones(layer, num_layers)
     
 
-    def forward(self, object_tokens, spatial_tokens, pos_2d):
+    def forward(self, spatial_tokens, pos_2d):
         B, L, C = spatial_tokens.shape
 
-        query = object_tokens[None, :, :].repeat(B, 1, 1)
+        query = self.object_tokens[None, :, :].repeat(B, 1, 1)
         query_pos = self.object_pos[None, :, :].repeat(B, 1, 1)
         pos_2d = pos_2d.view(1, L, C).repeat(B, 1, 1)
 
         for layer in self.layers:
-            query, attn_weights = layer(query=query, key=spatial_tokens, query_pos=query_pos, key_pos=pos_2d)
+            query = layer(query=query, key=spatial_tokens, query_pos=query_pos, key_pos=pos_2d)
 
-        #spatial_tokens = spatial_tokens.permute(0, 2, 1).view(T, B, C, H * W).view(T, B, C, H, W)
-        #query = query.permute(1, 0, 2).contiguous() # T, B, C
-        return query, attn_weights
+        #object_tokens = query[:, :4]
+        #heatmap_token = query[:, -1].unsqueeze(1)
+        return query
     
 
+class TransformerLayers(nn.Module):
+    def __init__(self, dim, num_heads, num_layers, d_ffn, nb_spatial_tokens):
+        super().__init__()
+        self.nb_spatial_tokens = nb_spatial_tokens
+        self.num_layers = num_layers
+        self.class_tokens = nn.Parameter(torch.randn(1, dim))
+        self.pos_2d = nn.Parameter(torch.randn(nb_spatial_tokens + 1, dim))
+
+        layer = TransformerEncoderLayer(d_model=dim, nhead=num_heads, dim_feedforward=d_ffn)
+        self.layers = _get_clones(layer, num_layers)
+    
+
+    def forward(self, spatial_tokens):
+        B, C, H, W = spatial_tokens.shape
+        L = H * W
+
+        class_tokens = self.class_tokens[None, :, :].repeat(B, 1, 1)
+        pos = self.pos_2d.view[None, :, :].repeat(B, 1, 1)
+
+        spatial_tokens = spatial_tokens.permute(0, 2, 3, 1).contiguous()
+        spatial_tokens = spatial_tokens.view(B, H * W, C)
+
+        src = torch.cat([spatial_tokens, class_tokens], dim=1)
+
+        for layer in self.layers:
+            src, weights = layer(src=src, pos=pos)
+
+        spatial_tokens = src[:, :L]
+        #class_tokens = src[:, L:]
+        class_token_weights = weights[:, :L, :L]
+
+        return spatial_tokens, class_token_weights
+    
 
 class TransformerDecoderLayer(nn.Module):
     def __init__(self, dim, num_heads, d_ffn, dropout=0.0):
         super().__init__()
 
         #self.cross_attn_layer = SlotAttention(dim=dim)
-        self.cross_attn_layer = SlotAttention(dim=dim)
+        self.cross_attn_layer = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads, batch_first=True, dropout=dropout)
         self.norm1 = nn.LayerNorm(dim)
         self.dropout1 = nn.Dropout(dropout)
 
@@ -860,7 +894,7 @@ class TransformerDecoderLayer(nn.Module):
         query = query + self.dropout1(tgt2)
         query = self.norm1(query)
 
-        tgt2, attn_weights = self.cross_attn_layer(query=query, key=key, value=key, query_pos=query_pos, key_pos=key_pos)
+        tgt2 = self.cross_attn_layer(query=self.with_pos_embed(query, query_pos), key=self.with_pos_embed(key, key_pos), value=key)[0]
         query = query + self.dropout2(tgt2)
         query = self.norm2(query)
 
@@ -870,7 +904,7 @@ class TransformerDecoderLayer(nn.Module):
 
         #spatial_tokens = spatial_tokens.permute(0, 2, 1).view(T, B, C, H * W).view(T, B, C, H, W)
         #object_tokens = object_tokens.permute(1, 0, 2).contiguous() # T, B, C
-        return query, attn_weights
+        return query
 
 
 class ChannelAttention(nn.Module):
@@ -1299,14 +1333,13 @@ class TransformerEncoderLayer(nn.Module):
                      src_key_padding_mask: Optional[Tensor] = None,
                      pos: Optional[Tensor] = None):
         q = k = self.with_pos_embed(src, pos)
-        src2 = self.self_attn(q, k, value=src, attn_mask=src_mask,
-                              key_padding_mask=src_key_padding_mask)[0]
+        src2, weights = self.self_attn(q, k, value=src, attn_mask=src_mask, key_padding_mask=src_key_padding_mask)
         src = src + self.dropout1(src2)
         src = self.norm1(src)
         src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
         src = src + self.dropout2(src2)
         src = self.norm2(src)
-        return src
+        return src, weights
 
     def forward_pre(self, src,
                     src_mask: Optional[Tensor] = None,
@@ -1314,13 +1347,12 @@ class TransformerEncoderLayer(nn.Module):
                     pos: Optional[Tensor] = None):
         src2 = self.norm1(src)
         q = k = self.with_pos_embed(src2, pos)
-        src2 = self.self_attn(q, k, value=src2, attn_mask=src_mask,
-                              key_padding_mask=src_key_padding_mask)[0]
+        src2, weights = self.self_attn(q, k, value=src2, attn_mask=src_mask, key_padding_mask=src_key_padding_mask)
         src = src + self.dropout1(src2)
         src2 = self.norm2(src)
         src2 = self.linear2(self.dropout(self.activation(self.linear1(src2))))
         src = src + self.dropout2(src2)
-        return src
+        return src, weights
 
     def forward(self, src,
                 src_mask: Optional[Tensor] = None,

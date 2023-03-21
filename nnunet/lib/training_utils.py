@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 from nnunet.network_architecture.MTL_model import MTLmodel, PolicyNet
 from nnunet.network_architecture.temporal_model import VideoModel
+from nnunet.network_architecture.UDA_model import UDAModel
 from tqdm import tqdm
 import logging
 import os
@@ -833,6 +834,25 @@ def build_video_model(config, conv_layer, conv_layer_1d, norm_2d, norm_1d, log_f
     #    model = load_weights(model)
 
     return model
+
+
+def build_UDA_model(config, conv_layer, norm, image_size):
+
+    model = UDAModel(out_encoder_dims=config['out_encoder_dims'],
+             device=config['device'],
+             in_dims=config['in_encoder_dims'],
+             image_size=image_size,
+             num_bottleneck_layers=config['num_bottleneck_layers'],
+             conv_layer=conv_layer,
+             conv_depth=config['conv_depth'],
+             bottleneck_heads=config['bottleneck_heads'],
+             drop_path_rate=config['drop_path_rate'],
+             norm_2d=norm)
+        
+    model = model.to(config['device'])
+
+    return model
+
 
 def build_2d_model(config, conv_layer, norm, log_function, image_size, window_size, middle, num_classes):
 

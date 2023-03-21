@@ -90,20 +90,23 @@ class Processor(object):
     
     def get_mean_centroid(self, data):
         B, T, H, W = data.shape
+        data[data > 0] = 1
         mean_centroid_list = []
         for b in range(len(data)):
-            current_data = data[b]
-            current_flattened_data = torch.flatten(current_data, start_dim=1)
-            mask = torch.count_nonzero(current_flattened_data, dim=-1) != 0
-            if torch.count_nonzero(mask) < T / 2:
-                mean_centroid = torch.tensor([H / 2, W / 2], device=data.device).view(2)
-            else:
-                current_data = current_data[mask]
-                coords = masks_to_boxes(current_data)
-                x = coords[:, 0] + ((coords[:, 2] - coords[:, 0]) / 2)
-                y = coords[:, 1] + ((coords[:, 3] - coords[:, 1]) / 2)
-                coords = torch.stack([x, y], dim=-1)
-                mean_centroid = coords.mean(dim=0)
+            current_data_batch = data[b]
+            centroid_list = []
+            for t in range(len(current_data_batch)):
+                current_data_time = current_data_batch[t]
+                if torch.count_nonzero(current_data_time) == 0:
+                    centroid = torch.tensor([H / 2, W / 2], device=data.device).view(1, 2)
+                else:
+                    coords = masks_to_boxes(current_data_time.unsqueeze(0))
+                    x = coords[:, 0] + ((coords[:, 2] - coords[:, 0]) / 2)
+                    y = coords[:, 1] + ((coords[:, 3] - coords[:, 1]) / 2)
+                    centroid = torch.stack([x, y], dim=-1)
+                centroid_list.append(centroid)
+            centroid_list = torch.cat(centroid_list, dim=0)
+            mean_centroid = centroid_list.mean(0)
             mean_centroid_list.append(mean_centroid)
         return torch.stack(mean_centroid_list, dim=0).int()
     
@@ -175,7 +178,7 @@ class Processor(object):
         return out_volume
     
     def uncrop_no_registration(self, output, padding_need):
-        output_volume = output['predictions'].transpose(0, 1)
+        output_volume = output.transpose(0, 1)
         assert len(output_volume) == len(padding_need)
         out_list = []
         for b in range(len(output_volume)):
@@ -219,23 +222,21 @@ class Processor(object):
         network_input = {'labeled_data': [cropped_volume[:, i] for i in range(cropped_volume.shape[1])]}
         return network_input, padding_need, translation_dists
     
-    def crop_and_pad(self, data_volume, mean_centroids, video_padding):
+    def crop_and_pad(self, data_volume, mean_centroids):
         cropped_volume, padding_need = self.crop_data(data_volume, mean_centroids) # B, T, 1, 128, 128
 
-        video_padding = video_padding.permute(1, 0) # B, T
-        cropped_volume[video_padding] = torch.zeros(size=(cropped_volume.shape[-2], cropped_volume.shape[-1]), dtype=cropped_volume.dtype, device=cropped_volume.device)
         assert torch.all(torch.isfinite(cropped_volume))
         assert cropped_volume.shape[-1] == self.crop_size, print(cropped_volume.shape[-1])
 
         cropped_volume = cropped_volume.transpose(0, 1)
         return cropped_volume, padding_need
 
-    def preprocess_no_registration(self, data_list, video_padding):
+    def preprocess_no_registration(self, data_list):
         temp_volume = self.discretize(data_list) # B, T, H, W
 
         mean_centroids = self.get_mean_centroid(temp_volume) # B, 2
         data_volume = torch.stack(data_list, dim=1) # B, T, 1, H, W
 
-        cropped_volume, padding_need = self.crop_and_pad(data_volume, mean_centroids, video_padding)
+        cropped_volume, padding_need = self.crop_and_pad(data_volume, mean_centroids)
 
         return cropped_volume, padding_need, temp_volume, mean_centroids

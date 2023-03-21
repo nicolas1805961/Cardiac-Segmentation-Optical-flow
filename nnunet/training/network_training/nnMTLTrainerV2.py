@@ -2456,17 +2456,17 @@ class nnMTLTrainerV2(nnUNetTrainer):
         else:
             dl_tr = DataLoader2D(self.dataset_tr, self.basic_generator_patch_size, self.patch_size, self.batch_size,
                                 oversample_foreground_percent=self.oversample_foreground_percent,
-                                pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r', classification=self.classification)
+                                pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
             dl_val = DataLoader2D(self.dataset_val, self.patch_size, self.patch_size, self.batch_size,
                                 oversample_foreground_percent=self.oversample_foreground_percent,
-                                pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r', classification=self.classification)
+                                pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
             if self.unlabeled:
                 dl_un_tr = DataLoader2DUnlabeled(self.dataset_un_tr, self.basic_generator_patch_size, self.patch_size, self.batch_size,
                                             oversample_foreground_percent=self.oversample_foreground_percent,
-                                            pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r', classification=self.classification)
+                                            pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
                 dl_un_val = DataLoader2DUnlabeled(self.dataset_un_val, self.basic_generator_patch_size, self.patch_size, self.batch_size,
                                             oversample_foreground_percent=self.oversample_foreground_percent,
-                                            pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r', classification=self.classification)
+                                            pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
         return dl_tr, dl_val, dl_un_tr, dl_un_val
 
 
