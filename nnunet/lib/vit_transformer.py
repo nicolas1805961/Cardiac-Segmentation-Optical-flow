@@ -825,39 +825,172 @@ class TransformerDecoder(nn.Module):
         return query
     
 
-class TransformerLayers(nn.Module):
-    def __init__(self, dim, num_heads, num_layers, d_ffn, nb_spatial_tokens):
+class TransformerFlowDecoder(nn.Module):
+    def __init__(self, dim, num_heads, num_layers, d_ffn):
         super().__init__()
-        self.nb_spatial_tokens = nb_spatial_tokens
         self.num_layers = num_layers
-        self.class_tokens = nn.Parameter(torch.randn(1, dim))
-        self.pos_2d = nn.Parameter(torch.randn(nb_spatial_tokens + 1, dim))
+        self.object_pos = nn.Parameter(torch.randn(6, dim))
+        self.object_tokens = nn.Parameter(torch.randn(6, dim))
 
-        layer = TransformerEncoderLayer(d_model=dim, nhead=num_heads, dim_feedforward=d_ffn)
+        layer = TransformerDecoderLayer(dim=dim, num_heads=num_heads, d_ffn=d_ffn)
+        #layer = TransformerEncoderLayer(d_model=dim, nhead=num_heads, dim_feedforward=d_ffn)
         self.layers = _get_clones(layer, num_layers)
+
+        self.pos_obj = PositionEmbeddingSine2d(num_pos_feats=dim // 2, normalize=True)
     
 
-    def forward(self, spatial_tokens):
-        B, C, H, W = spatial_tokens.shape
-        L = H * W
+    def forward(self, feature_map):
+        B, C, H, W = feature_map.shape
 
-        class_tokens = self.class_tokens[None, :, :].repeat(B, 1, 1)
-        pos = self.pos_2d.view[None, :, :].repeat(B, 1, 1)
+        pos = self.pos_obj(shape_util=(B, H, W), device=feature_map.device)
+        pos = pos.permute(0, 2, 3, 1).contiguous()
+        pos = pos.view(B, H * W, C)
 
-        spatial_tokens = spatial_tokens.permute(0, 2, 3, 1).contiguous()
-        spatial_tokens = spatial_tokens.view(B, H * W, C)
+        feature_map = feature_map.permute(0, 2, 3, 1).contiguous()
+        feature_map = feature_map.view(B, H * W, C)
 
-        src = torch.cat([spatial_tokens, class_tokens], dim=1)
+        query = self.object_tokens[None, :, :].repeat(B, 1, 1)
+        query_pos = self.object_pos[None, :, :].repeat(B, 1, 1)
 
+        out_list = []
         for layer in self.layers:
-            src, weights = layer(src=src, pos=pos)
+            query = layer(query=query, key=feature_map, query_pos=query_pos, key_pos=pos)
+            out_list.append(query)
 
-        spatial_tokens = src[:, :L]
-        #class_tokens = src[:, L:]
-        class_token_weights = weights[:, :L, :L]
-
-        return spatial_tokens, class_token_weights
+        return out_list[::-1]
     
+
+class TransformerFlowLayer(nn.Module):
+
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.0,
+                 activation="relu", normalize_before=False):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.cross_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        # Implementation of Feedforward model
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+
+        self.activation = nn.GELU()
+        self.normalize_before = normalize_before
+
+    def with_pos_embed(self, tensor, pos: Optional[Tensor]):
+        return tensor if pos is None else tensor + pos
+
+    def forward_post(self, myself, other, pos):
+        q = k = self.with_pos_embed(myself, pos)
+        tgt2 = self.self_attn(q, k, value=myself)[0]
+        myself = myself + self.dropout1(tgt2)
+        myself = self.norm1(myself)
+
+        tgt2 = self.cross_attn(query=self.with_pos_embed(myself, pos), key=self.with_pos_embed(other, pos), value=other)[0]
+        myself = myself + self.dropout2(tgt2)
+        myself = self.norm2(myself)
+
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(myself))))
+        myself = myself + self.dropout3(tgt2)
+        myself = self.norm3(myself)
+        return myself
+
+    def forward(self, myself, other, pos):
+        return self.forward_post(myself, other, pos)
+
+
+class TransformerFlowEncoder(nn.Module):
+    def __init__(self, dim, nhead, num_layers, video_length):
+        super().__init__()
+
+        spatial_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
+        self.spatial_layers = _get_clones(spatial_layer, num_layers)
+
+        temporal_layer = TransformerEncoderLayer(d_model=dim, nhead=nhead)
+        self.temporal_layers = _get_clones(temporal_layer, num_layers)
+
+        self.pos_obj_2d = PositionEmbeddingSine2d(num_pos_feats=dim // 2, normalize=True)
+        self.pos_obj_1d = PositionEmbeddingSine1d(num_pos_feats=dim, normalize=True)
+
+        self.token_pos = nn.Parameter(torch.randn(6, dim))
+        self.temporal_tokens = nn.Parameter(torch.randn(6 * video_length, dim))
+    
+    
+    def forward(self, labeled_spatial_features, unlabeled_spatial_features):
+        '''labeled_spatial_features: B, C, H, W
+            unlabeled_spatial_features: T, B, C, H, W'''
+        
+        shape = unlabeled_spatial_features.shape
+        T, B, C, H, W = shape
+
+        labeled_spatial_features = labeled_spatial_features[None, :, :, :, :].repeat(T, 1, 1, 1, 1)
+        labeled_spatial_features = labeled_spatial_features.permute(0, 1, 3, 4, 2).contiguous() # T, B, H, W, C
+        labeled_spatial_features = labeled_spatial_features.view(T * B, H * W, C)
+
+        unlabeled_spatial_features = unlabeled_spatial_features.permute(0, 1, 3, 4, 2).contiguous() # T, B, H, W, C
+        unlabeled_spatial_features = unlabeled_spatial_features.view(T * B, H * W, C)
+
+        pos_2d = self.pos_obj_2d(shape_util=(B, H, W), device=labeled_spatial_features.device)
+        pos_2d = pos_2d.permute(0, 2, 3, 1).contiguous()
+        pos_2d = pos_2d.view(B, H * W, C).repeat(T, 1, 1)
+
+        pos_1d = self.pos_obj_1d(shape_util=(B, T), device=labeled_spatial_features.device) # B, C, T
+        pos_1d = pos_1d.permute(0, 2, 1).contiguous() # B, T, C
+        pos_1d = pos_1d.repeat(6, 2, 1) # B * 6, T * 2, C
+        token_pos = self.token_pos[None, :, :].repeat(T * B, 1, 1)
+
+        temporal_tokens = self.temporal_tokens[None, :, :].repeat(B, 1, 1).view(T * B, 6, C)
+        labeled_token_features = temporal_tokens
+        unlabeled_token_features = temporal_tokens
+
+        pos = torch.cat([pos_2d, token_pos], dim=1)
+
+        for spatial_layer, temporal_layer in zip(self.spatial_layers, self.temporal_layers):
+            labeled = torch.cat([labeled_spatial_features, labeled_token_features], dim=1)
+            unlabeled = torch.cat([unlabeled_spatial_features, unlabeled_token_features], dim=1)
+
+            labeled = spatial_layer(labeled, unlabeled, pos)
+            unlabeled = spatial_layer(unlabeled, labeled, pos)
+
+            labeled_spatial_features = labeled[:, :-6]
+            labeled_token_features = labeled[:, -6:] # T * B, 6, C
+            labeled_token_features = labeled_token_features.view(T, B, 6, C)
+            labeled_token_features = labeled_token_features.permute(1, 2, 0, 3).contiguous() # B, 6, T, C
+
+            unlabeled_spatial_features = unlabeled[:, :-6]
+            unlabeled_token_features = unlabeled[:, -6:] # T * B, 6, C
+            unlabeled_token_features = unlabeled_token_features.view(T, B, 6, C)
+            unlabeled_token_features = unlabeled_token_features.permute(1, 2, 0, 3).contiguous() # B, 6, T, C
+
+            token_features = torch.stack([labeled_token_features, unlabeled_token_features], dim=3) # B, 6, T, 2, C
+            token_features = token_features.view(B * 6, T * 2, C)
+
+            token_features = temporal_layer(src=token_features, pos=pos_1d)[0] # B * 6, T * 2, C
+            token_features = token_features.view(B, 6, T, 2, C)
+
+            labeled_token_features = token_features[:, :, :, 0, :] # B, 6, T, C
+            labeled_token_features = labeled_token_features.permute(2, 0, 1, 3).contiguous() # T, B, 6, C
+            labeled_token_features = labeled_token_features.view(T * B, 6, C)
+
+            unlabeled_token_features = token_features[:, :, :, 1, :] # B, 6, T, C
+            unlabeled_token_features = unlabeled_token_features.permute(2, 0, 1, 3).contiguous() # T, B, 6, C
+            unlabeled_token_features = unlabeled_token_features.view(T * B, 6, C)
+
+        labeled_spatial_features = labeled_spatial_features.view(T, B, H, W, C)
+        labeled_spatial_features = labeled_spatial_features.permute(0, 1, 4, 2, 3).contiguous()
+
+        unlabeled_spatial_features = unlabeled_spatial_features.view(T, B, H, W, C)
+        unlabeled_spatial_features = unlabeled_spatial_features.permute(0, 1, 4, 2, 3).contiguous()
+
+        labeled_token_features = labeled_token_features.view(T, B, 6, C)
+        unlabeled_token_features = unlabeled_token_features.view(T, B, 6, C)
+
+        return labeled_spatial_features, unlabeled_spatial_features, labeled_token_features, unlabeled_token_features
 
 class TransformerDecoderLayer(nn.Module):
     def __init__(self, dim, num_heads, d_ffn, dropout=0.0):
@@ -1140,7 +1273,7 @@ class TransformerEncoder(nn.Module):
         output = torch.flatten(output, start_dim=2).permute(0, 2, 1)
 
         for layer in self.layers:
-            output = layer(output, src_mask=mask, src_key_padding_mask=src_key_padding_mask, pos=pos)
+            output = layer(output, src_mask=mask, src_key_padding_mask=src_key_padding_mask, pos=pos)[0]
 
         if self.norm is not None:
             output = self.norm(output)
@@ -1307,7 +1440,7 @@ class RelativeTransformerEncoderLayer(nn.Module):
 
 class TransformerEncoderLayer(nn.Module):
 
-    def __init__(self, d_model, nhead, dim_feedforward, dropout=0.0,
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.0,
                  activation="gelu", normalize_before=False):
         super().__init__()
         self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)

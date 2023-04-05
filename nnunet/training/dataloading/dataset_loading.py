@@ -12,6 +12,9 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
+import torch
+from monai.transforms import NormalizeIntensity
+import cv2 as cv
 from collections import OrderedDict
 import numpy as np
 import sys
@@ -20,6 +23,11 @@ from multiprocessing import Pool
 from math import ceil, floor
 from scipy.signal import savgol_filter
 from numpy.lib.stride_tricks import sliding_window_view
+import albumentations as A
+import monai.transforms as T
+from monai.transforms import Compose
+from monai.utils.misc import set_determinism
+import random
 
 from batchgenerators.dataloading.data_loader import SlimDataLoaderBase
 
@@ -1737,6 +1745,586 @@ class DataLoaderVideoUnlabeled(SlimDataLoaderBase):
         #    plt.show()
 
         return {'data': data, 'seg': seg, 'properties': case_properties, "keys": keys, "labeled_binary": labeled_binary}
+
+class DataLoaderFlow(SlimDataLoaderBase):
+    def __init__(self, data, patch_size, final_patch_size, batch_size, unlabeled_dataset, video_length, step, force_one_label, processor, is_val, crop_size, oversample_foreground_percent=0.0,
+                 memmap_mode="r", pseudo_3d_slices=1, pad_mode="edge",
+                 pad_kwargs_data=None, pad_sides=None):
+        """
+        This is the basic data loader for 2D networks. It uses preprocessed data as produced by my (Fabian) preprocessing.
+        You can load the data with load_dataset(folder) where folder is the folder where the npz files are located. If there
+        are only npz files present in that folder, the data loader will unpack them on the fly. This may take a while
+        and increase CPU usage. Therefore, I advise you to call unpack_dataset(folder) first, which will unpack all npz
+        to npy. Don't forget to call delete_npy(folder) after you are done with training?
+        Why all the hassle? Well the decathlon dataset is huge. Using npy for everything will consume >1 TB and that is uncool
+        given that I (Fabian) will have to store that permanently on /datasets and my local computer. With this strategy all
+        data is stored in a compressed format (factor 10 smaller) and only unpacked when needed.
+        :param data: get this with load_dataset(folder, stage=0). Plug the return value in here and you are g2g (good to go)
+        :param patch_size: what patch size will this data loader return? it is common practice to first load larger
+        patches so that a central crop after data augmentation can be done to reduce border artifacts. If unsure, use
+        get_patch_size() from data_augmentation.default_data_augmentation
+        :param final_patch_size: what will the patch finally be cropped to (after data augmentation)? this is the patch
+        size that goes into your network. We need this here because we will pad patients in here so that patches at the
+        border of patients are sampled properly
+        :param batch_size:
+        :param num_batches: how many batches will the data loader produce before stopping? None=endless
+        :param seed:
+        :param stage: ignore this (Fabian only)
+        :param transpose: ignore this
+        :param random: sample randomly; CAREFUL! non-random sampling requires batch_size=1, otherwise you will iterate batch_size times over the dataset
+        :param pseudo_3d_slices: 7 = 3 below and 3 above the center slice
+        """
+        super(DataLoaderFlow, self).__init__(data, batch_size, None)
+        if pad_kwargs_data is None:
+            pad_kwargs_data = OrderedDict()
+        self.pad_kwargs_data = pad_kwargs_data
+        self.pad_mode = pad_mode
+        self.crop_size = crop_size
+        self.is_val = is_val
+        self.pseudo_3d_slices = pseudo_3d_slices
+        self.oversample_foreground_percent = oversample_foreground_percent
+        self.final_patch_size = final_patch_size
+        self.patch_size = patch_size
+        self.list_of_keys = list(self._data.keys())
+        self.un_list_of_keys = list(unlabeled_dataset.keys())
+        self.need_to_pad = np.array(patch_size) - np.array(final_patch_size)
+        self.memmap_mode = memmap_mode
+        self.video_length = video_length
+        self.step = step
+        self.percent = None
+        self.force_one_label = force_one_label
+        if pad_sides is not None:
+            if not isinstance(pad_sides, np.ndarray):
+                pad_sides = np.array(pad_sides)
+            self.need_to_pad += pad_sides
+        self.pad_sides = pad_sides
+        self.data_shape, self.seg_shape = self.determine_shapes()
+        self.un_data = unlabeled_dataset
+
+        self.preprocessing_transform = self.set_up_preprocessing_pipeline()
+        self.pixel_transform, self.spatial_transform = self.set_up_augmentation_pipeline()
+
+        self.processor = processor
+
+    def determine_shapes(self):
+        num_seg = 1
+
+        k = list(self._data.keys())[0]
+        if isfile(self._data[k]['data_file'][:-4] + ".npy"):
+            case_all_data = np.load(self._data[k]['data_file'][:-4] + ".npy", self.memmap_mode)
+        else:
+            case_all_data = np.load(self._data[k]['data_file'])['data']
+        num_color_channels = case_all_data.shape[0] - num_seg
+        data_shape = (self.batch_size, num_color_channels, *self.patch_size)
+        seg_shape = (self.batch_size, num_seg, *self.patch_size)
+        return data_shape, seg_shape
+
+    def get_do_oversample(self, batch_idx):
+        return not batch_idx < round(self.batch_size * (1 - self.oversample_foreground_percent))
+    
+    def select_deep_supervision(self, x):
+        if self.deep_supervision:
+            return x[0]
+        else:
+            return x
+        
+
+    def my_crop(self, labeled, seg, unlabeled):
+
+        xm = labeled.shape[-1] / 2
+        ym = labeled.shape[-2] / 2
+
+        x1 = int(round(xm - self.final_patch_size[1] / 2))
+        x2 = int(round(xm + self.final_patch_size[1] / 2))
+        y1 = int(round(ym - self.final_patch_size[0] / 2))
+        y2 = int(round(ym + self.final_patch_size[0] / 2))
+
+        labeled = labeled[:, :, y1:y2, x1:x2]
+        seg = seg[:, :, y1:y2, x1:x2]
+
+        xm = unlabeled.shape[-1] / 2
+        ym = unlabeled.shape[-2] / 2
+
+        x1 = int(round(xm - self.final_patch_size[1] / 2))
+        x2 = int(round(xm + self.final_patch_size[1] / 2))
+        y1 = int(round(ym - self.final_patch_size[0] / 2))
+        y2 = int(round(ym + self.final_patch_size[0] / 2))
+
+        unlabeled = unlabeled[:, :, :, y1:y2, x1:x2]
+
+        return labeled, seg, unlabeled
+    
+    def preprocess(self, image, mask):
+        if mask is not None:
+            data = {'image': image, 'mask': mask}
+            transformed = self.preprocessing_transform(data)
+            image = transformed['image']
+            mask = transformed['mask']
+        else:
+            data = {'image': image}
+            transformed = self.preprocessing_transform(data)
+            image = transformed['image']
+
+        return image, mask
+    
+    def augment(self, image, mask, seed):
+        self.pixel_transform = self.pixel_transform.set_random_state(seed=seed)
+        self.spatial_transform = self.spatial_transform.set_random_state(seed=seed)
+        
+        temp = torch.clone(image)
+        padding_mask = image == 0
+
+        if mask is not None:
+            data = {'image': image, 'mask': mask}
+            pixel_transformed = self.pixel_transform(data)
+            image = pixel_transformed['image']
+            mask = pixel_transformed['mask']
+            image[padding_mask] = 0
+            data = {'image': image, 'mask': mask}
+            spatial_transformed = self.spatial_transform(data)
+            image = spatial_transformed['image']
+            mask = spatial_transformed['mask']
+
+            #matplotlib.use('QtAgg')
+            #fig, ax = plt.subplots(1, 3)
+            #ax[0].imshow(temp[0].cpu(), cmap='gray')
+            #ax[1].imshow(image[0].cpu(), cmap='gray')
+            #ax[2].imshow(mask[0].cpu(), cmap='gray')
+            #plt.show()
+        else:
+            data = {'image': image}
+            pixel_transformed = self.pixel_transform(data)
+            image = pixel_transformed['image']
+            image[padding_mask] = 0
+            data = {'image': image}
+            spatial_transformed = self.spatial_transform(data)
+            image = spatial_transformed['image']
+
+            #matplotlib.use('QtAgg')
+            #fig, ax = plt.subplots(1, 3)
+            #ax[0].imshow(temp[0].cpu(), cmap='gray')
+            #ax[1].imshow(image[0].cpu(), cmap='gray')
+            #ax[2].imshow(mask[0].cpu(), cmap='gray')
+            #plt.show()
+
+        return image, mask
+    
+    def set_up_preprocessing_pipeline(self):
+        preprocess = Compose([
+                            T.SpatialPadd(keys=['image', 'mask'], spatial_size=self.final_patch_size, allow_missing_keys=True),
+                            T.CenterSpatialCropd(keys=['image', 'mask'], roi_size=self.final_patch_size, allow_missing_keys=True),
+                            T.ToTensor(dtype=torch.float32, device='cuda:0')
+                            ])
+
+        return preprocess
+    
+    def set_up_augmentation_pipeline(self):
+        spatial_transform = Compose([
+                                    T.RandFlipd(keys=['image', 'mask'], prob=0.5, spatial_axis=0, allow_missing_keys=True),
+                                    T.RandFlipd(keys=['image', 'mask'], prob=0.5, spatial_axis=1, allow_missing_keys=True),
+                                    T.RandRotated(keys=['image', 'mask'], prob=0.2, range_x=np.pi, mode=["bilinear", "nearest"], padding_mode="zeros", allow_missing_keys=True),
+                                    T.RandZoomd(keys=['image', 'mask'], prob=0.2, min_zoom=0.8, max_zoom=1.2, mode=["bilinear", "nearest"], padding_mode="constant", allow_missing_keys=True),
+                                    T.RandAffined(keys=['image', 'mask'], prob=0.2, translate_range=(-26, 26), mode=["bilinear", "nearest"], padding_mode="zeros", allow_missing_keys=True)
+                                    ])
+
+        pixel_transform = Compose([
+                                T.RandGaussianNoised(keys=['image'], prob=0.2, std=0.1, allow_missing_keys=True),
+                                T.RandScaleIntensityd(keys=['image'], prob=0.2, factors=0.2, allow_missing_keys=True),
+                                T.RandAdjustContrastd(keys=['image'], prob=0.2, gamma=(0.7, 1.5), allow_missing_keys=True),
+                                T.RandGaussianSmoothd(keys=['image'], prob=0.2, sigma_x=(0.5, 1.0), sigma_y=(0.5, 1.0), allow_missing_keys=True),
+                                T.RandGaussianSharpend(keys=['image'], prob=0.2, sigma1_x=(0.2, 0.3), sigma1_y=(0.2, 0.3), sigma2_x=0.2, sigma2_y=0.2, alpha=(20.0, 20.0), allow_missing_keys=True)
+                                ])
+
+        return pixel_transform, spatial_transform
+
+    def generate_train_batch(self):
+        #eval_idx = None
+        selected_keys = np.random.choice(self.list_of_keys, self.batch_size, True, None)
+        list_of_frames = []
+        for i in range(len(selected_keys)):
+            patient_id = selected_keys[i][:10]
+            l_filtered = [x for x in self.list_of_keys if x[:10] in patient_id]
+            un_filtered = [x for x in self.un_list_of_keys if x[:10] in patient_id]
+            filtered = l_filtered + un_filtered
+            list_of_frames.append(filtered)
+
+        labeled = torch.full(size=(self.batch_size, 1, *self.final_patch_size), fill_value=torch.nan, device='cuda:0')
+        unlabeled = torch.full(size=(self.video_length, self.batch_size, 1, *self.final_patch_size), fill_value=torch.nan, device='cuda:0')
+        seg = torch.full(size=(self.batch_size, 1, *self.final_patch_size), fill_value=torch.nan, device='cuda:0')
+
+        cropped_labeled = torch.full(size=(self.batch_size, 1, self.crop_size, self.crop_size), fill_value=torch.nan, device='cuda:0')
+        cropped_unlabeled = torch.full(size=(self.video_length, self.batch_size, 1, self.crop_size, self.crop_size), fill_value=torch.nan, device='cuda:0')
+        cropped_seg = torch.full(size=(self.batch_size, 1, self.crop_size, self.crop_size), fill_value=torch.nan, device='cuda:0')
+
+        case_properties = []
+        padding_need_list = []
+        for j, frames in enumerate(list_of_frames):
+            labeled_frame = frames[0]
+            if 'properties' in self._data[labeled_frame].keys():
+                properties = self._data[labeled_frame]['properties']
+            else:
+                properties = load_pickle(self._data[labeled_frame]['properties_file'])
+            case_properties.append(properties)
+
+            depth = properties['size_after_resampling'][0]
+            depth_idx = np.random.choice(depth)
+
+            frames = sorted(frames, key=lambda x: int(x[16:18]))
+            frames = np.array(frames)
+            labeled_idx = np.where(~np.char.endswith(frames, '_u'))[0]
+
+            if self.step > 1:
+                if np.all(labeled_idx % 2 == 0):
+                    frames = frames[0::self.step]
+                elif np.all(labeled_idx % 2 != 0):
+                    frames = frames[1::self.step]
+                else:
+                    start = np.random.randint(0, 2)
+                    frames = frames[start::self.step]
+                labeled_idx = np.where(~np.char.endswith(frames, '_u'))[0]
+
+            values = np.arange(len(frames))
+
+            values = np.pad(values, (10000, 10000), mode='wrap')
+            windows = sliding_window_view(values, self.video_length)
+            mask = np.isin(windows[:, 0], labeled_idx)
+            windows = windows[mask]
+            window_idx = np.random.choice(len(windows))
+            frame_indices = windows[window_idx]
+            assert len(frame_indices) == self.video_length
+            video = frames[frame_indices]
+
+            for idx, t in enumerate(video):
+
+                if '_u' in t:
+                    if not isfile(self.un_data[t]['data_file'][:-4] + ".npy"):
+                        # lets hope you know what you're doing
+                        case_all_data = np.load(self.un_data[t]['data_file'][:-4] + ".npz")['data']
+                    else:
+                        case_all_data = np.load(self.un_data[t]['data_file'][:-4] + ".npy", self.memmap_mode)
+                else:
+                    if not isfile(self._data[t]['data_file'][:-4] + ".npy"):
+                        # lets hope you know what you're doing
+                        case_all_data = np.load(self._data[t]['data_file'][:-4] + ".npz")['data']
+                    else:
+                        case_all_data = np.load(self._data[t]['data_file'][:-4] + ".npy", self.memmap_mode)
+
+                # this is for when there is just a 2d slice in case_all_data (2d support)
+                if len(case_all_data.shape) == 3:
+                    case_all_data = case_all_data[:, None]
+                
+                assert case_all_data.shape[1] == depth
+
+                # now crop case_all_data to contain just the slice of interest. If we want additional slice above and
+                # below the current slice, here is where we get them. We stack those as additional color channels
+                slice_data = case_all_data[:, depth_idx]
+
+                # case all data should now be (c, x, y)
+                assert len(slice_data.shape) == 3
+
+                if idx == 0:
+                    image = slice_data[:-1].copy()
+                    mask = slice_data[-1:].copy()
+                    image = image + 1e-8
+                    mask[mask < 0] = 0
+
+                    image, mask = self.preprocess(image, mask)
+
+                    seg[j] = mask
+                    labeled[j] = image
+                else:
+                    image = slice_data.copy()
+                    image = image + 1e-8
+
+                    image, _ = self.preprocess(image, None)                    
+
+                unlabeled[idx, j] = image
+
+            with torch.no_grad():
+                mean_centroid, _ = self.processor.preprocess_no_registration(data=unlabeled[:, j]) # T, C(1), H, W
+
+                cropped_unlabeled[:, j], padding_need = self.processor.crop_and_pad(data=unlabeled[:, j], mean_centroid=mean_centroid)
+                padding_need_list.append(padding_need)
+
+                current_cropped_label, _ = self.processor.crop_and_pad(data=labeled[j][None], mean_centroid=mean_centroid)
+                cropped_labeled[j] = current_cropped_label[0]
+
+                current_cropped_seg, _ = self.processor.crop_and_pad(data=seg[j][None], mean_centroid=mean_centroid)
+                cropped_seg[j] = current_cropped_seg[0]
+
+            
+            if not self.is_val:
+                seed = random.randint(0, 2**32-1)
+                cropped_labeled[j], cropped_seg[j] = self.augment(image=cropped_labeled[j], mask=cropped_seg[j], seed=seed)
+
+                #matplotlib.use('QtAgg')
+                #fig, ax = plt.subplots(2, len(cropped_unlabeled))
+                for t in range(len(cropped_unlabeled)):
+                    #temp = torch.clone(cropped_unlabeled[t, j])
+                    cropped_unlabeled[t, j], _ = self.augment(image=cropped_unlabeled[t, j], mask=None, seed=seed)
+                    #ax[0, t].imshow(cropped_unlabeled[t, j, 0].cpu(), cmap='gray')
+                    #ax[1, t].imshow(temp[0].cpu(), cmap='gray')
+                #plt.show()
+
+            mu = cropped_unlabeled[:, j].mean().item()
+            sigma = cropped_unlabeled[:, j].std().item()
+            cropped_labeled[j] = NormalizeIntensity(subtrahend=mu, divisor=sigma, nonzero=True)(cropped_labeled[j])
+            cropped_unlabeled[:, j] = NormalizeIntensity(subtrahend=mu, divisor=sigma, nonzero=True)(cropped_unlabeled[:, j])
+
+        keys = selected_keys
+
+        #print(seg.shape)
+        #print(np.unique(seg))
+        #matplotlib.use('QtAgg')
+        #fig, ax = plt.subplots(1, 2)
+        #ax[0].imshow(labeled[3, 0], cmap='gray')
+        #ax[1].imshow(seg[3, 0], cmap='gray')
+        #plt.show()
+
+
+        assert torch.all(torch.isin(cropped_seg, torch.tensor([0, 1, 2, 3], device=cropped_seg.device)))
+        padding_need = torch.stack(padding_need_list, dim=0) # B, 4
+
+        return {'labeled': cropped_labeled, 
+                'unlabeled':cropped_unlabeled, 
+                'target': cropped_seg,
+                'padding_need': padding_need,
+                'properties': case_properties, 
+                "keys": keys}
+    
+
+class DataLoader2DBinary(SlimDataLoaderBase):
+    def __init__(self, data, patch_size, final_patch_size, batch_size, deep_supervision, isval, oversample_foreground_percent=0.0,
+                 memmap_mode="r", pseudo_3d_slices=1, pad_mode="edge",
+                 pad_kwargs_data=None, pad_sides=None):
+        """
+        This is the basic data loader for 2D networks. It uses preprocessed data as produced by my (Fabian) preprocessing.
+        You can load the data with load_dataset(folder) where folder is the folder where the npz files are located. If there
+        are only npz files present in that folder, the data loader will unpack them on the fly. This may take a while
+        and increase CPU usage. Therefore, I advise you to call unpack_dataset(folder) first, which will unpack all npz
+        to npy. Don't forget to call delete_npy(folder) after you are done with training?
+        Why all the hassle? Well the decathlon dataset is huge. Using npy for everything will consume >1 TB and that is uncool
+        given that I (Fabian) will have to store that permanently on /datasets and my local computer. With this strategy all
+        data is stored in a compressed format (factor 10 smaller) and only unpacked when needed.
+        :param data: get this with load_dataset(folder, stage=0). Plug the return value in here and you are g2g (good to go)
+        :param patch_size: what patch size will this data loader return? it is common practice to first load larger
+        patches so that a central crop after data augmentation can be done to reduce border artifacts. If unsure, use
+        get_patch_size() from data_augmentation.default_data_augmentation
+        :param final_patch_size: what will the patch finally be cropped to (after data augmentation)? this is the patch
+        size that goes into your network. We need this here because we will pad patients in here so that patches at the
+        border of patients are sampled properly
+        :param batch_size:
+        :param num_batches: how many batches will the data loader produce before stopping? None=endless
+        :param seed:
+        :param stage: ignore this (Fabian only)
+        :param transpose: ignore this
+        :param random: sample randomly; CAREFUL! non-random sampling requires batch_size=1, otherwise you will iterate batch_size times over the dataset
+        :param pseudo_3d_slices: 7 = 3 below and 3 above the center slice
+        """
+        super(DataLoader2DBinary, self).__init__(data, batch_size, None)
+        if pad_kwargs_data is None:
+            pad_kwargs_data = OrderedDict()
+        self.pad_kwargs_data = pad_kwargs_data
+        self.pad_mode = pad_mode
+        self.isval = isval
+        self.pseudo_3d_slices = pseudo_3d_slices
+        self.oversample_foreground_percent = oversample_foreground_percent
+        self.final_patch_size = final_patch_size
+        self.patch_size = patch_size
+        self.list_of_keys = list(self._data.keys())
+        self.need_to_pad = np.array(patch_size) - np.array(final_patch_size)
+        self.memmap_mode = memmap_mode
+        if pad_sides is not None:
+            if not isinstance(pad_sides, np.ndarray):
+                pad_sides = np.array(pad_sides)
+            self.need_to_pad += pad_sides
+        self.pad_sides = pad_sides
+        self.data_shape, self.seg_shape = self.determine_shapes()
+
+        self.preprocessing_transform = self.set_up_preprocessing_pipeline()
+        if isval:
+            self.pixel_transform = self.spatial_transform = None
+        else:
+            self.pixel_transform, self.spatial_transform = self.set_up_augmentation_pipeline()
+        self.deep_supervision = deep_supervision
+
+    def determine_shapes(self):
+        num_seg = 1
+
+        k = list(self._data.keys())[0]
+        if isfile(self._data[k]['data_file'][:-4] + ".npy"):
+            case_all_data = np.load(self._data[k]['data_file'][:-4] + ".npy", self.memmap_mode)
+        else:
+            case_all_data = np.load(self._data[k]['data_file'])['data']
+        num_color_channels = case_all_data.shape[0] - num_seg
+        data_shape = (self.batch_size, num_color_channels, *self.patch_size)
+        seg_shape = (self.batch_size, num_seg, *self.patch_size)
+        return data_shape, seg_shape
+
+    def get_do_oversample(self, batch_idx):
+        return not batch_idx < round(self.batch_size * (1 - self.oversample_foreground_percent))
+    
+    def preprocess(self, image, mask):
+        data = {'image': image, 'mask': mask}
+        transformed = self.preprocessing_transform(data)
+        image = transformed['image']
+        mask = transformed['mask']
+
+        return image, mask
+    
+    def augment(self, image, mask):
+        temp = np.copy(image)
+        padding_mask = image == 0
+
+
+        data = {'image': image, 'mask': mask}
+        pixel_transformed = self.pixel_transform(data)
+        image = pixel_transformed['image']
+        mask = pixel_transformed['mask']
+        image[padding_mask] = 0
+
+        matplotlib.use('QtAgg')
+        fig, ax = plt.subplots(1, 3)
+        ax[0].imshow(temp[0], cmap='gray')
+        ax[1].imshow(image[0], cmap='gray')
+        ax[2].imshow(mask[0], cmap='gray')
+        plt.show()
+        
+        data = {'image': image, 'mask': mask}
+        spatial_transformed = self.spatial_transform(data)
+        image = spatial_transformed['image']
+        mask = spatial_transformed['mask']
+
+        matplotlib.use('QtAgg')
+        fig, ax = plt.subplots(1, 3)
+        ax[0].imshow(temp[0], cmap='gray')
+        ax[1].imshow(image[0], cmap='gray')
+        ax[2].imshow(mask[0], cmap='gray')
+        plt.show()
+
+        return image, mask
+
+    def get_deep_supervision_scales(self, image, mask):
+        resized_image_list = []
+        resized_mask_list = []
+        for i in range(3):
+            resized_image = cv.resize(image, (self.final_patch_size[0] // 2**i, self.final_patch_size[1] // 2**i), interpolation=cv.INTER_LINEAR)
+            resized_mask = cv.resize(mask, (self.final_patch_size[0] // 2**i, self.final_patch_size[1] // 2**i), interpolation=cv.INTER_NEAREST)
+            resized_image_list.append(resized_image)
+            resized_mask_list.append(resized_mask)
+
+        return resized_image_list, resized_mask_list
+
+    def set_up_preprocessing_pipeline(self):
+        preprocess = Compose([
+                            T.SpatialPadd(keys=['image', 'mask'], spatial_size=self.final_patch_size),
+                            T.CenterSpatialCropd(keys=['image', 'mask'], roi_size=self.final_patch_size)
+                            ])
+
+        return preprocess
+    
+    def set_up_augmentation_pipeline(self):
+        spatial_transform = Compose([
+                                    T.RandFlipd(keys=['image', 'mask'], prob=0.5, spatial_axis=0),
+                                    T.RandFlipd(keys=['image', 'mask'], prob=0.5, spatial_axis=1),
+                                    T.RandRotated(keys=['image', 'mask'], prob=0.2, range_x=np.pi, mode=["bilinear", "nearest"], padding_mode="zeros"),
+                                    T.RandZoomd(keys=['image', 'mask'], prob=0.2, min_zoom=0.8, max_zoom=1.2, mode=["bilinear", "nearest"], padding_mode="constant"),
+                                    T.RandAffined(keys=['image', 'mask'], prob=0.2, translate_range=(-26, 26), mode=["bilinear", "nearest"], padding_mode="zeros")
+                                    ])
+
+        pixel_transform = Compose([
+                                    T.RandGaussianNoised(keys=['image'], prob=0.2, std=0.1),
+                                    T.RandScaleIntensityd(keys=['image'], prob=0.2, factors=0.2),
+                                    T.RandAdjustContrastd(keys=['image'], prob=0.2, gamma=(0.7, 1.5)),
+                                    T.RandGaussianSmoothd(keys=['image'], prob=0.2, sigma_x=(0.5, 1.0), sigma_y=(0.5, 1.0)),
+                                    T.RandGaussianSharpend(keys=['image'], prob=0.2, sigma1_x=(0.2, 0.3), sigma1_y=(0.2, 0.3), sigma2_x=0.2, sigma2_y=0.2, alpha=(20.0, 20.0))
+                                    ])
+
+        return pixel_transform, spatial_transform
+
+    def generate_train_batch(self):
+        selected_keys = np.random.choice(self.list_of_keys, self.batch_size, True, None)
+
+        if self.deep_supervision:
+            B, C, H, W = (self.batch_size, 1, *self.final_patch_size)
+            data = [np.zeros((B, C, H // 2**i, W // 2**i), dtype=np.float32) for i in range(3)]
+            seg = [np.zeros((B, C, H // 2**i, W // 2**i), dtype=np.float32) for i in range(3)]
+        else:
+            B, C, H, W = (self.batch_size, 1, *self.final_patch_size)
+            data = [np.zeros((B, C, H // 2**i, W // 2**i), dtype=np.float32) for i in range(1)]
+            seg = [np.zeros((B, C, H // 2**i, W // 2**i), dtype=np.float32) for i in range(1)]
+
+        case_properties = []
+        for j, i in enumerate(selected_keys):
+            if 'properties' in self._data[i].keys():
+                properties = self._data[i]['properties']
+            else:
+                properties = load_pickle(self._data[i]['properties_file'])
+            case_properties.append(properties)
+
+            if self.get_do_oversample(j):
+                force_fg = True
+            else:
+                force_fg = False
+
+            if not isfile(self._data[i]['data_file'][:-4] + ".npy"):
+                # lets hope you know what you're doing
+                case_all_data = np.load(self._data[i]['data_file'][:-4] + ".npz")['data']
+            else:
+                case_all_data = np.load(self._data[i]['data_file'][:-4] + ".npy", self.memmap_mode)
+
+            # this is for when there is just a 2d slice in case_all_data (2d support)
+            if len(case_all_data.shape) == 3:
+                case_all_data = case_all_data[:, None]
+
+            # first select a slice. This can be either random (no force fg) or guaranteed to contain some class
+            random_slice = np.random.choice(case_all_data.shape[1])
+
+            # now crop case_all_data to contain just the slice of interest. If we want additional slice above and
+            # below the current slice, here is where we get them. We stack those as additional color channels
+            case_all_data = case_all_data[:, random_slice]
+
+            # case all data should now be (c, x, y)
+            assert len(case_all_data.shape) == 3
+            
+            assert np.min(case_all_data[:-1]) >= 0.0
+            image = case_all_data[:-1].copy()
+            mask = case_all_data[-1:].copy()
+            image = image + 1e-8
+            mask[mask < 0] = 0
+            mask[mask > 0] = 1
+
+            image, mask = self.preprocess(image, mask)
+            if not self.isval:
+                image, mask = self.augment(image, mask)
+
+            mu = image.mean()
+            sigma = image.std()
+            image = NormalizeIntensity(subtrahend=mu, divisor=sigma, nonzero=True)(image)
+
+            assert np.all(np.isin(mask, [0, 1]))
+
+            if not self.isval and self.deep_supervision:
+                image_list, mask_list = self.get_deep_supervision_scales(image[0], mask[0])
+                for i in range(3):
+                    data[i][j] = image_list[i][None]
+                    seg[i][j] = mask_list[i][None]
+            else:
+                data[j] = image[None]
+                seg[j] = mask[None]
+
+        keys = selected_keys
+
+        #print(seg.shape)
+        #print(np.unique(seg))
+        #matplotlib.use('QtAgg')
+        #fig, ax = plt.subplots(1, 2)
+        #ax[0].imshow(labeled[3, 0], cmap='gray')
+        #ax[1].imshow(seg[3, 0], cmap='gray')
+        #plt.show()
+
+        return {'data': data, 'target': seg, 'properties': case_properties, "keys": keys}
+    
 
 if __name__ == "__main__":
     t = "Task002_Heart"

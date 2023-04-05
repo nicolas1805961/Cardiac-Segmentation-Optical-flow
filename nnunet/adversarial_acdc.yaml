@@ -67,7 +67,7 @@ conv_depth: [2, 2, 2]
 transformer_depth: [] #[2, 2, 2], [2]
 num_heads: [] #[3, 6, 12], [8] [12]
 spatial_cross_attention_num_heads: [2, 4, 8] #[2, 4, 6, 8, 12] [12, 8, 6, 4, 2] [bottom, ..., top] [3, 6, 12] [4, 4, 8, 8, 16]
-batch_size: 10 #6
+batch_size: 2 #6
 bottleneck: 'swin' # ['vit', 'swin', 'factorized', 'vit_3d', 'swin_3d']
 rpe_mode: 'bias' # ['contextual', 'bias', 'None']
 rpe_contextual_tensors: 'qkv'
@@ -131,7 +131,6 @@ directional_field_weight: 1.0
 
 learn_transforms: False
 use_cropped_images: True
-binary: False
 
 reconstruction: False
 reconstruction_skip: False

@@ -71,7 +71,6 @@ class ModelWrap(SegmentationNetwork):
 
 class MTLmodel(SegmentationNetwork):
     def __init__(self,
-                binary,
                 attention_map,
                 shortcut,
                 patch_size, 
@@ -142,7 +141,6 @@ class MTLmodel(SegmentationNetwork):
         self.v1 = v1
         self.middle_unlabeled = middle_unlabeled
         self.classification = classification
-        self.binary = binary
         self.do_ds = deep_supervision
         self.conv_op=nn.Conv2d
         self.middle = middle

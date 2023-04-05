@@ -28,6 +28,7 @@ import torch.backends.cudnn as cudnn
 from _warnings import warn
 from sklearn.model_selection import train_test_split
 from scipy.signal import savgol_filter
+from nnunet.training.network_training.data_augmentation import Augmenter
 
 
 import psutil
@@ -69,7 +70,7 @@ from monai.losses import DiceFocalLoss, DiceLoss
 from torch.utils.tensorboard import SummaryWriter
 from nnunet.training.loss_functions.dice_loss import DC_and_CE_loss, DC_and_focal_loss, DC_and_topk_loss, DC_and_CE_loss_Weighted, SoftDiceLoss
 from nnunet.training.loss_functions.crossentropy import RobustCrossEntropyLoss, WeightedRobustCrossEntropyLoss
-from nnunet.training.dataloading.dataset_loading import DataLoader2DMiddle, DataLoader2DUnlabeled
+from nnunet.training.dataloading.dataset_loading import DataLoader2DMiddle, DataLoader2DUnlabeled, DataLoader2DBinary
 from nnunet.training.dataloading.dataset_loading import load_dataset, load_unlabeled_dataset
 from nnunet.network_architecture.MTL_model import ModelWrap
 from nnunet.lib.utils import RFR, ConvBlocks, Resblock, LayerNorm, RFR_1d, Resblock1D, ConvBlocks1D
@@ -85,7 +86,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
     """
 
     def __init__(self, plans_file, fold, output_folder=None, dataset_directory=None, batch_dice=True, stage=None,
-                 unpack_data=True, deterministic=True, fp16=False, middle=False, video=False, inference=False):
+                 unpack_data=True, deterministic=True, fp16=False, middle=False, video=False, inference=False, binary=False):
         super().__init__(plans_file, fold, output_folder, dataset_directory, batch_dice, stage, unpack_data,
                          deterministic, fp16)
         self.middle = middle
@@ -102,6 +103,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
         self.log_images = self.config['log_images']
         self.initial_lr = self.config['initial_lr']
         self.weight_decay = self.config['weight_decay']
+        self.binary = binary
         self.deep_supervision_scales = None
         self.ds_loss_weights = None
         self.use_progress_bar=True
@@ -444,38 +446,17 @@ class nnMTLTrainerV2(nnUNetTrainer):
                         "INFO: Not unpacking data! Training may be slow due to that. Pray you are not using 2d or you "
                         "will wait all winter for your model to finish!")
 
-                if not self.middle:
+                if not self.binary:
                     self.tr_gen, self.val_gen, self.tr_un_gen, self.val_un_gen = get_moreDA_augmentation_mtl(
                     self.dl_tr, self.dl_val, self.dl_un_tr, self.dl_un_val,
                     self.data_aug_params[
                         'patch_size_for_spatialtransform'],
-                    directional_field=self.directional_field,
                     params=self.data_aug_params,
                     deep_supervision_scales=self.deep_supervision_scales,
                     pin_memory=self.pin_memory,
                     use_nondetMultiThreadedAugmenter=False
                     )
-                else:
-                    if self.middle_unlabeled:
-                        self.tr_gen, self.val_gen = get_moreDA_augmentation_middle_unlabeled(
-                        self.dl_tr, self.dl_val,
-                        self.data_aug_params[
-                            'patch_size_for_spatialtransform'],
-                        params=self.data_aug_params,
-                        deep_supervision_scales=self.deep_supervision_scales,
-                        pin_memory=self.pin_memory,
-                        use_nondetMultiThreadedAugmenter=False
-                        )
-                    else:
-                        self.tr_gen, self.val_gen = get_moreDA_augmentation_middle(
-                            self.dl_tr, self.dl_val,
-                            self.data_aug_params[
-                                'patch_size_for_spatialtransform'],
-                            params=self.data_aug_params,
-                            deep_supervision_scales=self.deep_supervision_scales,
-                            pin_memory=self.pin_memory,
-                            use_nondetMultiThreadedAugmenter=False
-                            )
+
                 self.print_to_log_file("TRAINING KEYS:\n %s" % (str(self.dataset_tr.keys())),
                                        also_print_to_console=False)
                 self.print_to_log_file("VALIDATION KEYS:\n %s" % (str(self.dataset_val.keys())),
@@ -581,7 +562,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
         """
         models = {}
 
-        num_classes = 4
+        num_classes = 2 if self.binary else 4
 
         wanted_norm = self.config['norm']
         if wanted_norm == 'batchnorm':
@@ -747,7 +728,8 @@ class nnMTLTrainerV2(nnUNetTrainer):
 
                     current_target = target[t]
 
-                    self.vis.set_up_image_seg(seg_dice=seg_dice[t].mean(), gt=current_target, pred=current_pred, x=current_x)
+                    self.vis.set_up_image_seg_best(seg_dice=seg_dice[t].mean(), gt=current_target, pred=current_pred, x=current_x)
+                    self.vis.set_up_image_seg_worst(seg_dice=seg_dice[t].mean(), gt=current_target, pred=current_pred, x=current_x)
                     
                     #with autocast():
 
@@ -831,8 +813,10 @@ class nnMTLTrainerV2(nnUNetTrainer):
         self.print_to_log_file("(interpret this as an estimate for the Dice of the different classes. This is not exact.)")
         self.print_to_log_file("Average global foreground Dice:", [np.round(i, 4) for i in global_dc_per_class_seg])
 
-
-        class_dice = {'RV': global_dc_per_class_seg[0], 'MYO': global_dc_per_class_seg[1], 'LV': global_dc_per_class_seg[2]}
+        if self.binary:
+            class_dice = {'Heart': global_dc_per_class_seg[0]}
+        else:
+            class_dice = {'RV': global_dc_per_class_seg[0], 'MYO': global_dc_per_class_seg[1], 'LV': global_dc_per_class_seg[2]}
         overfit_data = {'Train': torch.tensor(self.train_loss).mean().item(), 'Val': torch.tensor(self.val_loss).mean().item()}
         self.writer.add_scalars('Epoch/Train_vs_val_loss', overfit_data, self.epoch)
         self.writer.add_scalars('Epoch/Class dice', class_dice, self.epoch)            
@@ -876,7 +860,8 @@ class nnMTLTrainerV2(nnUNetTrainer):
         #        self.vis.log_aff_images(colormap=cm.plasma, epoch=self.epoch)
 
         if self.log_images:
-            self.vis.log_seg_images(colormap=cmap, norm=norm, epoch=self.epoch)
+            self.vis.log_best_seg_images(colormap=cmap, norm=norm, epoch=self.epoch)
+            self.vis.log_worst_seg_images(colormap=cmap, norm=norm, epoch=self.epoch)
             if self.unlabeled and self.adversarial_loss:
                 self.vis.log_confidence_images(colormap=cm.plasma, colormap_seg=cmap, norm=norm, epoch=self.epoch)
 
@@ -1409,7 +1394,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
             target = to_cuda(target)
 
         self.optimizer.zero_grad()
-
+    
         output = self.network(self.select_deep_supervision(data))
         self.compute_losses(x=data, output=output, target=target, gt_df=gt_df, do_backprop=do_backprop, gt_classification=gt_classification)
         
@@ -2116,13 +2101,19 @@ class nnMTLTrainerV2(nnUNetTrainer):
                     for b in tbar:
                         tbar.set_description("Epoch {}/{}".format(self.epoch+1, self.max_num_epochs))
 
-                        l = self.run_iteration(self.tr_gen, do_backprop=True)
+                        if self.binary:
+                            l = self.run_iteration(self.dl_tr, do_backprop=True)
+                        else:
+                            l = self.run_iteration(self.tr_gen, do_backprop=True)
 
                         tbar.set_postfix(loss=l)
                         train_losses_epoch.append(l)
             else:
                 for _ in range(self.num_batches_per_epoch):
-                    l = self.run_iteration(self.tr_gen, True)
+                    if self.binary:
+                        l = self.run_iteration(self.dl_tr, do_backprop=True)
+                    else:
+                        l = self.run_iteration(self.tr_gen, do_backprop=True)
                     train_losses_epoch.append(l)
 
             self.all_tr_losses.append(np.mean(train_losses_epoch))
@@ -2134,7 +2125,10 @@ class nnMTLTrainerV2(nnUNetTrainer):
                     self.network.eval()
                     val_losses = []
                     for b in range(self.num_val_batches_per_epoch):
-                        l = self.run_iteration(self.val_gen, do_backprop=False, run_online_evaluation=True)
+                        if self.binary:
+                            l = self.run_iteration(self.dl_val, do_backprop=False, run_online_evaluation=True)
+                        else:
+                            l = self.run_iteration(self.val_gen, do_backprop=False, run_online_evaluation=True)
                         val_losses.append(l)
                     self.all_val_losses.append(np.mean(val_losses))
                     self.print_to_log_file("validation loss: %.4f" % self.all_val_losses[-1])
@@ -2144,7 +2138,10 @@ class nnMTLTrainerV2(nnUNetTrainer):
                         # validation with train=True
                         val_losses = []
                         for b in range(self.num_val_batches_per_epoch):
-                            l = self.run_iteration(self.val_gen, do_backprop=False)
+                            if self.binary:
+                                l = self.run_iteration(self.dl_val, do_backprop=False)
+                            else:
+                                l = self.run_iteration(self.val_gen, do_backprop=False)
                             val_losses.append(l)
                         self.all_val_losses_tr_mode.append(np.mean(val_losses))
                         self.print_to_log_file("validation loss (train=True): %.4f" % self.all_val_losses_tr_mode[-1])
@@ -2438,21 +2435,15 @@ class nnMTLTrainerV2(nnUNetTrainer):
         self.do_split()
         dl_un_tr = None
         dl_un_val = None
-        if self.middle:
-            if self.middle_unlabeled:
-                dl_tr = DataLoader2DMiddleUnlabeled(self.dataset_tr, self.basic_generator_patch_size, self.patch_size, self.batch_size, v1=self.v1, unlabeled_dataset=self.dataset_un_tr, is_val=False, one_vs_all=self.one_vs_all,
-                                        oversample_foreground_percent=self.oversample_foreground_percent,
-                                        pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
-                dl_val = DataLoader2DMiddleUnlabeled(self.dataset_val, self.patch_size, self.patch_size, self.batch_size, v1=self.v1, unlabeled_dataset=self.dataset_un_val, is_val=True, one_vs_all=self.one_vs_all,
-                                        oversample_foreground_percent=self.oversample_foreground_percent,
-                                        pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
-            else:
-                dl_tr = DataLoader2DMiddle(self.dataset_tr, self.basic_generator_patch_size, self.patch_size, self.batch_size, is_val=False, one_vs_all=self.one_vs_all,
-                                        oversample_foreground_percent=self.oversample_foreground_percent,
-                                        pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
-                dl_val = DataLoader2DMiddle(self.dataset_val, self.patch_size, self.patch_size, self.batch_size, is_val=True, one_vs_all=self.one_vs_all,
-                                        oversample_foreground_percent=self.oversample_foreground_percent,
-                                        pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
+        if self.binary:
+            dl_tr = DataLoader2DBinary(self.dataset_tr, self.basic_generator_patch_size, self.patch_size, self.batch_size, self.deep_supervision,
+                                isval=False,
+                                oversample_foreground_percent=self.oversample_foreground_percent,
+                                pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
+            dl_val = DataLoader2DBinary(self.dataset_val, self.patch_size, self.patch_size, self.batch_size, self.deep_supervision,
+                                isval=True,
+                                oversample_foreground_percent=self.oversample_foreground_percent,
+                                pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
         else:
             dl_tr = DataLoader2D(self.dataset_tr, self.basic_generator_patch_size, self.patch_size, self.batch_size,
                                 oversample_foreground_percent=self.oversample_foreground_percent,

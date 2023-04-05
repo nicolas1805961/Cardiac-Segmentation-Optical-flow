@@ -76,17 +76,7 @@ class Visualizer(object):
         eval_images['slot'] = None
         eval_images['target'] = None
         eval_images['attention_map'] = None
-        if self.middle:
-            eval_images['sim'] = None
-            eval_images['weights'] = None
-            if self.registered_seg:
-                eval_images['forward_motion'] = None
-                eval_images['backward_motion'] = None
-            if self.middle_unlabeled:
-                eval_images['sim_unlabeled'] = None
-                eval_images['pseudo_label'] = None
-            #else:
-            #    eval_images['sim'] = None
+        eval_images['motion_flow'] = None
 
         for key in eval_images.keys():
             data = []
@@ -158,24 +148,16 @@ class Visualizer(object):
                     score = 0
                     data.append(payload)
                     scores.append(score)
-            elif key == 'forward_motion':
-                for i in range(log_images_nb):
-                    payload = {'moving': None,
-                                'registered': None,
-                                'fixed': None,
-                                'motion': None}
-                    score = 0
-                    data.append(payload)
-                    scores.append(score)
-            elif key == 'backward_motion':
-                for i in range(log_images_nb):
-                    payload = {'moving': None,
-                                'registered': None,
-                                'fixed': None,
-                                'motion': None}
-                    score = 0
-                    data.append(payload)
-                    scores.append(score)
+            elif key == 'motion_flow':
+                payload = {'moving': None,
+                            'registered_input': None,
+                            'registered_seg': None,
+                            'fixed': None,
+                            'target': None,
+                            'motion_flow': None}
+                score = -1
+                data.append(payload)
+                scores.append(score)
             elif key == 'corr':
                 payload = {'corr': None}
                 score = 0
@@ -491,27 +473,47 @@ class Visualizer(object):
         self.writer.add_images(os.path.join('Registered_x', 'moving_seg').replace('\\', '/'), moving_seg_list, epoch, dataformats='NHWC')
         self.writer.add_images(os.path.join('Registered_x', 'registered_seg').replace('\\', '/'), registered_seg_list, epoch, dataformats='NHWC')
 
-    def log_motion_images(self, colormap_seg, colormap, norm, epoch, name):
-        moving_list = [x['moving'] for x in self.eval_images[name][0]]
-        moving_list = [self.get_seg_images_ready_for_display(x, colormap=colormap_seg, norm=norm) for x in moving_list]
+    def log_motion_images(self, colormap, norm, epoch):
+        moving = self.eval_images['motion_flow'][0, 0]['moving'] # T, H, W
+        fixed = self.eval_images['motion_flow'][0, 0]['fixed'] # H, W
+        registered_input = self.eval_images['motion_flow'][0, 0]['registered_input'] # T, H, W
+        registered_seg = self.eval_images['motion_flow'][0, 0]['registered_seg'] # T, H, W
+        motion_flow = self.eval_images['motion_flow'][0, 0]['motion_flow'] # T, 3, H, W
+        target = self.eval_images['motion_flow'][0, 0]['target'] # H, W
+
+        fixed = self.get_images_ready_for_display(fixed, colormap=None)
+        target = self.get_seg_images_ready_for_display(target, colormap=colormap, norm=norm)
+
+        moving_list = []
+        registered_input_list = []
+        registered_seg_list = []
+        motion_flow_list = []
+        for t in range(len(moving)):
+            current_moving = moving[t] # H, W
+            current_registered_input = registered_input[t] # H, W
+            current_registered_seg = registered_seg[t] # H, W
+            current_motion_flow = motion_flow[t] # 3, H, W
+
+            current_moving = self.get_images_ready_for_display(current_moving, colormap=None)
+            current_registered_input = self.get_images_ready_for_display(current_registered_input, colormap=None)
+            current_registered_seg = self.get_seg_images_ready_for_display(current_registered_seg, colormap=colormap, norm=norm)
+
+            moving_list.append(current_moving)
+            registered_input_list.append(current_registered_input)
+            registered_seg_list.append(current_registered_seg)
+            motion_flow_list.append(current_motion_flow)
+        
         moving_list = np.stack(moving_list, axis=0)
+        registered_input_list = np.stack(registered_input_list, axis=0)
+        registered_seg_list = np.stack(registered_seg_list, axis=0)
+        motion_flow_list = np.stack(motion_flow_list, axis=0).transpose(0, 2, 3, 1)
 
-        registered_list = [x['registered'] for x in self.eval_images[name][0]]
-        registered_list = [self.get_seg_images_ready_for_display(x, colormap=colormap_seg, norm=norm) for x in registered_list]
-        registered_list = np.stack(registered_list, axis=0)
-
-        fixed_list = [x['fixed'] for x in self.eval_images[name][0]]
-        fixed_list = [self.get_seg_images_ready_for_display(x, colormap=colormap_seg, norm=norm) for x in fixed_list]
-        fixed_list = np.stack(fixed_list, axis=0)
-
-        motion_list = [x['motion'] for x in self.eval_images[name][0]]
-        motion_list = [self.get_images_ready_for_display(x, colormap) for x in motion_list]
-        motion_list = np.stack(motion_list, axis=0)
-
-        self.writer.add_images(os.path.join(name, 'moving').replace('\\', '/'), moving_list, epoch, dataformats='NHWC')
-        self.writer.add_images(os.path.join(name, 'registered').replace('\\', '/'), registered_list, epoch, dataformats='NHWC')
-        self.writer.add_images(os.path.join(name, 'fixed').replace('\\', '/'), fixed_list, epoch, dataformats='NHWC')
-        self.writer.add_images(os.path.join(name, 'motion').replace('\\', '/'), motion_list, epoch, dataformats='NHWC')
+        self.writer.add_images(os.path.join('Optical Flow', 'fixed').replace('\\', '/'), fixed, epoch, dataformats='HWC')
+        self.writer.add_images(os.path.join('Optical Flow', 'mask').replace('\\', '/'), target, epoch, dataformats='HWC')
+        self.writer.add_images(os.path.join('Optical Flow', 'moving').replace('\\', '/'), moving_list, epoch, dataformats='NHWC')
+        self.writer.add_images(os.path.join('Optical Flow', 'registered_input').replace('\\', '/'), registered_input_list, epoch, dataformats='NHWC')
+        self.writer.add_images(os.path.join('Optical Flow', 'registered_seg').replace('\\', '/'), registered_seg_list, epoch, dataformats='NHWC')
+        self.writer.add_images(os.path.join('Optical Flow', 'motion_flow').replace('\\', '/'), motion_flow_list, epoch, dataformats='NHWC')
 
     def log_df_images(self, colormap, epoch):
         input_list = [x['input'] for x in self.eval_images['df'][0]]
@@ -972,6 +974,30 @@ class Visualizer(object):
         self.writer.add_images(os.path.join('Confidence', 'input').replace('\\', '/'), input_list, epoch, dataformats='NHWC')
         self.writer.add_images(os.path.join('Confidence', 'confidence_map').replace('\\', '/'), confidence_list, epoch, dataformats='NHWC')
         self.writer.add_images(os.path.join('Confidence', 'prediction').replace('\\', '/'), pred_list, epoch, dataformats='NHWC')
+
+
+    def set_up_image_flow(self, seg_dice, moving, registered_input, registered_seg, fixed, motion_flow, target):
+        seg_dice = seg_dice.cpu().numpy()
+        moving = moving.cpu().numpy()
+        registered_input = registered_input.cpu().numpy()
+        registered_seg = registered_seg.cpu().numpy()
+        fixed = fixed.cpu().numpy()
+        motion_flow = motion_flow.cpu().numpy()
+        target = target.cpu().numpy()
+
+        if self.eval_images['motion_flow'][1, 0] <= seg_dice:
+
+            self.eval_images['motion_flow'][0, 0]['moving'] = moving.astype(np.float32)
+            self.eval_images['motion_flow'][0, 0]['registered_input'] = registered_input.astype(np.float32)
+            self.eval_images['motion_flow'][0, 0]['registered_seg'] = registered_input.astype(np.float32)
+            self.eval_images['motion_flow'][0, 0]['fixed'] = fixed.astype(np.float32)
+            self.eval_images['motion_flow'][0, 0]['motion_flow'] = motion_flow.astype(np.float32)
+            self.eval_images['motion_flow'][0, 0]['target'] = target.astype(np.float32)
+            self.eval_images['motion_flow'][1, 0] = seg_dice
+
+            sorted_indices = self.eval_images['motion_flow'][1, :].argsort()
+            self.eval_images['motion_flow'] = self.eval_images['motion_flow'][:, sorted_indices]
+
 
     def set_up_image_seg_best(self, seg_dice, gt, pred, x):
         seg_dice = seg_dice.cpu().numpy()

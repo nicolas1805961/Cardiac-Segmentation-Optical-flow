@@ -213,7 +213,7 @@ def get_moreDA_augmentation(dataloader_train, dataloader_val, patch_size, params
 
 
 
-def get_moreDA_augmentation_mtl(dataloader_train, dataloader_val, dataloader_train_un, dataloader_val_un, patch_size, directional_field, params=default_3D_augmentation_params,
+def get_moreDA_augmentation_mtl(dataloader_train, dataloader_val, dataloader_train_un, dataloader_val_un, patch_size, params=default_3D_augmentation_params,
                             border_val_seg=-1,
                             seeds_train=None, seeds_val=None, order_seg=1, order_data=3, deep_supervision_scales=None,
                             soft_ds=False,
@@ -354,14 +354,9 @@ def get_moreDA_augmentation_mtl(dataloader_train, dataloader_val, dataloader_tra
 
     if regions is not None:
         tr_transforms.append(ConvertSegmentationToRegionsTransform(regions, 'target', 'target'))
-    
-    if directional_field:
-        tr_transforms.append(DistanceMap(input_key='target', output_key='directional_field'))
 
     if deep_supervision_scales is not None:
         scales = copy(deep_supervision_scales)
-        if directional_field:
-            scales.insert(1, [1.0, 1.0])
         if soft_ds:
             assert classes is not None
             tr_transforms.append(DownsampleSegForDSTransform3(scales, 'target', 'target', classes))
@@ -425,14 +420,8 @@ def get_moreDA_augmentation_mtl(dataloader_train, dataloader_val, dataloader_tra
 
     if regions is not None:
         val_transforms.append(ConvertSegmentationToRegionsTransform(regions, 'target', 'target'))
-    
-    if directional_field:
-        val_transforms.append(DistanceMap(input_key='target', output_key='directional_field'))
 
     if deep_supervision_scales is not None:
-        if directional_field:
-            scales = copy(deep_supervision_scales)
-            scales.insert(1, [1.0, 1.0])
         if soft_ds:
             assert classes is not None
             val_transforms.append(DownsampleSegForDSTransform3(scales, 'target', 'target', classes))

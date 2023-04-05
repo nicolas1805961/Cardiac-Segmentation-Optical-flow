@@ -145,14 +145,9 @@ def main():
     # else:
     #     raise ValueError("force_separate_z must be None, True or False. Given: %s" % force_separate_z)
 
-    if network_trainer == 'nnMTLTrainerV2Video':
+    if network_trainer == 'nnMTLTrainerV2Video' or network_trainer == 'nnMTLTrainerV2Flow':
         config = read_config(os.path.join(Path.cwd(), 'video.yaml'), middle=False, video=True)
-    elif network_trainer == 'nnMTLTrainerV2UDA':
-        config = read_config(os.path.join(Path.cwd(), 'uda.yaml'), middle=False, video=False)
     else:
-        #if middle:
-        #    config = read_config(os.path.join(Path.cwd(), 'adversarial_acdc_middle.yaml'), middle=True, video=False)
-        #else:
         config = read_config(os.path.join(Path.cwd(), 'adversarial_acdc.yaml'), middle=False, video=False)
 
     plans_file, output_folder_name, dataset_directory, batch_dice, stage, \
@@ -177,11 +172,18 @@ def main():
     else:
         assert issubclass(trainer_class,
                           nnUNetTrainer), "network_trainer was found but is not derived from nnUNetTrainer"
-
-    trainer = trainer_class(plans_file, fold, output_folder=output_folder_name, dataset_directory=dataset_directory,
+        
+    if '31' in task and network_trainer == 'nnMTLTrainerV2':
+        trainer = trainer_class(plans_file, fold, output_folder=output_folder_name, dataset_directory=dataset_directory,
+                            batch_dice=batch_dice, stage=stage, unpack_data=decompress_data,
+                            deterministic=deterministic,
+                            fp16=run_mixed_precision, binary=True)
+    else:
+        trainer = trainer_class(plans_file, fold, output_folder=output_folder_name, dataset_directory=dataset_directory,
                             batch_dice=batch_dice, stage=stage, unpack_data=decompress_data,
                             deterministic=deterministic,
                             fp16=run_mixed_precision)
+
     if args.disable_saving:
         trainer.save_final_checkpoint = False # whether or not to save the final checkpoint
         trainer.save_best_checkpoint = False  # whether or not to save the best checkpoint according to

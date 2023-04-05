@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 from nnunet.network_architecture.MTL_model import MTLmodel, PolicyNet
 from nnunet.network_architecture.temporal_model import VideoModel
-from nnunet.network_architecture.UDA_model import UDAModel
+from nnunet.network_architecture.Optical_flow_model import OpticalFlowModel
 from tqdm import tqdm
 import logging
 import os
@@ -836,11 +836,14 @@ def build_video_model(config, conv_layer, conv_layer_1d, norm_2d, norm_1d, log_f
     return model
 
 
-def build_UDA_model(config, conv_layer, norm, image_size):
+def build_flow_model(config, conv_layer, norm, image_size):
 
-    model = UDAModel(out_encoder_dims=config['out_encoder_dims'],
+    model = OpticalFlowModel(deep_supervision=config['deep_supervision'],
+             out_encoder_dims=config['out_encoder_dims'],
              device=config['device'],
              in_dims=config['in_encoder_dims'],
+             nb_layers=config['nb_layers'],
+             video_length=config['video_length'],
              image_size=image_size,
              num_bottleneck_layers=config['num_bottleneck_layers'],
              conv_layer=conv_layer,
@@ -884,7 +887,6 @@ def build_2d_model(config, conv_layer, norm, log_function, image_size, window_si
                         filter_skip_co_segmentation=config['filter_skip_co_segmentation'],
                         directional_field=config['directional_field'],
                         classification=config['classification'],
-                        binary=config['binary'],
                         attention_map=config['attention_map'],
                         batch_size=config['batch_size'],
                         uncertainty_weighting=config['uncertainty_weighting'],

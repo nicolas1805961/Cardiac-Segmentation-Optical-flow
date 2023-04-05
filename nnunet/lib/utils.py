@@ -24,6 +24,34 @@ import matplotlib
 from mmcv.utils import get_logger
 import sys
 from torch.nn.functional import affine_grid
+from torch.nn.functional import grid_sample
+
+
+class MotionEstimation(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.tanh = torch.nn.Tanh()
+    
+    def generate_grid(self, flow):
+        flow_shape = flow.shape
+        grid_h, grid_w = torch.meshgrid([torch.linspace(-1, 1, flow_shape[2]), torch.linspace(-1, 1, flow_shape[3])])  # (h, w)
+        grid_h = grid_h.cuda().float()
+        grid_w = grid_w.cuda().float()
+
+        offset_h, offset_w = torch.split(flow, 1, 1)
+        offset_h = offset_h.contiguous().view(int(flow_shape[0]), int(flow_shape[2]), int(flow_shape[3]))  # (b, h, w)
+        offset_w = offset_w.contiguous().view(int(flow_shape[0]), int(flow_shape[2]), int(flow_shape[3]))  # (b, h, w)
+
+        offset_h = grid_h + offset_h
+        offset_w = grid_w + offset_w
+
+        offsets = torch.stack((offset_h, offset_w), 3)
+        return offsets
+
+    def forward(self, flow, original):
+        flow = self.tanh(flow)
+        grid = self.generate_grid(flow=flow)
+        return grid_sample(original, grid)
 
 
 def _get_activation_fn(activation):
@@ -942,17 +970,15 @@ def get_root_logger(log_file=None, log_level=logging.INFO):
 class MLP(nn.Module):
     """ Very simple multi-layer perceptron (also called FFN)"""
 
-    def __init__(self, input_dim, output_dim, num_layers):
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
         super().__init__()
         self.num_layers = num_layers
-        dims = [int(x) for x in torch.linspace(input_dim, output_dim, num_layers + 1)]
-        self.layers = nn.ModuleList(nn.Linear(dims[i], dims[i + 1]) for i in range(num_layers))
+        h = [hidden_dim] * (num_layers - 1)
+        self.layers = nn.ModuleList(nn.Linear(n, k) for n, k in zip([input_dim] + h, h + [output_dim]))
 
     def forward(self, x):
         for i, layer in enumerate(self.layers):
-            print(x.shape)
-            x = F.gelu(layer(x)) if i < self.num_layers - 1 else layer(x) # try relu
-            print(x.shape)
+            x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
         return x
 
 

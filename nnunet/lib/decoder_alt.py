@@ -803,6 +803,7 @@ class SegmentationDecoder2(nn.Module):
                 num_classes,
                 img_size,
                 norm,
+                deep_supervision,
                 last_activation='identity',
                 **kwargs):
         super().__init__()
@@ -810,6 +811,7 @@ class SegmentationDecoder2(nn.Module):
         self.num_stages = len(conv_depth)
         self.img_size = img_size
         self.num_classes = num_classes
+        self.deep_supervision = deep_supervision
         
         # build decoder layers
         self.layers = nn.ModuleList()
@@ -842,6 +844,7 @@ class SegmentationDecoder2(nn.Module):
     
 
     def forward(self, x, encoder_skip_connections):
+        out = []
 
         for i, (layer_up,
                 upsample_layer,
@@ -854,8 +857,13 @@ class SegmentationDecoder2(nn.Module):
             x = upsample_layer(x)
             x = torch.cat((encoder_skip_connection, x), dim=1)
             x = layer_up(x)
+            out.append(x)
 
-        return x
+        out = out[::-1]
+        if not self.deep_supervision:
+            out = out[0]
+        return out
+
 
 
 class VideoSegmentationDecoder(nn.Module):
@@ -1106,34 +1114,6 @@ class SimpleDecoder(nn.Module):
         #x = self.up(x)
         return [x]
 
-class MotionEstimation(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.tanh = torch.nn.Tanh()
-    
-    def generate_grid(self, x, offset):
-        x_shape = x.size()
-        grid_w, grid_h = torch.meshgrid([torch.linspace(-1, 1, x_shape[2]), torch.linspace(-1, 1, x_shape[3])])  # (h, w)
-        grid_w = grid_w.cuda().float()
-        grid_h = grid_h.cuda().float()
-
-        grid_w = nn.Parameter(grid_w, requires_grad=False)
-        grid_h = nn.Parameter(grid_h, requires_grad=False)
-
-        offset_h, offset_w = torch.split(offset, 1, 1)
-        offset_w = offset_w.contiguous().view(-1, int(x_shape[2]), int(x_shape[3]))  # (b*c, h, w)
-        offset_h = offset_h.contiguous().view(-1, int(x_shape[2]), int(x_shape[3]))  # (b*c, h, w)
-
-        offset_w = grid_w + offset_w
-        offset_h = grid_h + offset_h
-
-        offsets = torch.stack((offset_h, offset_w), 3)
-        return offsets
-
-    def forward(self, x, original):
-        x = self.tanh(x)
-        grid = self.generate_grid(x=original, offset=x)
-        return grid_sample(original, grid)
 
 class SimpleDecoderStages(nn.Module):
     def __init__(self, 

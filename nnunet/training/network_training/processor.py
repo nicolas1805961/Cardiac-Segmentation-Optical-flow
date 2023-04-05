@@ -89,26 +89,22 @@ class Processor(object):
         return torch.stack(batch_list, dim=0)
     
     def get_mean_centroid(self, data):
-        B, T, H, W = data.shape
+        T, H, W = data.shape
         data[data > 0] = 1
-        mean_centroid_list = []
-        for b in range(len(data)):
-            current_data_batch = data[b]
-            centroid_list = []
-            for t in range(len(current_data_batch)):
-                current_data_time = current_data_batch[t]
-                if torch.count_nonzero(current_data_time) == 0:
-                    centroid = torch.tensor([H / 2, W / 2], device=data.device).view(1, 2)
-                else:
-                    coords = masks_to_boxes(current_data_time.unsqueeze(0))
-                    x = coords[:, 0] + ((coords[:, 2] - coords[:, 0]) / 2)
-                    y = coords[:, 1] + ((coords[:, 3] - coords[:, 1]) / 2)
-                    centroid = torch.stack([x, y], dim=-1)
-                centroid_list.append(centroid)
-            centroid_list = torch.cat(centroid_list, dim=0)
-            mean_centroid = centroid_list.mean(0)
-            mean_centroid_list.append(mean_centroid)
-        return torch.stack(mean_centroid_list, dim=0).int()
+        centroid_list = []
+        for t in range(len(data)):
+            current_data_time = data[t]
+            if torch.count_nonzero(current_data_time) == 0:
+                centroid = torch.tensor([H / 2, W / 2], device=data.device).view(1, 2)
+            else:
+                coords = masks_to_boxes(current_data_time.unsqueeze(0))
+                x = coords[:, 0] + ((coords[:, 2] - coords[:, 0]) / 2)
+                y = coords[:, 1] + ((coords[:, 3] - coords[:, 1]) / 2)
+                centroid = torch.stack([x, y], dim=-1)
+            centroid_list.append(centroid)
+        centroid_list = torch.cat(centroid_list, dim=0)
+        mean_centroid = centroid_list.mean(0)
+        return mean_centroid.int()
     
     def adjust_cropping_window(self, centroid):
         half_crop_size = self.crop_size // 2
@@ -131,34 +127,28 @@ class Processor(object):
         pad_top = y_low
         pad_bottom = self.image_size - y_high
 
-        out = {'crop_indices': [x_low, x_high, y_low, y_high], 'padding_need': (pad_left, pad_right, pad_top, pad_bottom)}
+        out = {'crop_indices': [x_low, x_high, y_low, y_high], 'padding_need': torch.tensor([pad_left, pad_right, pad_top, pad_bottom])}
 
         return out
     
-    def crop_data(self, volume, centroids):
-        data_list = []
-        padding_list = []
-        for b in range(volume.shape[0]):
-            data = volume[b]
-            centroid = centroids[b]
-            payload = self.adjust_cropping_window(centroid)
-            padding_list.append(payload['padding_need'])
-            coords = payload['crop_indices']
-            data = data[:, :, coords[2]:coords[3], coords[0]:coords[1]]
-            data_list.append(data)
-        return torch.stack(data_list, dim=0), padding_list
+    def crop_data(self, volume, centroid):
+        payload = self.adjust_cropping_window(centroid)
+        coords = payload['crop_indices']
+        volume = volume[:, :, coords[2]:coords[3], coords[0]:coords[1]]
+        return volume, payload['padding_need']
     
-    def discretize(self, data_list):
+    def discretize(self, data):
         out_list = []
-        for data in data_list:
-            if torch.count_nonzero(data) == 0:
-                softmaxed = torch.zeros_like(data_list[0])
+        for i in range(len(data)):
+            current_data = data[i][None] # B(1), 1, H, W
+            if torch.count_nonzero(current_data) == 0:
+                softmaxed = torch.zeros_like(current_data)
             else:
-                softmaxed = self.cropping_network(data)['pred']
+                softmaxed = self.cropping_network(current_data)['pred']
                 softmaxed = torch.softmax(softmaxed, dim=1)
-            out = torch.argmax(softmaxed, dim=1)
+            out = torch.argmax(softmaxed, dim=1).squeeze(0) # H, W
             out_list.append(out)
-        out_list = torch.stack(out_list, dim=1) # B, T, H, W
+        out_list = torch.stack(out_list, dim=0) # T, H, W
         return out_list
     
     def uncrop(self, output, padding_need, translation_dists):
@@ -178,13 +168,13 @@ class Processor(object):
         return out_volume
     
     def uncrop_no_registration(self, output, padding_need):
-        output_volume = output.transpose(0, 1)
-        assert len(output_volume) == len(padding_need)
+        assert len(output) == len(padding_need)
         out_list = []
-        for b in range(len(output_volume)):
-            padded = torch.nn.functional.pad(output_volume[b], pad=padding_need[b])
+        for b in range(len(output)):
+            current_padding_need = tuple(padding_need[b].tolist())
+            padded = torch.nn.functional.pad(output[b], pad=current_padding_need)
             out_list.append(padded)
-        out_volume = torch.stack(out_list, dim=1)
+        out_volume = torch.stack(out_list, dim=0)
         return out_volume
 
     def preprocess(self, data_list, idx):
@@ -222,21 +212,17 @@ class Processor(object):
         network_input = {'labeled_data': [cropped_volume[:, i] for i in range(cropped_volume.shape[1])]}
         return network_input, padding_need, translation_dists
     
-    def crop_and_pad(self, data_volume, mean_centroids):
-        cropped_volume, padding_need = self.crop_data(data_volume, mean_centroids) # B, T, 1, 128, 128
+    def crop_and_pad(self, data, mean_centroid):
+        '''data: T, 1, H, W'''
+        cropped_volume, padding_need = self.crop_data(data, mean_centroid) # T, 1, 128, 128
 
         assert torch.all(torch.isfinite(cropped_volume))
         assert cropped_volume.shape[-1] == self.crop_size, print(cropped_volume.shape[-1])
 
-        cropped_volume = cropped_volume.transpose(0, 1)
         return cropped_volume, padding_need
 
-    def preprocess_no_registration(self, data_list):
-        temp_volume = self.discretize(data_list) # B, T, H, W
-
-        mean_centroids = self.get_mean_centroid(temp_volume) # B, 2
-        data_volume = torch.stack(data_list, dim=1) # B, T, 1, H, W
-
-        cropped_volume, padding_need = self.crop_and_pad(data_volume, mean_centroids)
-
-        return cropped_volume, padding_need, temp_volume, mean_centroids
+    def preprocess_no_registration(self, data):
+        '''data: T, 1, H, W'''
+        temp_volume = self.discretize(data) # T, H, W
+        mean_centroid = self.get_mean_centroid(temp_volume) # 2
+        return mean_centroid, temp_volume
