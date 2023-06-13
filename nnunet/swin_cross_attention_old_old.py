@@ -1,14 +1,11 @@
 import torch
 import torch.nn as nn
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
-from .utils import depthwise_separable_conv, Mlp, get_indices_2d
+from utils import depthwise_separable_conv, Mlp, get_indices_2d
 import torch.utils.checkpoint as checkpoint
 import matplotlib.pyplot as plt
-from .position_embedding import PositionEmbeddingSine2d
-import matplotlib
-import random
-import string
-import os
+from position_embedding import PositionEmbeddingSine2d
+
 
 class SwinCrossAttention(nn.Module):
     r""" Swin Transformer Block.
@@ -29,7 +26,7 @@ class SwinCrossAttention(nn.Module):
         norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
     """
 
-    def __init__(self, dim, same_key_query, input_resolution, num_heads, device, window_size, shift_size,
+    def __init__(self, dim, proj, same_key_query, input_resolution, num_heads, device, relative_position_index, rpe_mode, rpe_contextual_tensor, window_size, shift_size,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0.):
         super().__init__()
         self.dim = dim
@@ -46,11 +43,16 @@ class SwinCrossAttention(nn.Module):
         
         self.before_cross_attention_img1 = BeforeCrossAttention(dim=dim, input_resolution=input_resolution, window_size=self.window_size, shift_size=self.shift_size)
         self.before_cross_attention_img2 = BeforeCrossAttention(dim=dim, input_resolution=input_resolution, window_size=self.window_size, shift_size=self.shift_size)
-        self.cross_attn = CrossAttention(dim=dim,
+        self.cross_attn = CrossAttention(dim=dim, 
                                             same_key_query=same_key_query,
+                                            input_resolution=input_resolution,
+                                            proj=proj,
                                             window_size=to_2tuple(self.window_size), 
                                             num_heads=num_heads,
                                             device=device,
+                                            relative_position_index=relative_position_index,
+                                            rpe_mode=rpe_mode,
+                                            rpe_contextual_tensor=rpe_contextual_tensor,
                                             qkv_bias=qkv_bias, 
                                             qk_scale=qk_scale, 
                                             attn_drop=attn_drop, 
@@ -81,18 +83,18 @@ class SwinCrossAttention(nn.Module):
 
         self.register_buffer("attn_mask", attn_mask)
 
-    def forward(self, rescaled, rescaler):
+    def forward(self, x1, x2):
         #H, W = self.input_resolution
-        B, C, H, W = rescaled.shape
-        rescaled = rescaled.permute(0, 2, 3, 1).view(B, H * W, C)
-        rescaler = rescaler.permute(0, 2, 3, 1).view(B, H * W, C)
+        B, C, H, W = x1.shape
+        x1 = x1.permute(0, 2, 3, 1).view(B, H * W, C)
+        x2 = x2.permute(0, 2, 3, 1).view(B, H * W, C)
         #assert L == H * W, "input feature has wrong size"
 
-        x_windows_rescaled = self.before_cross_attention_img1(rescaled)
-        x_windows_rescaler = self.before_cross_attention_img2(rescaler)
+        x_windows_img1 = self.before_cross_attention_img1(x1)
+        x_windows_img2 = self.before_cross_attention_img2(x2)
 
         # W-MSA/SW-MSA
-        attn_windows = self.cross_attn(x_windows_rescaled, x_windows_rescaler, mask=self.attn_mask)  # nW*B, window_size*window_size, C
+        attn_windows = self.cross_attn(x_windows_img1, x_windows_img2, mask=self.attn_mask)  # nW*B, window_size*window_size, C
 
         # merge windows
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
@@ -112,43 +114,51 @@ class SwinCrossAttention(nn.Module):
 
 
 class SwinFilterBlock(nn.Module):
-    def __init__(self, in_dim, out_dim, input_resolution, num_heads, norm, device, rpe_mode, rpe_contextual_tensor, window_size, depth):
+    def __init__(self, in_dim, out_dim, input_resolution, num_heads, proj, device, rpe_mode, rpe_contextual_tensor, window_size, depth):
         super(SwinFilterBlock,self).__init__()
         self.W_g = nn.Sequential(
             nn.Conv2d(in_dim, out_dim, kernel_size=1,stride=1,padding=0,bias=True),
-            norm(out_dim),
+            nn.BatchNorm2d(out_dim),
             nn.GELU()
             )
         
         self.W_x = nn.Sequential(
             nn.Conv2d(in_dim, out_dim, kernel_size=1,stride=1,padding=0,bias=True),
-            norm(out_dim),
+            nn.BatchNorm2d(out_dim),
             nn.GELU()
         )
 
+        if rpe_mode is not None:
+            relative_position_index = get_indices_2d(to_2tuple(min(window_size, input_resolution[0])))
+        else:
+            relative_position_index = None
+
         self.blocks = nn.ModuleList([
             SwinCrossAttention(dim=out_dim,
+                                proj=proj,
                                 same_key_query=True,
                                 input_resolution=input_resolution,
                                 num_heads=num_heads,
                                 device=device,
+                                relative_position_index=relative_position_index,
+                                rpe_mode=rpe_mode,
+                                rpe_contextual_tensor=rpe_contextual_tensor,
                                 window_size=window_size,
                                 shift_size=0 if (i % 2 == 0) else window_size // 2) 
                                 for i in range(depth)])
 
         self.psi = nn.Sequential(
             nn.Conv2d(out_dim, out_dim, kernel_size=1,stride=1,padding=0,bias=True),
-            norm(out_dim),
+            nn.BatchNorm2d(out_dim),
             nn.Sigmoid()
         )
         self.abs_pos_encoding = PositionEmbeddingSine2d(in_dim//2, normalize=True)
         
     def forward(self, x, skip_co):
-        vis = None
         B, C, H, W = x.shape
-        #pos = self.abs_pos_encoding(shape_util=(B, H, W), device=x.device)
-        #x = x + pos
-        #skip_co = skip_co + pos
+        pos = self.abs_pos_encoding(shape_util=(B, H, W), device=x.device)
+        x = x + pos
+        skip_co = skip_co + pos
         g1 = self.W_g(skip_co)
         x1 = self.W_x(x)
         for blk in self.blocks:
@@ -157,13 +167,7 @@ class SwinFilterBlock(nn.Module):
 
         filtered = skip_co * psi
 
-        #if H == 224:
-        #    before = skip_co[0].mean(0).detach().cpu()
-        #    after = filtered[0].mean(0).detach().cpu()
-        #    vis = (before, after)
-
         return filtered
-        #return filtered, vis
 
 
 class SwinFilterBlockIdentity(nn.Module):
@@ -220,7 +224,7 @@ class CrossAttention(nn.Module):
         proj_drop (float, optional): Dropout ratio of output. Default: 0.0
     """
 
-    def __init__(self, dim, same_key_query, window_size, num_heads, device, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0.):
+    def __init__(self, dim, proj, same_key_query, input_resolution, window_size, num_heads, rpe_mode, rpe_contextual_tensor, device, relative_position_index=None, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0.):
 
         super().__init__()
         self.dim = dim
@@ -228,58 +232,82 @@ class CrossAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = qk_scale or self.head_dim ** -0.5
+        self.qkv = None
         self.device=device
         self.same_key_query = same_key_query
 
-        self.get_qkv_object_rescaled = get_qkv(num_heads=num_heads, dim=dim, qkv_bias=qkv_bias)
-        self.get_qkv_object_rescaler = get_qkv(num_heads=num_heads, dim=dim, qkv_bias=qkv_bias)
+        self.get_qkv_object_img1 = get_qkv(proj=proj, num_heads=num_heads, dim=dim, qkv_bias=qkv_bias, window_size=window_size, input_resolution=input_resolution)
+        self.get_qkv_object_img2 = get_qkv(proj=proj, num_heads=num_heads, dim=dim, qkv_bias=qkv_bias, window_size=window_size, input_resolution=input_resolution)
 
-        # define a parameter table of relative position bias
-        self.relative_position_bias_table = nn.Parameter(
-            torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), num_heads))  # 2*Wh-1 * 2*Ww-1, nH
-
-        # get pair-wise relative position index for each token inside the window
-        coords_h = torch.arange(self.window_size[0])
-        coords_w = torch.arange(self.window_size[1])
-        coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  # 2, Wh, Ww
-        coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
-        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww
-        relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wh*Ww, Wh*Ww, 2
-        relative_coords[:, :, 0] += self.window_size[0] - 1  # shift to start from 0
-        relative_coords[:, :, 1] += self.window_size[1] - 1
-        relative_coords[:, :, 0] *= 2 * self.window_size[1] - 1
-        relative_position_index = relative_coords.sum(-1)  # Wh*Ww, Wh*Ww
-        self.register_buffer("relative_position_index", relative_position_index)
+        self.rpe_table = None
+        self.q_rpe_table = None
+        self.k_rpe_table = None
+        self.v_rpe_table = None
+        
+        self.rpe_table_size = int((2 * self.window_size[0] - 1) * (2 * self.window_size[1] - 1))
+        if relative_position_index is not None:
+            self.rpe_indices = relative_position_index
+            if rpe_mode == 'contextual':
+                if 'q' in rpe_contextual_tensor:
+                    self.q_rpe_table = nn.Parameter(torch.zeros(num_heads, self.head_dim, self.rpe_table_size))  # nh, head_dim, 2*Wh-1 * 2*Ww-1
+                    trunc_normal_(self.q_rpe_table, std=.02)
+                if 'k' in rpe_contextual_tensor:
+                    self.k_rpe_table = nn.Parameter(torch.zeros(num_heads, self.head_dim, self.rpe_table_size))  # nh, head_dim, 2*Wh-1 * 2*Ww-1
+                    trunc_normal_(self.k_rpe_table, std=.02)
+                if 'v' in rpe_contextual_tensor:
+                    self.v_rpe_table = nn.Parameter(torch.zeros(num_heads, self.rpe_table_size, self.head_dim))  # nh, head_dim, 2*Wh-1 * 2*Ww-1
+                    trunc_normal_(self.v_rpe_table, std=.02)
+            elif rpe_mode == 'bias':
+                self.rpe_table = nn.Parameter(torch.zeros(num_heads, self.rpe_table_size))  # nh, 2*Wh-1 * 2*Ww-1
+                trunc_normal_(self.rpe_table, std=.02)
 
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-        trunc_normal_(self.relative_position_bias_table, std=.02)
         self.softmax = nn.Softmax(dim=-1)
 
-    def forward(self, rescaled, rescaler, mask=None):
+    def forward(self, img1, img2, mask=None):
         """
         Args:
             shape = shape of x before call to 'get_qkv'
         """
-        B_, N, C = rescaled.shape
+        B_, N, C = img1.shape
 
-        q_rescaled, k_rescaled, v_rescaled = self.get_qkv_object_rescaled(rescaled)
-        q_rescaler, k_rescaler, v_rescaler = self.get_qkv_object_rescaler(rescaler)
+        q_img1, k_img1, v_img1 = self.get_qkv_object_img1(img1)
+        q_img2, k_img2, v_img2 = self.get_qkv_object_img2(img2)
 
         if self.same_key_query:
-            q, k, v = q_rescaler, k_rescaler, v_rescaled
+            q, k, v = q_img2, k_img2, v_img1
         else:
-            q, k, v = q_rescaler, k_rescaled, v_rescaled
+            q, k, v = q_img2, k_img1, v_img1
 
         q = q * self.scale
-        attn = (q @ k.transpose(-2, -1))
 
-        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
-            self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)  # Wh*Ww,Wh*Ww,nH
-        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
-        attn = attn + relative_position_bias.unsqueeze(0)
+        if self.rpe_table is not None:
+            rpe = self.rpe_table[:, self.rpe_indices.view(-1)].view(-1, self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1])
+            attn = (q @ k.transpose(-2, -1))
+            attn = (attn + rpe)
+        elif self.q_rpe_table is not None or self.k_rpe_table is not None:
+            b = torch.zeros((B_, self.num_heads) + self.rpe_indices.shape, device=self.device)
+            if self.q_rpe_table is not None:
+                b_q = torch.matmul(q.view(B_, self.num_heads, self.window_size[0]**2, self.head_dim), self.q_rpe_table)
+                b_q = b_q.flatten(2)[:, :, self.rpe_indices].view((B_, self.num_heads) + self.rpe_indices.shape)
+                b += b_q
+            if self.k_rpe_table is not None:
+                b_k = torch.matmul(k.view(B_, self.num_heads, self.window_size[1]**2, self.head_dim), self.k_rpe_table)
+                b_k = b_k.flatten(2)[:, :, self.rpe_indices].view((B_, self.num_heads) + self.rpe_indices.shape)
+                b += b_k
+            attn = (q @ k.transpose(-2, -1))
+            attn = attn + b
+        else:
+            attn = (q @ k.transpose(-2, -1))
+
+        #relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
+        #    self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)  # Wh*Ww,Wh*Ww,nH
+        #relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
+        #attn = attn + relative_position_bias.unsqueeze(0)
+
 
         if mask is not None:
             nW = mask.shape[0]
@@ -291,7 +319,16 @@ class CrossAttention(nn.Module):
 
         attn = self.attn_drop(attn)
 
-        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+        if self.v_rpe_table is not None and self.rpe_table is None:
+            w = self.v_rpe_table[:, self.rpe_indices.flatten()] # 24 49*49 32
+            w = w.view(self.num_heads, self.window_size[0]**2, self.window_size[1]**2, self.head_dim)
+            r_v = torch.matmul(attn.permute(1, 2, 0, 3), w) # 24 49 4 32
+            r_v = r_v.permute(2, 1, 0, 3).contiguous().view(B_, self.window_size[0]**2, self.head_dim * self.num_heads)
+            x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+            x = x + r_v
+        else:
+            x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
@@ -326,12 +363,18 @@ class get_qkv(nn.Module):
         proj_drop (float, optional): Dropout ratio of output. Default: 0.0
     """
 
-    def __init__(self, dim, num_heads, qkv_bias=True):
+    def __init__(self, proj, dim, num_heads, window_size, input_resolution, qkv_bias=True):
 
         super().__init__()
+        self.window_size = window_size
+        self.input_resolution = input_resolution
         self.dim = dim
+        self.proj_type = proj
         self.num_heads = num_heads
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        if proj == 'conv':
+            self.qkv = depthwise_separable_conv(dim, 3*dim)
+        elif proj == 'linear':
+            self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
 
     def forward(self, x):
         """
@@ -340,7 +383,14 @@ class get_qkv(nn.Module):
             mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
         """
         B_, N, C = x.shape
-        qkv = self.qkv(x)
+        if self.proj_type == 'conv':
+            x = x.view(B_, self.window_size[0], self.window_size[1], C)
+            x = window_reverse(x, self.window_size[0], self.input_resolution[0], self.input_resolution[1]).permute(0, 3, 1, 2)
+            qkv = self.qkv(x).permute(0, 2, 3, 1)
+            qkv = window_partition(qkv, self.window_size[0])
+            qkv = qkv.reshape(B_, N, -1)
+        elif self.proj_type == 'linear':
+            qkv = self.qkv(x)
         qkv = qkv.reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         #qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
@@ -383,7 +433,7 @@ class SwinTransformerBlock(nn.Module):
         norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
     """
 
-    def __init__(self, dim, norm, proj, same_key_query, use_conv_mlp, input_resolution, num_heads, device, relative_position_index, rpe_mode, rpe_contextual_tensor, window_size=7, shift_size=0,
+    def __init__(self, dim, proj, same_key_query, use_conv_mlp, input_resolution, num_heads, device, relative_position_index, rpe_mode, rpe_contextual_tensor, window_size=7, shift_size=0,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0., drop_path=0.,
                  act_layer=nn.GELU, norm_layer=nn.LayerNorm):
         super().__init__()
@@ -402,7 +452,6 @@ class SwinTransformerBlock(nn.Module):
         self.before_cross_attention_img1 = BeforeCrossAttention(dim=dim, input_resolution=input_resolution, window_size=self.window_size, shift_size=self.shift_size)
         self.before_cross_attention_img2 = BeforeCrossAttention(dim=dim, input_resolution=input_resolution, window_size=self.window_size, shift_size=self.shift_size)
         self.cross_attn = CrossAttention(dim=dim, 
-                                            norm=norm,
                                             same_key_query=same_key_query,
                                             input_resolution=input_resolution,
                                             proj=proj,
@@ -548,7 +597,7 @@ class BasicLayer(nn.Module):
         use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False.
     """
 
-    def __init__(self, swin_abs_pos, norm, same_key_query, dim, proj, input_resolution, use_conv_mlp, depth, num_heads, device, rpe_mode, rpe_contextual_tensor, window_size=7,
+    def __init__(self, swin_abs_pos, same_key_query, dim, proj, input_resolution, use_conv_mlp, depth, num_heads, device, rpe_mode, rpe_contextual_tensor, window_size=7,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0.,
                  drop_path=0., norm_layer=nn.LayerNorm, use_checkpoint=False):
 
@@ -569,7 +618,6 @@ class BasicLayer(nn.Module):
         # build blocks
         self.blocks = nn.ModuleList([
             SwinTransformerBlock(dim=dim, 
-                                norm=norm,
                                 proj=proj,
                                 same_key_query=same_key_query,
                                 input_resolution=input_resolution,
@@ -597,27 +645,27 @@ class BasicLayer(nn.Module):
         #    self.downsample = None
 
     def forward(self, x1, x2):
-
-        assert x1.shape == x2.shape
-
-        B, C, H, W = x1.shape
+        H, W = self.input_resolution
+        B, L, C = x1.shape
 
         if self.swin_abs_pos:
+            x1 = x1.permute(0, 2, 1).view(B, C, H, W)
+            x2 = x2.permute(0, 2, 1).view(B, C, H, W)
             abs_pos = self.pos_object(shape_util=(B, H, W), device=x1.device)
             x1 = x1 + abs_pos
             x2 = x2 + abs_pos
-
-        x1 = x1.permute(0, 2, 3, 1).view(B, H*W, C)
-        x2 = x2.permute(0, 2, 3, 1).view(B, H*W, C)
+            x1 = x1.permute(0, 2, 3, 1).view(B, L, C)
+            x2 = x2.permute(0, 2, 3, 1).view(B, L, C)
 
         for blk in self.blocks:
             if self.use_checkpoint:
                 x1 = checkpoint.checkpoint(blk, x1)
             else:
                 x1 = blk(x1, x2)
-
-        x1 = x1.permute(0, 2, 1).view(B, C, H, W)
-
+        #layer_out = x
+        #if self.downsample is not None:
+        #    x = self.downsample(x)
+        #return x, layer_out
         return x1
 
     def extra_repr(self) -> str:

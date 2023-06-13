@@ -14,7 +14,7 @@ import torch
 import sys
 import torch.nn as nn
 import matplotlib.pyplot as plt
-from ..lib.encoder import Encoder
+from ..lib.encoder import Encoder, Encoder1D
 from ..lib.utils import MLP, MotionEstimation, DeformableTransformer, ConvBlocks, Filter, ConvBlock, GetSeparability, GetCrossSimilarityMatrix, ReplicateChannels, To_image, From_image, rescale, CCA
 from ..lib import swin_transformer_2
 from ..lib import decoder_alt
@@ -29,7 +29,7 @@ from ..lib.vq_vae import VectorQuantizer, VectorQuantizerEMA, VanillaVAE, Quanti
 from torch.cuda.amp import autocast
 from nnunet.utilities.random_stuff import no_op
 from typing import Union, Tuple
-from ..lib.vit_transformer import _get_clones, TransformerDecoder, TransformerFlowEncoder, ModulationTransformer, TransformerFlowDecoder, SpatioTemporalTransformer, SpatialTransformerLayer, SlotTransformer, TransformerEncoderLayer, SlotAttention, CrossTransformerEncoderLayer, CrossRelativeSpatialTransformerLayer
+from ..lib.vit_transformer import _get_clones, TransformerDecoder, TransformerFlowEncoderIterative, TransformerFlowEncoderIterativeMiddle, TransformerFlowEncoder, ModulationTransformer, TransformerFlowDecoder, SpatioTemporalTransformer, SpatialTransformerLayer, SlotTransformer, TransformerEncoderLayer, SlotAttention, CrossTransformerEncoderLayer, CrossRelativeSpatialTransformerLayer
 from batchgenerators.augmentations.utils import pad_nd_image
 from ..training.dataloading.dataset_loading import get_idx, select_idx
 from ..lib.position_embedding import PositionEmbeddingSine2d, PositionEmbeddingSine1d
@@ -69,7 +69,7 @@ class ModelWrap(SegmentationNetwork):
         return self.model1._internal_maybe_mirror_and_pred_2D(x, mirror_axes, do_mirroring, mult)
 
 
-class OpticalFlowModel(SegmentationNetwork):
+class OpticalFlowModel4(SegmentationNetwork):
     def __init__(self,
                 deep_supervision,
                 out_encoder_dims,
@@ -87,10 +87,10 @@ class OpticalFlowModel(SegmentationNetwork):
                 log_function,
                 dot_multiplier,
                 nb_tokens,
+                lookback,
                 norm_1d,
                 norm_2d):
-        super(OpticalFlowModel, self).__init__()
-        
+        super(OpticalFlowModel4, self).__init__()
         self.num_stages = (len(conv_depth))
         self.num_bottleneck_layers = num_bottleneck_layers
         self.d_model = out_encoder_dims[-1] * 2
@@ -103,6 +103,7 @@ class OpticalFlowModel(SegmentationNetwork):
         self.log_function = log_function
         self.blackout = blackout
         #self.regularization_loss_weight = nn.Parameter(torch.tensor([-30.0], requires_grad=True)) # -6.8
+        self.lookback = lookback
         
         self.num_classes = 4
 
@@ -115,16 +116,24 @@ class OpticalFlowModel(SegmentationNetwork):
         dpr_decoder = [x[::-1] for x in dpr_encoder[::-1]]
         dpr_bottleneck = dpr[-1]
 
+        self.motion_estimation = MotionEstimation()
+
         self.encoder = Encoder(conv_layer=conv_layer_2d, norm=norm_2d, out_dims=out_encoder_dims, device=device, in_dims=in_dims, conv_depth=conv_depth, dpr=dpr_encoder)
-        in_dims[0] = self.num_classes
+        decoder_in_dims = in_dims[:]
+        decoder_in_dims[0] = self.num_classes
         conv_depth_decoder = conv_depth[::-1]
 
-        self.seg_decoder = decoder_alt.SegmentationDecoder2(dot_multiplier=dot_multiplier, deep_supervision=deep_supervision, conv_depth=conv_depth_decoder, conv_layer=conv_layer_2d, dpr=dpr_decoder, in_encoder_dims=in_dims[::-1], out_encoder_dims=out_encoder_dims[::-1], num_classes=self.num_classes, img_size=image_size, norm=norm_2d)
-        self.flow_decoder = decoder_alt.SegmentationDecoder2(dot_multiplier=dot_multiplier, deep_supervision=deep_supervision, conv_depth=conv_depth_decoder, conv_layer=conv_layer_2d, dpr=dpr_decoder, in_encoder_dims=in_dims[::-1], out_encoder_dims=out_encoder_dims[::-1], num_classes=2, img_size=image_size, norm=norm_2d)
+        self.seg_decoder = decoder_alt.SegmentationDecoder2(dot_multiplier=dot_multiplier, deep_supervision=deep_supervision, conv_depth=conv_depth_decoder, conv_layer=conv_layer_2d, dpr=dpr_decoder, in_encoder_dims=decoder_in_dims[::-1], out_encoder_dims=out_encoder_dims[::-1], num_classes=self.num_classes, img_size=image_size, norm=norm_2d)
+        self.flow_decoder = decoder_alt.SegmentationDecoder2(dot_multiplier=dot_multiplier, deep_supervision=deep_supervision, conv_depth=conv_depth_decoder, conv_layer=conv_layer_2d, dpr=dpr_decoder, in_encoder_dims=decoder_in_dims[::-1], out_encoder_dims=out_encoder_dims[::-1], num_classes=2, img_size=image_size, norm=norm_2d)
 
         H, W = (int(image_size / 2**(self.num_stages)), int(image_size / 2**(self.num_stages)))
         #d_ffn = min(2048, self.d_model * 4)
-        self.transformer_flow_encoder = TransformerFlowEncoder(dim=self.d_model, nhead=self.bottleneck_heads, num_layers=self.nb_layers, nb_tokens=nb_tokens)
+        #self.transformer_flow_encoder = TransformerFlowEncoderIterative(dim=self.d_model, nhead=self.bottleneck_heads, num_layers=self.nb_layers, nb_tokens=nb_tokens, lookback=lookback)
+        self.transformer_flow_encoder = TransformerFlowEncoderIterativeMiddle(dim=self.d_model, nhead=self.bottleneck_heads, num_layers=self.nb_layers, nb_tokens=nb_tokens, lookback=lookback)
+        
+        #for i in range(nb_conv_1d):
+        #    conv_1d = nn.Sequential(nn.Conv1d(in_channels=self.d_model, out_channels=self.d_model, kernel_size=3, padding='same'),
+        #                            )
         
         self.conv_1d = nn.Conv1d(in_channels=self.d_model, out_channels=self.d_model, kernel_size=17, padding='same')
 
@@ -154,6 +163,16 @@ class OpticalFlowModel(SegmentationNetwork):
         output_feature_map = output_feature_map.permute(0, 2, 1).contiguous() # B, C, L
         output_feature_map = memory_bus @ output_feature_map # B, M, L
         return output_feature_map
+
+    def organize_deep_supervision(self, outputs):
+        all_scale_list = []
+        for i in range(self.num_stages):
+            one_scale_list = []
+            for t in range(len(outputs)):
+                one_scale_list.append(outputs[t][i])
+            one_scale_list = torch.stack(one_scale_list, dim=0)
+            all_scale_list.append(one_scale_list)
+        return all_scale_list
 
     def forward(self, unlabeled):
         out = {'seg': None,
@@ -200,62 +219,46 @@ class OpticalFlowModel(SegmentationNetwork):
         pos_1d = torch.flatten(unlabeled_features, start_dim=-2).mean(-1) # T, B, C
         pos_1d = pos_1d.permute(1, 2, 0).contiguous()
         pos_1d = self.conv_1d(pos_1d)
-        pos_1d_1 = pos_1d[:, :, :-1]
-        pos_1d_2 = pos_1d[:, :, 1:]
 
-        feature_1 = unlabeled_features[:-1]
-        feature_2 = unlabeled_features[1:]
-        feature_1_skip_co = unlabeled_skip_co_list[:-1]
-        feature_2_skip_co = unlabeled_skip_co_list[1:]
+        T, B, C, H, W = unlabeled_features.shape
 
-        T, B, C, H, W = feature_1.shape
+        unlabeled_features = self.transformer_flow_encoder(spatial_features=unlabeled_features, pos_1d=pos_1d) # T, B, H*W, C
 
-        feature_1, feature_2 = self.transformer_flow_encoder(spatial_features_1=feature_1, 
-                                                             spatial_features_2=feature_2,
-                                                             pos_1d_1=pos_1d_1,
-                                                             pos_1d_2=pos_1d_2) # T, B, H*W, C ; T, B, M, C
-
-        seg_list_1 = []
-        seg_list_2 = []
-        for t in range(len(feature_1)):
+        seg_list = []
+        for t in range(len(unlabeled_features)):
 
             flow_skip_co = []
             for s, reduction_layer in enumerate(self.skip_co_reduction_list):
-                concatenated = torch.cat([feature_1_skip_co[t][s], feature_2_skip_co[t][s]], dim=1)
+                if t == 0:
+                    concatenated = torch.cat([torch.zeros_like(unlabeled_skip_co_list[t][s]), unlabeled_skip_co_list[t][s]], dim=1)
+                else:
+                    concatenated = torch.cat([unlabeled_skip_co_list[t - 1][s], unlabeled_skip_co_list[t][s]], dim=1)
                 concatenated = reduction_layer(concatenated)
                 flow_skip_co.append(concatenated)
 
-            to_decode_feature_1 = feature_1[t] # B, L, C
-            to_decode_feature_2 = feature_2[t] # B, L, C
+            to_decode_feature = unlabeled_features[t] # B, L, C
+            to_decode_feature = to_decode_feature.permute(0, 2, 1).contiguous().view(B, C, H, W)
 
-            to_decode_feature_1 = to_decode_feature_1.permute(0, 2, 1).contiguous().view(B, C, H, W)
-            to_decode_feature_2 = to_decode_feature_2.permute(0, 2, 1).contiguous().view(B, C, H, W)
+            seg = self.seg_decoder(to_decode_feature, unlabeled_skip_co_list[t])
 
-            flow_1 = self.flow_decoder(to_decode_feature_1, flow_skip_co)
-            flow_2 = self.flow_decoder(to_decode_feature_2, flow_skip_co)
-            seg_1 = self.seg_decoder(to_decode_feature_1, feature_1_skip_co[t])
-            seg_2 = self.seg_decoder(to_decode_feature_2, feature_2_skip_co[t])
+            seg_list.append(seg)
+            flow = self.flow_decoder(to_decode_feature, flow_skip_co)
+            out['backward_flow'].append(flow)
 
-            seg_list_1.append(seg_1)
-            seg_list_2.append(seg_2)
-            out['forward_flow'].append(flow_1)
-            out['backward_flow'].append(flow_2)
-        
+        out['seg'] = self.organize_deep_supervision(seg_list)
+        out['backward_flow'] = self.organize_deep_supervision(out['backward_flow'])
 
-        seg_1 = torch.stack(seg_list_1, dim=0)
-        seg_2 = torch.stack(seg_list_2, dim=0)
+        if not self.do_ds:
+            out['seg'] = out['seg'][0]
+            out['backward_flow'] = out['backward_flow'][0]
 
-        middle = torch.stack([seg_1[1:], seg_2[:-1]], dim=0).mean(0)
-        seg = torch.cat([seg_1[0][None], middle, seg_2[-1][None]], dim=0)
-
-        out['seg'] = seg
-        out['forward_flow'] = torch.stack(out['forward_flow'], dim=0)
-        out['backward_flow'] = torch.stack(out['backward_flow'], dim=0)
+        #middle = torch.stack([seg_1[1:], seg_2[:-1]], dim=0).mean(0)
+        #seg = torch.cat([seg_1[0][None], middle, seg_2[-1][None]], dim=0)
 
         return out
     
 
-    def predict_3D_flow(self, unlabeled, processor, do_mirroring: bool, mirror_axes: Tuple[int, ...] = (0, 1, 2),
+    def predict_3D_flow(self, unlabeled, target_mask, padding_mask, target, processor, do_mirroring: bool, mirror_axes: Tuple[int, ...] = (0, 1, 2),
                    use_sliding_window: bool = False,
                    step_size: float = 0.5, patch_size: Tuple[int, ...] = None, regions_class_order: Tuple[int, ...] = None,
                    use_gaussian: bool = False, pad_border_mode: str = "constant",
@@ -293,6 +296,8 @@ class OpticalFlowModel(SegmentationNetwork):
         :param mixed_precision: if True, will run inference in mixed precision with autocast()
         :return:
         """
+
+        # P, T, 1, D, H, W
         torch.cuda.empty_cache()
 
         assert step_size <= 1, 'step_size must be smaller than 1. Otherwise there will be a gap between consecutive ' \
@@ -318,7 +323,7 @@ class OpticalFlowModel(SegmentationNetwork):
             self.log_function("WARNING! Network is in train mode during inference. This may be intended, or not...")
             #print('WARNING! Network is in train mode during inference. This may be intended, or not...')
 
-        assert len(unlabeled[0].shape) == 4, "data must have shape (c,x,y,z)"
+        assert len(unlabeled[0, 0].shape) == 4, "data must have shape (c,x,y,z)"
 
         if mixed_precision:
             context = autocast
@@ -330,7 +335,7 @@ class OpticalFlowModel(SegmentationNetwork):
         with context():
             with torch.no_grad():
                 if use_sliding_window:
-                    res = self._internal_predict_3D_2Dconv_tiled_flow(unlabeled, processor, patch_size, do_mirroring, mirror_axes, step_size,
+                    res = self._internal_predict_3D_2Dconv_tiled_flow(unlabeled, target_mask, padding_mask, target, processor, patch_size, do_mirroring, mirror_axes, step_size,
                                                                                 regions_class_order, use_gaussian, pad_border_mode,
                                                                                 pad_kwargs, all_in_gpu, False)
                 else:
@@ -339,8 +344,7 @@ class OpticalFlowModel(SegmentationNetwork):
 
         return res
 
-
-    def _internal_maybe_mirror_and_pred_2D(self, unlabeled, processor, mirror_axes: tuple,
+    def _internal_maybe_mirror_and_pred_2D(self, unlabeled, target, processor, mirror_axes: tuple,
                                            do_mirroring: bool = True) -> torch.tensor:
         # if cuda available:
         #   everything in here takes place on the GPU. If x and mult are not yet on GPU this will be taken care of here
@@ -348,12 +352,14 @@ class OpticalFlowModel(SegmentationNetwork):
 
         assert len(unlabeled[0].shape) == 4, 'x must be (b, c, x, y)'
         unlabeled = maybe_to_torch(unlabeled)
+        target = maybe_to_torch(target)
 
         result_torch_seg = torch.zeros(list(unlabeled.shape[:2]) + [self.num_classes] + [processor.crop_size, processor.crop_size], dtype=torch.float)
-        result_torch_flow = torch.zeros([unlabeled.shape[0] - 1] + [unlabeled.shape[1]] + [2] + [processor.crop_size, processor.crop_size], dtype=torch.float)
+        result_torch_flow = torch.zeros(list(unlabeled.shape[:2]) + [2] + [processor.crop_size, processor.crop_size], dtype=torch.float)
 
         if torch.cuda.is_available():
             unlabeled = to_cuda(unlabeled, gpu_id=self.get_device())
+            target = to_cuda(target, gpu_id=self.get_device())
             result_torch_seg = result_torch_seg.cuda(self.get_device(), non_blocking=True)
             result_torch_flow = result_torch_flow.cuda(self.get_device(), non_blocking=True)
 
@@ -373,8 +379,10 @@ class OpticalFlowModel(SegmentationNetwork):
             mean_centroid, _ = processor.preprocess_no_registration(data=unlabeled[:, 0]) # T, C(1), H, W
 
             cropped_unlabeled, padding_need = processor.crop_and_pad(data=unlabeled[:, 0], mean_centroid=mean_centroid)
+            cropped_target, _ = processor.crop_and_pad(data=target[:, 0], mean_centroid=mean_centroid)
             padding_need = padding_need[None]
             cropped_unlabeled = cropped_unlabeled[:, None]
+            cropped_target = cropped_target[:, None]
         
         cropped_unlabeled[:, 0] = NormalizeIntensity(nonzero=True)(cropped_unlabeled[:, 0])
 
@@ -458,13 +466,6 @@ class OpticalFlowModel(SegmentationNetwork):
 
                 result_torch_seg += 1 / num_results * torch.flip(seg_pred, (4, 3))
                 #result_torch_flow += 1 / num_results * torch.flip(flow_pred, (4, 3))
-
-        result_torch_seg = result_torch_seg.permute(1, 0, 2, 3, 4).contiguous()
-        result_torch_flow = result_torch_flow.permute(1, 0, 2, 3, 4).contiguous()
-        result_torch_seg = processor.uncrop_no_registration(result_torch_seg, padding_need)
-        result_torch_flow = processor.uncrop_no_registration(result_torch_flow, padding_need)
-        result_torch_seg = result_torch_seg.permute(1, 0, 2, 3, 4).contiguous()
-        result_torch_flow = result_torch_flow.permute(1, 0, 2, 3, 4).contiguous()
         
         #matplotlib.use('QtAgg')
         #fig, ax = plt.subplots(1, 1)
@@ -473,49 +474,57 @@ class OpticalFlowModel(SegmentationNetwork):
         #plt.waitforbuttonpress()
         #plt.close(fig)
         
-        return result_torch_seg, result_torch_flow
+        return result_torch_seg, result_torch_flow, cropped_target, padding_need
     
 
-    def _internal_predict_3D_2Dconv_tiled_flow(self, unlabeled, processor, patch_size: Tuple[int, int], do_mirroring: bool,
+    def _internal_predict_3D_2Dconv_tiled_flow(self, unlabeled, target_mask, padding_mask, target, processor, patch_size: Tuple[int, int], do_mirroring: bool,
                                                 mirror_axes: tuple = (0, 1), step_size: float = 0.5,
                                                 regions_class_order: tuple = None, use_gaussian: bool = False,
                                                 pad_border_mode: str = "edge", pad_kwargs: dict =None,
                                                 all_in_gpu: bool = False,
                                                 verbose: bool = True) -> Tuple[np.ndarray, np.ndarray]:
+        
+        # P, T, 1, D, H, W
+
         if all_in_gpu:
             raise NotImplementedError
 
-        assert len(unlabeled[0].shape) == 4, "data must be c, x, y, z"
+        assert len(unlabeled[0, 0].shape) == 4, "data must be c, x, y, z"
 
         predicted_segmentation = []
-        softmax_pred = []
+        softmax_pred_list = []
         flow_pred_list = []
+        registered_pred_list = []
 
-        for depth_idx in range(unlabeled.shape[2]):
+        for depth_idx in range(unlabeled.shape[3]):
 
             #current_video = [x[:, depth_idx] for x in frame_list]
 
-            pred_seg, softmax_pres, flow_pred = self._internal_predict_2D_2Dconv_tiled_flow(
-                unlabeled[:, :, depth_idx], processor, step_size, do_mirroring, mirror_axes, patch_size, regions_class_order, use_gaussian,
+            pred_seg, softmax_pred, flow_pred, registered_pred = self._internal_predict_2D_2Dconv_tiled_flow(
+                unlabeled[:, :, :, depth_idx], target_mask, padding_mask, target[:, :, depth_idx], processor, step_size, do_mirroring, mirror_axes, patch_size, regions_class_order, use_gaussian,
                 pad_border_mode, pad_kwargs, all_in_gpu, verbose)
 
-            predicted_segmentation.append(pred_seg[None]) # batch size added
-            softmax_pred.append(softmax_pres[None])
+            predicted_segmentation.append(pred_seg[None])
+            softmax_pred_list.append(softmax_pred[None])
             flow_pred_list.append(flow_pred[None])
+            registered_pred_list.append(registered_pred[None])
 
         predicted_segmentation = np.vstack(predicted_segmentation).transpose((1, 0, 2, 3)) # T, depth, H, W
-        flow_pred_list = np.vstack(flow_pred_list).transpose((1, 2, 0, 3, 4)) # T, C, depth, H, W
-        softmax_pred = np.vstack(softmax_pred).transpose((1, 2, 0, 3, 4)) # T, C, depth, H, W
+        flow_pred = np.vstack(flow_pred_list).transpose((1, 2, 0, 3, 4)) # T, C, depth, H, W
+        softmax_pred = np.vstack(softmax_pred_list).transpose((1, 2, 0, 3, 4)) # T, C, depth, H, W
+        registered_pred = np.vstack(registered_pred_list).transpose((1, 0, 2, 3)) # C, depth, H, W
 
-        return predicted_segmentation, softmax_pred, flow_pred_list
+        return predicted_segmentation, softmax_pred, flow_pred, registered_pred
 
 
-    def _internal_predict_2D_2Dconv_tiled_flow(self, unlabeled, processor, step_size: float, do_mirroring: bool, mirror_axes: tuple,
+    def _internal_predict_2D_2Dconv_tiled_flow(self, unlabeled, target_mask, padding_mask, target, processor, step_size: float, do_mirroring: bool, mirror_axes: tuple,
                                           patch_size: tuple, regions_class_order: tuple, use_gaussian: bool,
                                           pad_border_mode: str, pad_kwargs: dict, all_in_gpu: bool,
                                           verbose: bool) -> Tuple[np.ndarray, np.ndarray]:
+        # unlabeled = P, T1, 1, H, W
+        # target = T2, 1, H, W
         # better safe than sorry
-        assert len(unlabeled[0].shape) == 3, "x must be (c, x, y)"
+        assert len(unlabeled[0, 0].shape) == 3, "x must be (c, x, y)"
 
         if verbose: print("step_size:", step_size)
         if verbose: print("do mirror:", do_mirroring)
@@ -525,10 +534,11 @@ class OpticalFlowModel(SegmentationNetwork):
         # for sliding window inference the image must at least be as large as the patch size. It does not matter
         # whether the shape is divisible by 2**num_pool as long as the patch size is
         unlabeled_data, unlabeled_slicer = pad_nd_image(unlabeled, patch_size, pad_border_mode, pad_kwargs, True, None)
+        target_data, target_slicer = pad_nd_image(target, patch_size, pad_border_mode, pad_kwargs, True, None)
         unlabeled_shape = unlabeled_data.shape
 
         # compute the steps for sliding window
-        steps = self._compute_steps_for_sliding_window(patch_size, unlabeled_shape[2:], step_size)
+        steps = self._compute_steps_for_sliding_window(patch_size, unlabeled_shape[-2:], step_size)
         num_tiles = len(steps[0]) * len(steps[1])
 
         if verbose:
@@ -558,6 +568,8 @@ class OpticalFlowModel(SegmentationNetwork):
         #else:
         #    gaussian_importance_map = None
 
+        nb_frames = len(padding_mask[padding_mask])
+
         if all_in_gpu:
             # If we run the inference in GPU only (meaning all tensors are allocated on the GPU, this reduces
             # CPU-GPU communication but required more GPU memory) we need to preallocate a few things on GPU
@@ -576,25 +588,34 @@ class OpticalFlowModel(SegmentationNetwork):
             #    add_for_nb_of_preds = torch.ones(patch_size, device=self.get_device())
 
             if verbose: print("initializing result array (on GPU)")
-            aggregated_results_seg = torch.zeros([unlabeled_data.shape[0], self.num_classes] + list(unlabeled_data.shape[2:]), dtype=torch.half,
+            aggregated_results_seg = torch.zeros([nb_frames, self.num_classes] + list(unlabeled_data.shape[3:]), dtype=torch.half,
                                              device=self.get_device())
-            aggregated_results_flow = torch.zeros([unlabeled_data.shape[0], 2] + list(unlabeled_data.shape[2:]), dtype=torch.half,
+            aggregated_results_flow = torch.zeros([nb_frames, 2] + list(unlabeled_data.shape[3:]), dtype=torch.half,
+                                             device=self.get_device())
+            aggregated_results_registered = torch.zeros([1] + list(unlabeled_data.shape[3:]), dtype=torch.half,
                                              device=self.get_device())
 
             if verbose: print("moving data to GPU")
             unlabeled_data = torch.from_numpy(unlabeled_data).cuda(self.get_device(), non_blocking=True)
+            target_data = torch.from_numpy(target_data).cuda(self.get_device(), non_blocking=True)
+            target_mask = torch.from_numpy(target_mask).cuda(self.get_device(), non_blocking=True)
+            padding_mask = torch.from_numpy(padding_mask).cuda(self.get_device(), non_blocking=True)
 
             #if verbose: print("initializing result_numsamples (on GPU)")
-            #aggregated_nb_of_predictions_seg = torch.zeros([unlabeled_data.shape[0], self.num_classes] + list(unlabeled_data.shape[2:]), dtype=torch.half,
+            #aggregated_nb_of_predictions_seg = torch.zeros([nb_frames, self.num_classes] + list(unlabeled_data.shape[2:]), dtype=torch.half,
             #                                           device=self.get_device())
         else:
+            target_mask = torch.from_numpy(target_mask)
+            padding_mask = torch.from_numpy(padding_mask)
+
             #if use_gaussian and num_tiles > 1:
             #    add_for_nb_of_preds = self._gaussian_2d
             #else:
             #    add_for_nb_of_preds = np.ones(patch_size, dtype=np.float32)
-            aggregated_results_seg = np.zeros([unlabeled_data.shape[0], self.num_classes] + list(unlabeled_data.shape[2:]), dtype=np.float32)
-            aggregated_results_flow = np.zeros([unlabeled_data.shape[0] - 1, 2] + list(unlabeled_data.shape[2:]), dtype=np.float32)
-            #aggregated_nb_of_predictions_seg = np.zeros([unlabeled_data.shape[0], self.num_classes] + list(unlabeled_data.shape[2:]), dtype=np.float32)
+            aggregated_results_seg = np.zeros([nb_frames, self.num_classes] + list(unlabeled_data.shape[3:]), dtype=np.float32)
+            aggregated_results_flow = np.zeros([nb_frames, 2] + list(unlabeled_data.shape[3:]), dtype=np.float32)
+            aggregated_results_registered = np.zeros([1] + list(unlabeled_data.shape[3:]), dtype=np.float32)
+            #aggregated_nb_of_predictions_seg = np.zeros([nb_frames, self.num_classes] + list(unlabeled_data.shape[2:]), dtype=np.float32)
 
         H, W = unlabeled_data.shape[-2:]
         y1 = int((H / 2) - (patch_size[0] / 2))
@@ -602,19 +623,50 @@ class OpticalFlowModel(SegmentationNetwork):
         x1 = int((W / 2) - (patch_size[1] / 2))
         x2 = int((W / 2) + (patch_size[1] / 2))
 
-        seg, flow = self._internal_maybe_mirror_and_pred_2D(unlabeled_data[:, None, :, y1:y2, x1:x2], processor, mirror_axes, do_mirroring)
-        #flow = self._internal_maybe_mirror_and_pred_2D_flow(unlabeled_data[:, None, :, y1:y2, x1:x2], processor, mirror_axes, do_mirroring)
-        
-        flow = flow[:, 0]
-        seg = seg[:, 0]
+        seg_list = []
+        flow_list = []
+        for i in range(len(unlabeled_data)):
+            seg, flow, target, padding_need = self._internal_maybe_mirror_and_pred_2D(unlabeled_data[i, :, None, :, y1:y2, x1:x2], target_data[:, None, :, y1:y2, x1:x2], processor, mirror_axes, do_mirroring)
+            #flow = self._internal_maybe_mirror_and_pred_2D_flow(unlabeled_data[:, None, :, y1:y2, x1:x2], processor, mirror_axes, do_mirroring)
+
+            if i > 0:
+                seg = seg[1:]
+                flow = flow[1:]
+            seg_list.append(seg)
+            flow_list.append(flow)
+
+        seg = torch.cat(seg_list, axis=0) # T, B(1), 4, H, W
+        flow = torch.cat(flow_list, axis=0) # T, B(1), 2, H, W
+        assert len(seg) == len(padding_mask)
+        seg = seg[padding_mask]
+        flow = flow[padding_mask]
+
+        assert nb_frames == len(seg) == len(flow)
+
+        and_mask = torch.logical_and(padding_mask, target_mask)
+        indices = torch.nonzero(and_mask) # 2, 1
+        current_motion = target[indices[1].item()]
+        for t in range(indices[1].item(), indices[0].item(), -1):
+            current_motion = self.motion_estimation(flow=flow[t], original=current_motion, mode='nearest')
+
+        flow = flow.permute(1, 0, 2, 3, 4).contiguous()
+        seg = seg.permute(1, 0, 2, 3, 4).contiguous()
+        current_motion = current_motion[:, None]
+
+        flow = processor.uncrop_no_registration(flow, padding_need)[0]
+        seg = processor.uncrop_no_registration(seg, padding_need)[0]
+        current_motion = processor.uncrop_no_registration(current_motion, padding_need)[0, 0]
+
         if all_in_gpu:
             flow = flow.half()
             seg = seg.half()
         else:
             flow = flow.cpu().numpy()
             seg = seg.cpu().numpy()
+        
         aggregated_results_flow[:, :, y1:y2, x1:x2] += flow
         aggregated_results_seg[:, :, y1:y2, x1:x2] += seg
+        aggregated_results_registered[:, y1:y2, x1:x2] += current_motion
 
         #for x in steps[0]:
         #    lb_x = x
@@ -640,14 +692,19 @@ class OpticalFlowModel(SegmentationNetwork):
         # we reverse the padding here (remeber that we padded the input to be at least as large as the patch size
         unlabeled_slicer_seg = tuple(
             [slice(0, aggregated_results_seg.shape[i]) for i in
-             range(len(aggregated_results_seg.shape) - (len(unlabeled_slicer) - 2))] + unlabeled_slicer[2:])
+             range(len(aggregated_results_seg.shape) - 2)] + unlabeled_slicer[-2:])
         
         unlabeled_slicer_flow = tuple(
             [slice(0, aggregated_results_flow.shape[i]) for i in
-             range(len(aggregated_results_flow.shape) - (len(unlabeled_slicer) - 2))] + unlabeled_slicer[2:])
+             range(len(aggregated_results_flow.shape) - 2)] + unlabeled_slicer[-2:])
+        
+        unlabeled_slicer_registered = tuple(
+            [slice(0, aggregated_results_registered.shape[i]) for i in
+             range(len(aggregated_results_registered.shape) - 2)] + unlabeled_slicer[-2:])
         
         aggregated_results_seg = aggregated_results_seg[unlabeled_slicer_seg]
         aggregated_results_flow = aggregated_results_flow[unlabeled_slicer_flow]
+        aggregated_results_registered = aggregated_results_registered[unlabeled_slicer_registered]
         #aggregated_nb_of_predictions_seg = aggregated_nb_of_predictions_seg[unlabeled_slicer_seg]
 
         # computing the class_probabilities by dividing the aggregated result with result_numsamples
@@ -675,4 +732,4 @@ class OpticalFlowModel(SegmentationNetwork):
             class_probabilities = class_probabilities.detach().cpu().numpy()
 
         if verbose: print("prediction done")
-        return predicted_segmentation, class_probabilities, aggregated_results_flow
+        return predicted_segmentation, class_probabilities, aggregated_results_flow, aggregated_results_registered

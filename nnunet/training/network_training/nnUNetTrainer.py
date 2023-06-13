@@ -12,6 +12,7 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
+from tqdm import tqdm
 import psutil
 import shutil
 from collections import OrderedDict
@@ -19,6 +20,8 @@ from multiprocessing import Pool
 from time import sleep
 from typing import Tuple, List
 import matplotlib.pyplot as plt
+import SimpleITK as sitk
+
 
 import matplotlib
 import numpy as np
@@ -364,7 +367,10 @@ class nnUNetTrainer(NetworkTrainer):
         self.normalization_schemes = plans['normalization_schemes']
         self.base_num_features = plans['base_num_features']
         self.num_input_channels = plans['num_modalities']
-        self.num_classes = plans['num_classes'] + 1  # background is no longer in num_classes
+        if self.binary:
+            self.num_classes = 2  # background is no longer in num_classes
+        else:
+            self.num_classes = plans['num_classes'] + 1  # background is no longer in num_classes
         self.classes = plans['all_classes']
         self.use_mask_for_norm = plans['use_mask_for_norm']
         self.only_keep_largest_connected_component = plans['keep_only_largest_region']
@@ -487,7 +493,7 @@ class nnUNetTrainer(NetworkTrainer):
                                                          use_gaussian: bool = True, pad_border_mode: str = 'constant',
                                                          pad_kwargs: dict = None, all_in_gpu: bool = False,
                                                          verbose: bool = True, mixed_precision: bool = True,
-                                                         get_flops=False) -> Tuple[np.ndarray, np.ndarray]:
+                                                         get_flops=False, binary=False) -> Tuple[np.ndarray, np.ndarray]:
         """
         :param data:
         :param do_mirroring:
@@ -521,12 +527,12 @@ class nnUNetTrainer(NetworkTrainer):
                                       patch_size=self.patch_size, regions_class_order=self.regions_class_order,
                                       use_gaussian=use_gaussian, pad_border_mode=pad_border_mode,
                                       pad_kwargs=pad_kwargs, all_in_gpu=all_in_gpu, verbose=verbose,
-                                      mixed_precision=mixed_precision, get_flops=get_flops)
+                                      mixed_precision=mixed_precision, get_flops=get_flops, binary=binary)
         self.network.train(current_mode)
         return ret
 
 
-    def predict_preprocessed_data_return_seg_and_softmax_flow(self, labeled, unlabeled, processor, do_mirroring: bool = True,
+    def predict_preprocessed_data_return_seg_and_softmax_flow(self, unlabeled, target_mask, padding_mask, target, processor, do_mirroring: bool = True,
                                                          mirror_axes: Tuple[int] = None,
                                                          use_sliding_window: bool = True, step_size: float = 0.5,
                                                          use_gaussian: bool = True, pad_border_mode: str = 'constant',
@@ -545,6 +551,9 @@ class nnUNetTrainer(NetworkTrainer):
         :param verbose:
         :return:
         """
+
+        # P, T, 1, D, H, W
+
         if pad_border_mode == 'constant' and pad_kwargs is None:
             pad_kwargs = {'constant_values': 0}
 
@@ -560,7 +569,7 @@ class nnUNetTrainer(NetworkTrainer):
 
         current_mode = self.network.training
         self.network.eval()
-        ret = self.network.predict_3D_flow(labeled=labeled, unlabeled=unlabeled, processor=processor, do_mirroring=do_mirroring, mirror_axes=mirror_axes,
+        ret = self.network.predict_3D_flow(unlabeled=unlabeled, target_mask=target_mask, padding_mask=padding_mask, target=target, processor=processor, do_mirroring=do_mirroring, mirror_axes=mirror_axes,
                                       use_sliding_window=use_sliding_window, step_size=step_size,
                                       patch_size=self.patch_size, regions_class_order=self.regions_class_order,
                                       use_gaussian=use_gaussian, pad_border_mode=pad_border_mode,
@@ -789,7 +798,7 @@ class nnUNetTrainer(NetworkTrainer):
     def validate(self, log_function, do_mirroring: bool = True, use_sliding_window: bool = True, step_size: float = 0.5,
                  save_softmax: bool = True, use_gaussian: bool = True, overwrite: bool = True,
                  validation_folder_name: str = 'validation_raw', debug: bool = True, all_in_gpu: bool = False,
-                 segmentation_export_kwargs: dict = None, run_postprocessing_on_folds: bool = True, output_folder=None):
+                 segmentation_export_kwargs: dict = None, run_postprocessing_on_folds: bool = True, output_folder=None, binary=False):
         """
         if debug=True then the temporary files generated for postprocessing determination will be kept
         """
@@ -835,6 +844,9 @@ class nnUNetTrainer(NetworkTrainer):
                          }
         save_json(my_input_args, join(output_folder, "validation_args.json"))
 
+        if binary:
+            do_mirroring = True
+
         if do_mirroring:
             if not self.data_aug_params['do_mirror']:
                 raise RuntimeError("We did not train with mirroring so you cannot do inference with mirroring enabled")
@@ -860,21 +872,23 @@ class nnUNetTrainer(NetworkTrainer):
                 self.print_to_log_file(k, data.shape)
                 data[-1][data[-1] == -1] = 0
 
-                get_flops = idx == 0
+                #get_flops = idx == 0
+                get_flops = False
 
                 out = self.predict_preprocessed_data_return_seg_and_softmax(data[:-1],
-                                                                                     do_mirroring=do_mirroring,
-                                                                                     mirror_axes=mirror_axes,
-                                                                                     use_sliding_window=use_sliding_window,
-                                                                                     step_size=step_size,
-                                                                                     use_gaussian=use_gaussian,
-                                                                                     all_in_gpu=all_in_gpu,
-                                                                                     mixed_precision=self.fp16,
-                                                                                     get_flops=get_flops)
+                                                                            do_mirroring=do_mirroring,
+                                                                            mirror_axes=mirror_axes,
+                                                                            use_sliding_window=use_sliding_window,
+                                                                            step_size=step_size,
+                                                                            use_gaussian=use_gaussian,
+                                                                            all_in_gpu=all_in_gpu,
+                                                                            mixed_precision=self.fp16,
+                                                                            get_flops=get_flops,
+                                                                            binary=binary)
 
                 softmax_pred = out[1]
                 
-                if idx == 0:
+                if get_flops and idx == 0:
                     flop_dict = out[2]
                     inference_time = out[3] / 1000
                     gflops = 0
@@ -927,7 +941,8 @@ class nnUNetTrainer(NetworkTrainer):
                              json_author="Fabian",
                              json_task=task, num_threads=default_num_threads,
                              advanced=True,
-                             metadata_list=metadata_list)
+                             metadata_list=metadata_list,
+                             binary=binary)
 
         if run_postprocessing_on_folds:
             # in the old nnunet we would stop here. Now we add a postprocessing. This postprocessing can remove everything
@@ -937,7 +952,7 @@ class nnUNetTrainer(NetworkTrainer):
             self.print_to_log_file("determining postprocessing")
             determine_postprocessing(self.output_folder, self.gt_niftis_folder, validation_folder_name,
                                      final_subf_name=validation_folder_name + "_postprocessed", debug=debug, log_function=log_function,
-                                     metadata_list=metadata_list)
+                                     metadata_list=metadata_list, binary=binary)
             # after this the final predictions for the vlaidation set can be found in validation_folder_name_base + "_postprocessed"
             # They are always in that folder, even if no postprocessing as applied!
 
@@ -1190,7 +1205,278 @@ class nnUNetTrainer(NetworkTrainer):
     def validate_flow(self, processor, log_function, step, do_mirroring: bool = True, use_sliding_window: bool = True, step_size: float = 0.5,
                  save_softmax: bool = True, use_gaussian: bool = True, overwrite: bool = True,
                  validation_folder_name: str = 'validation_raw', debug: bool = True, all_in_gpu: bool = False,
-                 segmentation_export_kwargs: dict = None, run_postprocessing_on_folds: bool = True, output_folder=None):
+                 segmentation_export_kwargs: dict = None, run_postprocessing_on_folds: bool = True, output_folder=None, save_flow=True):
+
+        """
+        if debug=True then the temporary files generated for postprocessing determination will be kept
+        """
+        current_mode = self.network.training
+        self.network.eval()
+
+        assert self.was_initialized, "must initialize, ideally with checkpoint (or train first)"
+        if self.dataset_val is None:
+            self.load_dataset()
+            self.do_split()
+
+        if segmentation_export_kwargs is None:
+            if 'segmentation_export_params' in self.plans.keys():
+                force_separate_z = self.plans['segmentation_export_params']['force_separate_z']
+                interpolation_order = self.plans['segmentation_export_params']['interpolation_order']
+                interpolation_order_z = self.plans['segmentation_export_params']['interpolation_order_z']
+            else:
+                force_separate_z = None
+                interpolation_order = 1
+                interpolation_order_z = 0
+        else:
+            force_separate_z = segmentation_export_kwargs['force_separate_z']
+            interpolation_order = segmentation_export_kwargs['interpolation_order']
+            interpolation_order_z = segmentation_export_kwargs['interpolation_order_z']
+
+        # predictions as they come from the network go here
+        if output_folder is not None:
+            self.output_folder = output_folder
+        output_folder = join(self.output_folder, validation_folder_name)
+        maybe_mkdir_p(output_folder)
+        # this is for debug purposes
+        my_input_args = {'do_mirroring': do_mirroring,
+                         'use_sliding_window': use_sliding_window,
+                         'step_size': step_size,
+                         'save_softmax': save_softmax,
+                         'use_gaussian': use_gaussian,
+                         'overwrite': overwrite,
+                         'validation_folder_name': validation_folder_name,
+                         'debug': debug,
+                         'all_in_gpu': all_in_gpu,
+                         'segmentation_export_kwargs': segmentation_export_kwargs,
+                         }
+        save_json(my_input_args, join(output_folder, "validation_args.json"))
+
+        if do_mirroring:
+            if not self.data_aug_params['do_mirror']:
+                raise RuntimeError("We did not train with mirroring so you cannot do inference with mirroring enabled")
+            mirror_axes = self.data_aug_params['mirror_axes']
+        else:
+            mirror_axes = ()
+
+        pred_gt_tuples = []
+        pred_gt_tuples_register = []
+
+        export_pool = Pool(default_num_threads)
+        results = []
+
+        if save_flow:
+            newpath = join(output_folder, 'flow')
+            if not os.path.exists(newpath):
+                os.makedirs(newpath)
+
+        list_of_keys = list(self.dataset_val.keys())
+        un_list_of_keys = list(self.dataset_un_val.keys())
+        patient_id_list = np.unique([x[:10] for x in list_of_keys])
+        metadata_list = []
+        for patient_id in tqdm(patient_id_list[:1]):
+            all_keys = list_of_keys + un_list_of_keys
+            phase_list = [x for x in all_keys if patient_id in x]
+            phase_list = np.array(sorted(phase_list, key=lambda x: int(x[16:18])))
+            phase_list = np.array(phase_list)
+            global_labeled_idx = np.where(~np.char.endswith(phase_list, '_u'))[0]
+
+            if '_u' in phase_list[0]:
+                properties = load_pickle(self.unlabeled_dataset[phase_list[0]]['properties_file'])
+            else:
+                properties = load_pickle(self.dataset[phase_list[0]]['properties_file'])
+
+            unlabeled = np.full(shape=((len(phase_list), 1) + properties['size_after_resampling']), fill_value=np.nan)
+            target = np.full(shape=((len(phase_list), 1) + properties['size_after_resampling']), fill_value=np.nan)
+            target_mask = np.zeros(shape=(len(phase_list),), dtype=bool)
+            padding_mask = np.ones(shape=(len(phase_list),), dtype=bool)
+
+            if overwrite or (not isfile(join(output_folder, phase_list[0] + ".nii.gz"))) or (save_softmax and not isfile(join(output_folder, phase_list[0] + ".npz"))):
+                for idx, frame in enumerate(phase_list):
+                    #if frame == k:
+                    #    labeled_idx = idx
+                    if '_u' in frame:
+                        current_data = np.load(self.dataset_un_val[frame]['data_file'])['data']
+                        current_data = current_data + 1e-8
+                        unlabeled[idx] = current_data
+                    else:
+                        current_data = np.load(self.dataset_val[frame]['data_file'])['data']
+                        #current_data[-1][current_data[-1] == -1] = 0
+                        target[idx] = current_data[1]
+                        unlabeled[idx] = current_data[0] + 1e-8
+                        target_mask[idx] = True
+                    #self.print_to_log_file(k, data.shape)
+                
+                values = np.arange(len(phase_list))
+                if self.step > 1:
+                    values = values[::self.step]
+                windows = [values[i : i + self.video_length] for i in range(0, len(values), self.video_length - 1)]
+                padding_mask = np.concatenate([padding_mask, np.zeros(shape=(self.video_length - len(windows[-1]),), dtype=bool)], axis=0)
+                target_mask = np.concatenate([target_mask, np.zeros(shape=(self.video_length - len(windows[-1]),), dtype=bool)], axis=0)
+                windows[-1] = np.concatenate([windows[-1], np.arange(self.video_length - len(windows[-1]))])
+                unlabeled = [unlabeled[x] for x in windows]
+                unlabeled = np.stack(unlabeled, axis=0) # P, T, 1, D, H, W
+
+                ret = self.predict_preprocessed_data_return_seg_and_softmax_flow(unlabeled=unlabeled,
+                                                                                target_mask=target_mask,
+                                                                                padding_mask=padding_mask,
+                                                                                target=target,
+                                                                                processor=processor,
+                                                                                do_mirroring=do_mirroring,
+                                                                                mirror_axes=mirror_axes,
+                                                                                use_sliding_window=use_sliding_window,
+                                                                                step_size=step_size,
+                                                                                use_gaussian=use_gaussian,
+                                                                                all_in_gpu=all_in_gpu,
+                                                                                mixed_precision=self.fp16,
+                                                                                verbose=False)
+                predicted_segmentation = ret[0] # T, depth, H, W
+                softmax_pred = ret[1] # T, C, depth, H, W
+                flow_pred = ret[2] # T, C, depth, H, W
+                registered_pred = ret[3] # C, depth, H, W
+
+                #stop_indices = [len(x) for x in windows]
+                #videos = [phase_list[x] for x in windows]
+
+                #matplotlib.use('QtAgg')
+                #print(labeled_idx)
+                #print(video_padding)
+                #fig, ax = plt.subplots(1, self.video_length)
+                #for i in range(self.video_length):
+                #    ax[i].imshow(data[i, 0, 5], cmap='gray')
+                #plt.show()
+
+                assert len(softmax_pred) == len(flow_pred) == len(phase_list)
+
+                and_mask = target_mask[padding_mask]
+                gt_indices = np.where(and_mask)[0]
+                assert len(gt_indices) == 2
+
+                for t in range(len(softmax_pred)):
+                    if '_u' in phase_list[t]:
+                        properties = load_pickle(self.unlabeled_dataset[phase_list[t]]['properties_file'])
+                    else:
+                        properties = load_pickle(self.dataset[phase_list[t]]['properties_file'])
+                    fname = properties['list_of_data_files'][0].split(os.sep)[-1][:-12]
+
+                    current_softmax_pred = softmax_pred[t]
+                    current_softmax_pred = current_softmax_pred.transpose([0] + [i + 1 for i in self.transpose_backward])
+
+                    if save_softmax:
+                        softmax_fname = join(output_folder, fname + ".npz")
+                    else:
+                        softmax_fname = None
+
+                    if save_flow and t > 0:
+                        splitted = fname.split('frame')
+                        from_nb = int(splitted[-1].split('_')[0].split('.')[0]) - 1
+                        to_nb = from_nb + 1
+                        flow_name = splitted[0] + 'frame' + str(from_nb).zfill(2) + '_to_' + str(to_nb).zfill(2)
+                        flow_path = join(output_folder, 'flow', flow_name + ".nii.gz")
+                        current_flow = flow_pred[t]
+                        current_flow = current_flow.transpose([0] + [i + 1 for i in self.transpose_backward])
+                    else:
+                        flow_path = current_flow = None
+
+                    if t == gt_indices[0]:
+                        registered_path = join(output_folder, 'registered', fname + ".nii.gz")
+                    else:
+                        registered_path = None
+
+                    """There is a problem with python process communication that prevents us from communicating objects
+                    larger than 2 GB between processes (basically when the length of the pickle string that will be sent is
+                    communicated by the multiprocessing.Pipe object then the placeholder (I think) does not allow for long
+                    enough strings (lol). This could be fixed by changing i to l (for long) but that would require manually
+                    patching system python code. We circumvent that problem here by saving softmax_pred to a npy file that will
+                    then be read (and finally deleted) by the Process. save_segmentation_nifti_from_softmax can take either
+                    filename or np.ndarray and will handle this automatically"""
+                    if np.prod(current_softmax_pred.shape) > (2e9 / 4 * 0.85):  # *0.85 just to be save
+                        np.save(join(output_folder, fname + ".npy"), current_softmax_pred)
+                        current_softmax_pred = join(output_folder, fname + ".npy")
+
+                    results.append(export_pool.starmap_async(save_segmentation_nifti_from_softmax,
+                                                            ((current_softmax_pred, join(output_folder, fname + ".nii.gz"),
+                                                            properties, interpolation_order, self.regions_class_order,
+                                                            None, None,
+                                                            softmax_fname, None, force_separate_z,
+                                                            interpolation_order_z, False, current_flow, flow_path,
+                                                            registered_pred, registered_path),
+                                                            )
+                                                            )
+                                )
+                    
+                    
+                    if t in gt_indices:
+                        metadata_list.append(self.create_metadata_dict(properties))
+                        pred_gt_tuples.append([join(output_folder, fname + ".nii.gz"),
+                                                join(self.gt_niftis_folder, fname + ".nii.gz")])
+                    if t == gt_indices[0]:
+                        metadata_list.append(self.create_metadata_dict(properties))
+                        pred_gt_tuples_register.append([registered_path,
+                                                join(self.gt_niftis_folder, fname + ".nii.gz")])
+
+        _ = [i.get() for i in results]
+        self.print_to_log_file("finished prediction")
+
+        # evaluate raw predictions
+        self.print_to_log_file("evaluation of raw predictions")
+        task = self.dataset_directory.split(os.sep)[-1]
+        job_name = self.experiment_name
+        _ = aggregate_scores(pred_gt_tuples_register, labels=list(range(self.num_classes)),
+                             json_output_file=join(output_folder, 'registered', "summary.json"),
+                             json_name=job_name + " val tiled %s" % (str(use_sliding_window)),
+                             json_author="Fabian",
+                             json_task=task, num_threads=default_num_threads,
+                             advanced=True,
+                             metadata_list=metadata_list)
+        _ = aggregate_scores(pred_gt_tuples, labels=list(range(self.num_classes)),
+                             json_output_file=join(output_folder, "summary.json"),
+                             json_name=job_name + " val tiled %s" % (str(use_sliding_window)),
+                             json_author="Fabian",
+                             json_task=task, num_threads=default_num_threads,
+                             advanced=True,
+                             metadata_list=metadata_list)
+
+        if run_postprocessing_on_folds:
+            # in the old nnunet we would stop here. Now we add a postprocessing. This postprocessing can remove everything
+            # except the largest connected component for each class. To see if this improves results, we do this for all
+            # classes and then rerun the evaluation. Those classes for which this resulted in an improved dice score will
+            # have this applied during inference as well
+            self.print_to_log_file("determining postprocessing")
+            determine_postprocessing(self.output_folder, self.gt_niftis_folder, validation_folder_name,
+                                     final_subf_name=validation_folder_name + "_postprocessed", debug=debug, log_function=log_function,
+                                     metadata_list=metadata_list)
+            # after this the final predictions for the vlaidation set can be found in validation_folder_name_base + "_postprocessed"
+            # They are always in that folder, even if no postprocessing as applied!
+
+        # detemining postprocesing on a per-fold basis may be OK for this fold but what if another fold finds another
+        # postprocesing to be better? In this case we need to consolidate. At the time the consolidation is going to be
+        # done we won't know what self.gt_niftis_folder was, so now we copy all the niftis into a separate folder to
+        # be used later
+        gt_nifti_folder = join(self.output_folder_base, "gt_niftis")
+        maybe_mkdir_p(gt_nifti_folder)
+        for f in subfiles(self.gt_niftis_folder, suffix=".nii.gz"):
+            success = False
+            attempts = 0
+            e = None
+            while not success and attempts < 10:
+                try:
+                    shutil.copy(f, gt_nifti_folder)
+                    success = True
+                except OSError as e:
+                    attempts += 1
+                    sleep(1)
+            if not success:
+                print("Could not copy gt nifti file %s into folder %s" % (f, gt_nifti_folder))
+                if e is not None:
+                    raise e
+
+        self.network.train(current_mode)
+
+    
+    def validate_flow_one_step(self, processor, log_function, step, do_mirroring: bool = True, use_sliding_window: bool = True, step_size: float = 0.5,
+                 save_softmax: bool = True, use_gaussian: bool = True, overwrite: bool = True,
+                 validation_folder_name: str = 'validation_raw', debug: bool = True, all_in_gpu: bool = False,
+                 segmentation_export_kwargs: dict = None, run_postprocessing_on_folds: bool = True, output_folder=None, save_flow=True):
 
         """
         if debug=True then the temporary files generated for postprocessing determination will be kept
@@ -1248,78 +1534,95 @@ class nnUNetTrainer(NetworkTrainer):
         export_pool = Pool(default_num_threads)
         results = []
 
+        if save_flow:
+            newpath = join(output_folder, 'flow')
+            if not os.path.exists(newpath):
+                os.makedirs(newpath)
+
         list_of_keys = list(self.dataset_val.keys())
         un_list_of_keys = list(self.dataset_un_val.keys())
+        patient_id_list = np.unique([x[:10] for x in list_of_keys])
         metadata_list = []
-        for k in list_of_keys:
-            properties = load_pickle(self.dataset[k]['properties_file'])
-            metadata_list.append(self.create_metadata_dict(properties))
-            fname = properties['list_of_data_files'][0].split(os.sep)[-1][:-12]
+        for patient_id in tqdm(patient_id_list):
+            all_keys = list_of_keys + un_list_of_keys
+            phase_list = [x for x in all_keys if patient_id in x]
+            phase_list = np.array(sorted(phase_list, key=lambda x: int(x[16:18])))
+            video = phase_list
 
-            patient_id = k[:10]
-            l_filtered = [x for x in list_of_keys if x[:10] in patient_id]
-            un_filtered = [x for x in un_list_of_keys if x[:10] in patient_id]
-            filtered = l_filtered + un_filtered
-            filtered = sorted(filtered, key=lambda x: int(x[16:18]))
-            filtered = np.array(filtered)
-            labeled_idx = np.where(filtered == k)[0][0]
+            if overwrite or (not isfile(join(output_folder, video[0] + ".nii.gz"))) or (save_softmax and not isfile(join(output_folder, video[0] + ".npz"))):
+                local_labeled_idx = np.where(~np.char.endswith(video, '_u'))[0]
+                #global_labeled_idx = (video_index * self.video_length) + local_labeled_idx - video_index
+                #local_labeled_idx = local_labeled_idx[global_labeled_idx < len(phase_list)]
 
-            if step > 1:
-                if labeled_idx % 2 == 0:
-                    filtered = filtered[0::step]
+                if '_u' in video[0]:
+                    properties = load_pickle(self.unlabeled_dataset[video[0]]['properties_file'])
                 else:
-                    filtered = filtered[1::step]
-                labeled_idx = np.where(filtered == k)[0][0]
+                    properties = load_pickle(self.dataset[video[0]]['properties_file'])
 
-            values = np.arange(len(filtered))
-            end_padding = self.video_length - (len(filtered) % self.video_length)
-            values = np.pad(values, (0, end_padding), mode='wrap')
-            windows = np.split(values, np.arange(self.video_length, len(values), self.video_length))
-            video_mask = [x for x in windows if np.any(np.isin(x, labeled_idx))]
-            videos = [filtered[x] for x in windows]
+                unlabeled = np.zeros(shape=(len(video), 1) + properties['size_after_resampling'])
+                for idx, frame in enumerate(video):
+                    #if frame == k:
+                    #    labeled_idx = idx
+                    if '_u' in frame:
+                        current_data = np.load(self.dataset_un_val[frame]['data_file'])['data']
+                        current_data = current_data + 1e-8
+                        unlabeled[idx] = current_data
+                    else:
+                        current_data = np.load(self.dataset_val[frame]['data_file'])['data']
+                        #current_data[-1][current_data[-1] == -1] = 0
+                        current_data = current_data[:-1]
+                        current_data = current_data + 1e-8
+                        unlabeled[idx] = current_data
+                    #self.print_to_log_file(k, data.shape)
 
-            if overwrite or (not isfile(join(output_folder, fname + ".nii.gz"))) or (save_softmax and not isfile(join(output_folder, fname + ".npz"))):
-                for video in videos:
-                    assert len(video) == self.video_length
-                    labeled_idx = None
-                    unlabeled = np.zeros(shape=(self.video_length, 1) + properties['size_after_resampling'])
-                    for idx, frame in enumerate(video):
-                        #if frame == k:
-                        #    labeled_idx = idx
-                        if '_u' in frame:
-                            unlabeled[idx] = np.load(self.dataset_un_val[frame]['data_file'])['data']
-                        else:
-                            current_data = np.load(self.dataset_val[frame]['data_file'])['data']
-                            current_data[-1][current_data[-1] == -1] = 0
-                            labeled = current_data[:-1]
-                            unlabeled[idx] = current_data[:-1]
-                        #self.print_to_log_file(k, data.shape)
+                #matplotlib.use('QtAgg')
+                #print(labeled_idx)
+                #print(video_padding)
+                #fig, ax = plt.subplots(1, self.video_length)
+                #for i in range(self.video_length):
+                #    ax[i].imshow(data[i, 0, 5], cmap='gray')
+                #plt.show()
 
-                    #matplotlib.use('QtAgg')
-                    #print(labeled_idx)
-                    #print(video_padding)
-                    #fig, ax = plt.subplots(1, self.video_length)
-                    #for i in range(self.video_length):
-                    #    ax[i].imshow(data[i, 0, 5], cmap='gray')
-                    #plt.show()
+                ret = self.predict_preprocessed_data_return_seg_and_softmax_flow(unlabeled=unlabeled,
+                                                                                processor=processor,
+                                                                                do_mirroring=do_mirroring,
+                                                                                mirror_axes=mirror_axes,
+                                                                                use_sliding_window=use_sliding_window,
+                                                                                step_size=step_size,
+                                                                                use_gaussian=use_gaussian,
+                                                                                all_in_gpu=all_in_gpu,
+                                                                                mixed_precision=self.fp16,
+                                                                                verbose=False)
+                predicted_segmentation = ret[0] # T, depth, H, W
+                softmax_pred = ret[1] # T, C, depth, H, W
+                flow_pred = ret[2] # T - 1, C, depth, H, W
 
-                    softmax_pred = self.predict_preprocessed_data_return_seg_and_softmax_flow(labeled=labeled,
-                                                                                            unlabeled=unlabeled,
-                                                                                            processor=processor,
-                                                                                            do_mirroring=do_mirroring,
-                                                                                            mirror_axes=mirror_axes,
-                                                                                            use_sliding_window=use_sliding_window,
-                                                                                            step_size=step_size,
-                                                                                            use_gaussian=use_gaussian,
-                                                                                            all_in_gpu=all_in_gpu,
-                                                                                            mixed_precision=self.fp16)[1]
+                for t in range(len(softmax_pred)):
+                    if '_u' in video[t]:
+                        properties = load_pickle(self.unlabeled_dataset[video[t]]['properties_file'])
+                    else:
+                        properties = load_pickle(self.dataset[video[t]]['properties_file'])
+                    fname = properties['list_of_data_files'][0].split(os.sep)[-1][:-12]
 
-                    softmax_pred = softmax_pred.transpose([0] + [i + 1 for i in self.transpose_backward])
+                    current_softmax_pred = softmax_pred[t]
+                    current_softmax_pred = current_softmax_pred.transpose([0] + [i + 1 for i in self.transpose_backward])
 
                     if save_softmax:
                         softmax_fname = join(output_folder, fname + ".npz")
                     else:
                         softmax_fname = None
+
+                    if save_flow and t < len(video) - 1:
+                        splitted = fname.split('frame')
+                        from_nb = int(splitted[-1].split('_')[0].split('.')[0])
+                        to_nb = from_nb + 1
+                        flow_name = splitted[0] + 'frame' + str(from_nb).zfill(2) + '_to_' + str(to_nb).zfill(2)
+                        flow_path = join(output_folder, 'flow', flow_name + ".nii.gz")
+                        current_flow = flow_pred[t]
+                        current_flow = current_flow.transpose([0] + [i + 1 for i in self.transpose_backward])
+
+                    else:
+                        flow_path = current_flow = None
 
                     """There is a problem with python process communication that prevents us from communicating objects
                     larger than 2 GB between processes (basically when the length of the pickle string that will be sent is
@@ -1328,22 +1631,25 @@ class nnUNetTrainer(NetworkTrainer):
                     patching system python code. We circumvent that problem here by saving softmax_pred to a npy file that will
                     then be read (and finally deleted) by the Process. save_segmentation_nifti_from_softmax can take either
                     filename or np.ndarray and will handle this automatically"""
-                    if np.prod(softmax_pred.shape) > (2e9 / 4 * 0.85):  # *0.85 just to be save
-                        np.save(join(output_folder, fname + ".npy"), softmax_pred)
-                        softmax_pred = join(output_folder, fname + ".npy")
+                    if np.prod(current_softmax_pred.shape) > (2e9 / 4 * 0.85):  # *0.85 just to be save
+                        np.save(join(output_folder, fname + ".npy"), current_softmax_pred)
+                        current_softmax_pred = join(output_folder, fname + ".npy")
 
                     results.append(export_pool.starmap_async(save_segmentation_nifti_from_softmax,
-                                                            ((softmax_pred, join(output_folder, fname + ".nii.gz"),
+                                                            ((current_softmax_pred, join(output_folder, fname + ".nii.gz"),
                                                             properties, interpolation_order, self.regions_class_order,
                                                             None, None,
                                                             softmax_fname, None, force_separate_z,
-                                                            interpolation_order_z),
+                                                            interpolation_order_z, False, current_flow, flow_path),
                                                             )
                                                             )
                                 )
+                    
+                    if t in local_labeled_idx and t < len(video):
+                        metadata_list.append(self.create_metadata_dict(properties))
+                        pred_gt_tuples.append([join(output_folder, fname + ".nii.gz"),
+                                                join(self.gt_niftis_folder, fname + ".nii.gz")])
 
-            pred_gt_tuples.append([join(output_folder, fname + ".nii.gz"),
-                                   join(self.gt_niftis_folder, fname + ".nii.gz")])
 
         _ = [i.get() for i in results]
         self.print_to_log_file("finished prediction")

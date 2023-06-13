@@ -12,6 +12,8 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
+import matplotlib.pyplot as plt
+import matplotlib
 import sys
 import psutil
 import os
@@ -622,7 +624,8 @@ class SegmentationNetwork(NeuralNetwork):
                                           patch_size: tuple, regions_class_order: tuple, use_gaussian: bool,
                                           pad_border_mode: str, pad_kwargs: dict, all_in_gpu: bool,
                                           verbose: bool,
-                                          get_flops) -> Tuple[np.ndarray, np.ndarray]:
+                                          get_flops,
+                                          binary=False) -> Tuple[np.ndarray, np.ndarray]:
         # better safe than sorry
         assert len(x.shape) == 3, "x must be (c, x, y)"
 
@@ -633,9 +636,11 @@ class SegmentationNetwork(NeuralNetwork):
 
         # for sliding window inference the image must at least be as large as the patch size. It does not matter
         # whether the shape is divisible by 2**num_pool as long as the patch size is
+        if binary:
+            x = (x - x.min()) / (x.max() - x.min())
+            x = x + 1e-8
         data, slicer = pad_nd_image(x, patch_size, pad_border_mode, pad_kwargs, True, None)
         data_shape = data.shape  # still c, x, y
-
 
         # compute the steps for sliding window
         steps = self._compute_steps_for_sliding_window(patch_size, data_shape[1:], step_size)
@@ -711,7 +716,7 @@ class SegmentationNetwork(NeuralNetwork):
                 lb_y = y
                 ub_y = y + patch_size[1]
                 predicted_patch, out_flop, inference_time = self._internal_maybe_mirror_and_pred_2D(
-                    data[None, :, lb_x:ub_x, lb_y:ub_y], mirror_axes, get_flops, do_mirroring,
+                    data[None, :, lb_x:ub_x, lb_y:ub_y], mirror_axes, get_flops, binary, do_mirroring,
                     gaussian_importance_map)
 
                 predicted_patch = predicted_patch[0]
@@ -812,7 +817,8 @@ class SegmentationNetwork(NeuralNetwork):
                                           pad_border_mode: str = "edge", pad_kwargs: dict =None,
                                           all_in_gpu: bool = False,
                                           verbose: bool = True,
-                                          get_flops = False) -> Tuple[np.ndarray, np.ndarray]:
+                                          get_flops = False,
+                                          binary=False) -> Tuple[np.ndarray, np.ndarray]:
         if all_in_gpu:
             raise NotImplementedError
         
@@ -833,7 +839,7 @@ class SegmentationNetwork(NeuralNetwork):
 
             pred_seg, softmax_pres, flop_list, inference_time = self._internal_predict_2D_2Dconv_tiled(
                 x[:, s], step_size, do_mirroring, mirror_axes, patch_size, regions_class_order, use_gaussian,
-                pad_border_mode, pad_kwargs, all_in_gpu, verbose, get_flops)
+                pad_border_mode, pad_kwargs, all_in_gpu, verbose, get_flops, binary=binary)
 
             if s == 0:
                 out_flop = flop_list

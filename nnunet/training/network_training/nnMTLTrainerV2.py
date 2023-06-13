@@ -12,6 +12,7 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
+from ruamel.yaml import YAML
 from nnunet.analysis import flop_count_operators
 from tqdm import tqdm
 from collections import OrderedDict
@@ -40,7 +41,7 @@ from matplotlib import cm
 import matplotlib.pyplot as plt
 from copy import copy
 from time import time, sleep, strftime
-import yaml
+#import yaml
 import numpy as np
 import torch
 from nnunet.torchinfo.torchinfo.torchinfo import summary
@@ -86,15 +87,16 @@ class nnMTLTrainerV2(nnUNetTrainer):
     """
 
     def __init__(self, plans_file, fold, output_folder=None, dataset_directory=None, batch_dice=True, stage=None,
-                 unpack_data=True, deterministic=True, fp16=False, middle=False, video=False, inference=False, binary=False):
+                 unpack_data=True, deterministic=True, fp16=False, middle=False, video=False, binary=False, config=None):
         super().__init__(plans_file, fold, output_folder, dataset_directory, batch_dice, stage, unpack_data,
                          deterministic, fp16)
-        self.middle = middle
-
-        if self.middle:
-            self.config = read_config(os.path.join(Path.cwd(), 'adversarial_acdc_middle.yaml'), middle, False)
+        
+        if config is None:
+            self.inference = False
+            self.config = read_config(os.path.join(Path.cwd(), 'adversarial_acdc.yaml'), False, False)
         else:
-            self.config = read_config(os.path.join(Path.cwd(), 'adversarial_acdc.yaml'), middle, False)
+            self.inference = True
+            self.config = config
         
         self.image_size = self.config['patch_size'][0]
         self.window_size = 7 if self.image_size == 224 else 9 if self.image_size == 288 else None
@@ -114,25 +116,13 @@ class nnMTLTrainerV2(nnUNetTrainer):
         self.unlabeled = self.config['unlabeled']
         if self.unlabeled:
             self.unlabeled_loss_weight = self.config['unlabeled_loss_weight']
-        if self.middle:
-            self.past_percent = {}
-            self.cumulative_ema = 0
-            self.mix_residual = self.config['mix_residual']
-            self.registered_seg = self.config['registered_seg']
-            self.alpha_ema = self.config['alpha_ema']
-            self.one_vs_all = self.config['one_vs_all']
-            self.t1 = self.config['t1'] * (self.max_num_epochs * self.num_batches_per_epoch)
-            self.t2 = self.config['t2'] * (self.max_num_epochs * self.num_batches_per_epoch)
-            self.max_unlabeled_weight = self.config['max_unlabeled_weight']
-            self.middle_unlabeled = self.config['middle_unlabeled']
-            self.v1 = self.config['v1']
-        else:
-            self.registered_x = False
-            self.registered_seg = False
-            self.one_vs_all = True
-            self.interpolate = False
-            self.maximize_distance = False
-            self.middle_unlabeled = False
+
+        self.registered_x = False
+        self.registered_seg = False
+        self.one_vs_all = True
+        self.interpolate = False
+        self.maximize_distance = False
+        self.middle_unlabeled = False
 
         self.deep_supervision = self.config['deep_supervision']
         self.classification = self.config['classification']
@@ -153,11 +143,11 @@ class nnMTLTrainerV2(nnUNetTrainer):
             self.vis = Visualizer(unlabeled=self.unlabeled,
                                     adversarial_loss=self.adversarial_loss,
                                     middle_unlabeled=self.middle_unlabeled,
-                                    middle=self.middle,
+                                    middle=False,
                                     registered_seg=self.registered_seg,
                                     writer=self.writer)
 
-        if inference:
+        if self.inference:
             self.output_folder = output_folder
         else:
             self.output_folder = self.log_dir
@@ -238,13 +228,6 @@ class nnMTLTrainerV2(nnUNetTrainer):
                 similarity_initial_weight = self.config['similarity_weight'] if not self.config['progressive_similarity_growing'] else 0
                 loss_data['similarity'] = [similarity_initial_weight, float('nan')]
 
-        if self.middle:
-            #loss_data['heatmap'] = [self.config['heatmap_loss_weight'], float('nan')]
-            #loss_data['contrastive'] = [self.config['contrastive_loss_weight'], float('nan')]
-            if not self.middle_unlabeled:
-                loss_data['similarity'] = [self.config['similarity_loss_weight'], float('nan')]
-            if self.registered_seg:
-                loss_data['motion_estimation_seg'] = [self.config['seg_motion_estimation_loss_weight'], float('nan')]
         
         if self.config['separability']:
             loss_data['separability'] = [self.config['separability_loss_weight'], float('nan')]
@@ -278,22 +261,6 @@ class nnMTLTrainerV2(nnUNetTrainer):
             self.discriminator_decay = self.config['discriminator_decay']
             self.r1_penalty_iteration = self.config['r1_penalty_iteration']
 
-        if self.middle:
-
-            if self.one_vs_all:
-                self.mse_loss = nn.MSELoss()
-                if self.registered_seg:
-                    self.motion_estimation_loss_seg = DC_and_CE_loss({'batch_dice': True, 'smooth': 1e-5, 'do_bg': False}, {})
-                #self.contrastive_loss = ContrastiveLoss(temp=self.temp)
-            #else:
-            #    self.motion_estimation_loss_x = nn.MSELoss(reduction='none')
-            #    self.middle_seg_loss = DC_and_CE_loss({'batch_dice': self.batch_dice, 'smooth': 1e-5, 'do_bg': False}, {'reduction': 'none'})
-            #    self.motion_estimation_loss_seg = DC_and_CE_loss({'batch_dice': self.batch_dice, 'smooth': 1e-5, 'do_bg': False}, {'reduction': 'none'})
-            #    self.relation_loss = nn.MSELoss(reduction='none')
-            #    if self.interpolate:
-            #        self.inter_seg_loss = DC_and_CE_loss({'batch_dice': self.batch_dice, 'smooth': 1e-5, 'do_bg': False}, {'reduction': 'none'})
-            
-        
         if self.config['separability']:
             self.separability_loss = SeparabilityLoss()
         
@@ -317,10 +284,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
             elif self.config['loss'] == 'topk_and_dice':
                 self.segmentation_loss = DC_and_topk_loss({'batch_dice': self.batch_dice, 'smooth': 1e-5, 'do_bg': False}, {'k': 10}, ce_weight=0.5, dc_weight=0.5)
             elif self.config['loss'] == 'ce_and_dice':
-                if self.middle:
-                    self.segmentation_loss = DC_and_CE_loss({'batch_dice': False, 'smooth': 1e-5, 'do_bg': False}, {'reduction': 'none'})
-                else:
-                    self.segmentation_loss = DC_and_CE_loss({'batch_dice': True, 'smooth': 1e-5, 'do_bg': False}, {})
+                self.segmentation_loss = DC_and_CE_loss({'batch_dice': True, 'smooth': 1e-5, 'do_bg': False}, {})
             elif self.config['loss'] == 'ce':
                 self.segmentation_loss = RobustCrossEntropyLoss(weight=loss_weights)
 
@@ -329,10 +293,6 @@ class nnMTLTrainerV2(nnUNetTrainer):
 
         table = {}
         table['seg'] = {'foreground_dc': [], 'tp': [], 'fp': [], 'fn': []}
-
-        if self.middle and self.registered_seg:
-            table['forward_motion'] = {'foreground_dc': [], 'tp': [], 'fp': [], 'fn': []}
-            table['backward_motion'] = {'foreground_dc': [], 'tp': [], 'fp': [], 'fn': []}
     
         return table
     
@@ -419,9 +379,6 @@ class nnMTLTrainerV2(nnUNetTrainer):
 
             if self.deep_supervision:
                 self.segmentation_loss = MultipleOutputLoss2(self.segmentation_loss, seg_weights)
-                if self.middle:
-                    if self.interpolate:
-                        self.inter_seg_loss = MultipleOutputLoss2(self.inter_seg_loss, seg_weights)
                 if self.unlabeled and self.adversarial_loss:
                     self.confidence_loss = MultipleOutputLoss2(self.confidence_loss, seg_weights)
             if self.reconstruction:
@@ -512,8 +469,13 @@ class nnMTLTrainerV2(nnUNetTrainer):
     #        print(*args)
     
     def count_parameters(self, config, models):
+        if not self.inference:
+            yaml = YAML()
+            with open(os.path.join(self.log_dir, 'config.yaml'), 'wb') as f:
+                yaml.dump(config, f)
+                self.print_to_log_file(config, also_print_to_console=False)
+
         params_sum = 0
-        self.print_to_log_file(yaml.safe_dump(config, default_flow_style=None, sort_keys=False), also_print_to_console=False)
         for k, v in models.items():
             nb_params =  sum(p.numel() for p in v[0].parameters() if p.requires_grad)
             self.print_to_log_file(f"{k} has {nb_params:,} parameters")
@@ -604,19 +566,14 @@ class nnMTLTrainerV2(nnUNetTrainer):
                 #models['rec_discriminator'] = (self.rec_discriminator, discriminator_input)
 
             in_shape = torch.randn(self.config['batch_size'], 1, self.image_size, self.image_size)
-            self.network = build_2d_model(self.config, conv_layer=conv_layer, norm=getattr(torch.nn, self.config['norm']), log_function=self.print_to_log_file, image_size=self.image_size, window_size=self.window_size, middle=self.middle, num_classes=num_classes)
-            if self.middle:
-                model_input_data = {'l1': in_shape, 'l2': in_shape}
-                if self.middle_unlabeled:
-                    model_input_data['u1'] = in_shape
-                    if self.v1:
-                        model_input_data['u2'] = in_shape
-                model_input_data = [model_input_data]
-            else:
-                model_input_data = in_shape
+            self.network = build_2d_model(self.config, conv_layer=conv_layer, norm=getattr(torch.nn, self.config['norm']), log_function=self.print_to_log_file, image_size=self.image_size, window_size=self.window_size, middle=False, num_classes=num_classes)
+            model_input_data = in_shape
             models['model'] = (self.network, model_input_data)
 
+            do_ds = self.network.do_ds
+            self.network.do_ds = False
             self.count_parameters(self.config, models)
+            self.network.do_ds = do_ds
 
         #nb_inputs = 2 if self.middle else 1
         #model_input_size = [(self.config['batch_size'], 1, self.image_size, self.image_size)] * nb_inputs
@@ -1005,7 +962,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
                                 overwrite=overwrite, validation_folder_name=validation_folder_name,
                                 all_in_gpu=all_in_gpu, segmentation_export_kwargs=segmentation_export_kwargs,
                                 run_postprocessing_on_folds=run_postprocessing_on_folds,
-                                output_folder=output_folder, debug=True)
+                                output_folder=output_folder, debug=True, binary=self.binary)
 
         self.network.do_ds = ds
         return ret
@@ -1016,7 +973,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
                                                          use_sliding_window: bool = True, step_size: float = 0.5,
                                                          use_gaussian: bool = True, pad_border_mode: str = 'constant',
                                                          pad_kwargs: dict = None, all_in_gpu: bool = False,
-                                                         verbose: bool = True, mixed_precision=True, get_flops=False) -> Tuple[np.ndarray, np.ndarray]:
+                                                         verbose: bool = True, mixed_precision=True, get_flops=False, binary=False) -> Tuple[np.ndarray, np.ndarray]:
         """
         We need to wrap this because we need to enforce self.network.do_ds = False for prediction
         """
@@ -1031,7 +988,8 @@ class nnMTLTrainerV2(nnUNetTrainer):
                                                                        pad_kwargs=pad_kwargs, all_in_gpu=all_in_gpu,
                                                                        verbose=verbose,
                                                                        mixed_precision=mixed_precision,
-                                                                       get_flops=get_flops)
+                                                                       get_flops=get_flops,
+                                                                       binary=binary)
         self.network.do_ds = ds
         return ret
 
@@ -2297,10 +2255,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
         ds = self.network.do_ds
         #self.network.do_ds = True
         self.save_debug_information()
-        if self.middle:
-            ret = self.run_training_mtl_middle()
-        else:
-            ret = self.run_training_mtl()
+        ret = self.run_training_mtl()
         self.network.do_ds = ds
         return ret
 

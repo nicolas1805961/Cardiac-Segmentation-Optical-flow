@@ -284,12 +284,15 @@ class NiftiEvaluator(Evaluator):
             self.test_nifti = None
             super(NiftiEvaluator, self).set_test(test)
 
-    def set_reference(self, reference):
+    def set_reference(self, reference, binary=False):
         """Set the reference segmentation."""
 
         if reference is not None:
             self.reference_nifti = sitk.ReadImage(reference)
-            super(NiftiEvaluator, self).set_reference(sitk.GetArrayFromImage(self.reference_nifti))
+            mask = sitk.GetArrayFromImage(self.reference_nifti)
+            if binary:
+                mask[mask > 0] = 1
+            super(NiftiEvaluator, self).set_reference(mask)
         else:
             self.reference_nifti = None
             super(NiftiEvaluator, self).set_reference(reference)
@@ -304,10 +307,10 @@ class NiftiEvaluator(Evaluator):
 
 
 def run_evaluation(args):
-    test, ref, evaluator, metric_kwargs, metadata = args
+    test, ref, evaluator, metric_kwargs, metadata, binary = args
     # evaluate
     evaluator.set_test(test)
-    evaluator.set_reference(ref)
+    evaluator.set_reference(ref, binary)
     if evaluator.labels is None:
         evaluator.construct_labels()
     current_scores = evaluator.evaluate(**metric_kwargs)
@@ -330,6 +333,7 @@ def aggregate_scores(test_ref_pairs,
                      json_task="",
                      num_threads=2,
                      metadata_list=None,
+                     binary=False,
                      **metric_kwargs):
     """
     test = predicted image
@@ -359,7 +363,7 @@ def aggregate_scores(test_ref_pairs,
     test = [i[0] for i in test_ref_pairs]
     ref = [i[1] for i in test_ref_pairs]
     p = Pool(num_threads)
-    all_res = p.map(run_evaluation, zip(test, ref, [evaluator]*len(ref), [metric_kwargs]*len(ref), metadata_list))
+    all_res = p.map(run_evaluation, zip(test, ref, [evaluator]*len(ref), [metric_kwargs]*len(ref), metadata_list, [binary]*len(ref)))
     p.close()
     p.join()
 

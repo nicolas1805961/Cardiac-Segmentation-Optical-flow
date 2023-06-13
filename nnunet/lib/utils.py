@@ -33,25 +33,39 @@ class MotionEstimation(nn.Module):
         self.tanh = torch.nn.Tanh()
     
     def generate_grid(self, flow):
-        flow_shape = flow.shape
-        grid_h, grid_w = torch.meshgrid([torch.linspace(-1, 1, flow_shape[2]), torch.linspace(-1, 1, flow_shape[3])])  # (h, w)
+        B, C, H, W = flow.shape
+        grid_h, grid_w = torch.meshgrid([torch.linspace(-1, 1, H), torch.linspace(-1, 1, W)])  # (h, w)
         grid_h = grid_h.cuda().float()
         grid_w = grid_w.cuda().float()
 
-        offset_h, offset_w = torch.split(flow, 1, 1)
-        offset_h = offset_h.contiguous().view(int(flow_shape[0]), int(flow_shape[2]), int(flow_shape[3]))  # (b, h, w)
-        offset_w = offset_w.contiguous().view(int(flow_shape[0]), int(flow_shape[2]), int(flow_shape[3]))  # (b, h, w)
+        grid_w = nn.Parameter(grid_w, requires_grad=False)
+        grid_h = nn.Parameter(grid_h, requires_grad=False)
 
-        offset_h = grid_h + offset_h
-        offset_w = grid_w + offset_w
+        grid = torch.stack([grid_w, grid_h], dim=-1)[None].repeat(B, 1, 1, 1)
 
-        offsets = torch.stack((offset_h, offset_w), 3)
-        return offsets
+        #matplotlib.use('QtAgg')
+        #fig, ax = plt.subplots(1, 2)
+        #ax[0].imshow(grid_h.cpu())
+        #ax[1].imshow(grid_w.cpu())
+        #plt.show()
 
-    def forward(self, flow, original):
+        flow = flow.permute(0, 2, 3, 1).contiguous()
+
+        #offset_h, offset_w = torch.split(flow, 1, 1)
+        #offset_h = offset_h.contiguous().view(int(flow_shape[0]), int(flow_shape[2]), int(flow_shape[3]))  # (b, h, w)
+        #offset_w = offset_w.contiguous().view(int(flow_shape[0]), int(flow_shape[2]), int(flow_shape[3]))  # (b, h, w)
+#
+        #offset_h = grid_h + offset_h
+        #offset_w = grid_w + offset_w
+#
+        #offsets = torch.stack((offset_h, offset_w), 3)
+        #return offsets
+        return grid + flow
+
+    def forward(self, flow, original, mode='bilinear'):
         flow = self.tanh(flow)
         grid = self.generate_grid(flow=flow)
-        return grid_sample(original, grid)
+        return grid_sample(original, grid, mode=mode, align_corners=True)
 
 
 def _get_activation_fn(activation):
@@ -1124,15 +1138,14 @@ class DeepSupervision(nn.Module):
 
         return x
 
-class DeepSupervision3D(nn.Module):
+class DeepSupervisionLearn(nn.Module):
     def __init__(self, dim, num_classes, scale_factor):
         super().__init__()
-        self.conv = nn.Conv3d(dim, num_classes, 1, padding=0)
-        self.up = nn.Upsample(scale_factor=scale_factor, mode='trilinear')
+        self.scale_factor = scale_factor
+        self.conv = nn.ConvTranspose2d(in_channels=dim, out_channels=num_classes, kernel_size=scale_factor)
 
     def forward(self, x):
         x = self.conv(x)
-        x = self.up(x)
         return x
 
 class ReshapeLayer(nn.Module):

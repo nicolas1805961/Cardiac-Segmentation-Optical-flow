@@ -104,7 +104,7 @@ class NetworkTrainer(object):
         self.train_loss_MA_eps = 5e-4  # new MA must be at least this much better (smaller)
         self.max_num_epochs = 1000
         self.num_batches_per_epoch = 250
-        self.num_val_batches_per_epoch = 50
+        self.num_val_batches_per_epoch = 8#50
         self.also_val_in_tr_mode = False
         self.lr_threshold = 1e-6  # the network will not terminate training if the lr is still above this threshold
 
@@ -313,6 +313,38 @@ class NetworkTrainer(object):
             #    lr_sched_state_dct[key] = lr_sched_state_dct[key]
         if save_optimizer:
             optimizer_state_dict = self.optimizer.state_dict()
+        else:
+            optimizer_state_dict = None
+
+        self.print_to_log_file("saving checkpoint...")
+        save_this = {
+            'epoch': self.epoch + 1,
+            'state_dict': state_dict,
+            'optimizer_state_dict': optimizer_state_dict,
+            'lr_scheduler_state_dict': lr_sched_state_dct,
+            'plot_stuff': (self.all_tr_losses, self.all_val_losses, self.all_val_losses_tr_mode,
+                           self.all_val_eval_metrics),
+            'best_stuff' : (self.best_epoch_based_on_MA_tr_loss, self.best_MA_tr_loss_for_patience, self.best_val_eval_criterion_MA)}
+        if self.amp_grad_scaler is not None:
+            save_this['amp_grad_scaler'] = self.amp_grad_scaler.state_dict()
+
+        torch.save(save_this, fname)
+        self.print_to_log_file("done, saving took %.2f seconds" % (time() - start_time))
+    
+    def save_checkpoint_discriminator(self, fname, save_optimizer=True):
+        start_time = time()
+        state_dict = self.discriminator.state_dict()
+        for key in state_dict.keys():
+            state_dict[key] = state_dict[key].cpu()
+        lr_sched_state_dct = None
+        if self.discriminator_scheduler is not None and hasattr(self.discriminator_scheduler,
+                                                     'state_dict'):  # not isinstance(self.lr_scheduler, lr_scheduler.ReduceLROnPlateau):
+            lr_sched_state_dct = self.discriminator_scheduler.state_dict()
+            # WTF is this!?
+            # for key in lr_sched_state_dct.keys():
+            #    lr_sched_state_dct[key] = lr_sched_state_dct[key]
+        if save_optimizer:
+            optimizer_state_dict = self.discriminator_optimizer.state_dict()
         else:
             optimizer_state_dict = None
 

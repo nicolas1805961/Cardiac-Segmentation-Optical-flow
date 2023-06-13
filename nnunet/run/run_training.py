@@ -144,8 +144,7 @@ def main():
     #     force_separate_z = True
     # else:
     #     raise ValueError("force_separate_z must be None, True or False. Given: %s" % force_separate_z)
-
-    if network_trainer == 'nnMTLTrainerV2Video' or network_trainer == 'nnMTLTrainerV2Flow':
+    if network_trainer in ['nnMTLTrainerV2Video', 'nnMTLTrainerV2Flow', 'nnMTLTrainerV2Flow3', 'nnMTLTrainerV2Flow2', 'nnMTLTrainerV2Flow4']:
         config = read_config(os.path.join(Path.cwd(), 'video.yaml'), middle=False, video=True)
     else:
         config = read_config(os.path.join(Path.cwd(), 'adversarial_acdc.yaml'), middle=False, video=False)

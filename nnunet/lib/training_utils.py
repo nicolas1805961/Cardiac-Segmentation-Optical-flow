@@ -3,14 +3,18 @@ import torch
 import torch.nn as nn
 from nnunet.network_architecture.MTL_model import MTLmodel, PolicyNet
 from nnunet.network_architecture.temporal_model import VideoModel
-from nnunet.network_architecture.Optical_flow_model import OpticalFlowModel
+#from nnunet.network_architecture.Optical_flow_model import OpticalFlowModel
+#from nnunet.network_architecture.Optical_flow_model_2 import OpticalFlowModel
+from nnunet.network_architecture.Optical_flow_model_3 import OpticalFlowModel
+from nnunet.network_architecture.Optical_flow_model_4 import OpticalFlowModel4
+from nnunet.network_architecture.discriminator import Discriminator
 from tqdm import tqdm
 import logging
 import os
 import matplotlib.pyplot as plt
 import cv2 as cv
 import numpy as np
-import yaml
+#import yaml
 from nnunet.torchinfo.torchinfo.torchinfo import summary
 from .boundary_utils import one_hot, simplex
 from scipy.spatial.distance import directed_hausdorff
@@ -29,8 +33,8 @@ from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 from skimage.transform import resize
 from .encoder import Encoder
-from .discriminator import Discriminator, ConfidenceNetwork
 from copy import copy
+from ruamel.yaml import YAML
 
 def resample_logits_scipy(image, original_label):
     current_device = image.device
@@ -429,12 +433,13 @@ def batched_distance_transform(seg, resolution=None, dtype=None):
     return torch.tensor(res, dtype=torch.float32)
 
 def read_config(filename, middle, video):
+    yaml = YAML()
     with open(filename) as file:
-        config = yaml.load(file, Loader=yaml.FullLoader)
+        config = yaml.load(file)
+    #with open(filename) as file:
+    #    config = yaml.load(file, Loader=yaml.FullLoader)
 
-    if config['nb_nets'] > 1:
-        assert config['small'] == False and config['middle'] == False and config['big'] == False
-    elif config['bottleneck'] == 'swin_3d' or config['bottleneck'] == 'vit_3d' or config['bottleneck'] == 'factorized':
+    if config['bottleneck'] == 'swin_3d' or config['bottleneck'] == 'vit_3d' or config['bottleneck'] == 'factorized':
         assert config['nb_frames'] > 1, "bottleneck mode 'swin_3d', 'vit_3d' and 'factorized' require nb_frames to be more than 1"
     if config['bottleneck'] == 'factorized':
         assert len(config['patch_size']) == 2, "bottleneck mode 'factorized' require len(patch_size) to be 2"
@@ -443,16 +448,6 @@ def read_config(filename, middle, video):
     if config['semi_supervised'] == True:
         assert config['use_spatial_transformer'] == False, "Semi supervised model can not be used with spatial transformer"
     assert len(config['transformer_depth']) == len(config['num_heads']), "transformer_depth and num_heads must have the same size"
-    if not config['reconstruction']:
-        assert config['reconstruction_skip'] is False, "Cannot use skip connection between decoder and reconstruction decoder if 'reconstruction' is False"
-    if config['uncertainty_weighting'] or config['dynamic_weight_averaging']:
-        assert config['reconstruction'], "Need reconstruction for uncertainty weighting or dynamic weight averaging"
-    if middle:
-        assert not config['reconstruction'], "middle cannot work with reconstruction"
-        if not config['middle_unlabeled'] and config['mix_residual'] == True:
-            print('You are mixing skip connections but with same bottleneck !!!!!')
-        if config['middle_unlabeled']:
-            assert config['deep_supervision'] == False, "deep_supervision must be False when using middle_unlabeled"
     return config
 
 def write_model_parameters(model):
@@ -570,22 +565,22 @@ def build_autoencoder(config):
 
     return model
 
-def build_discriminator(config, discriminator_type):
-    num_stages = len(config['conv_depth']) + len(config['transformer_depth'])
-    # stochastic depth
-    num_blocks = config['conv_depth'] + config['transformer_depth'] + [config['num_bottleneck_layers']]
-    my_iter = torch.cat([torch.tensor([0]), torch.cumsum(torch.tensor(num_blocks), dim=0)])
-    dpr = [x.item() for x in torch.linspace(0, 0.0, sum(num_blocks))]
-    dpr = [dpr[my_iter[j]:my_iter[j+1]] for j in range(len(num_blocks))]
-    dpr_encoder = dpr[:num_stages]
-
-    if discriminator_type == 'seg':
-        in_discriminator_dims = config['seg_in_discriminator_dims']
-    elif discriminator_type == 'rec':
-        in_discriminator_dims = config['rec_in_discriminator_dims']
-
-    discriminator = SpectralConvDiscriminator(blur=config['blur'], shortcut=config['shortcut'], blur_kernel=config['blur_kernel'], dpr=dpr_encoder, in_discriminator_dims=in_discriminator_dims, out_discriminator_dims=config['out_discriminator_dims'], discriminator_conv_depth=config['discriminator_depth']).to(config['device'])
-    return discriminator
+#def build_discriminator(config, discriminator_type):
+#    num_stages = len(config['conv_depth']) + len(config['transformer_depth'])
+#    # stochastic depth
+#    num_blocks = config['conv_depth'] + config['transformer_depth'] + [config['num_bottleneck_layers']]
+#    my_iter = torch.cat([torch.tensor([0]), torch.cumsum(torch.tensor(num_blocks), dim=0)])
+#    dpr = [x.item() for x in torch.linspace(0, 0.0, sum(num_blocks))]
+#    dpr = [dpr[my_iter[j]:my_iter[j+1]] for j in range(len(num_blocks))]
+#    dpr_encoder = dpr[:num_stages]
+#
+#    if discriminator_type == 'seg':
+#        in_discriminator_dims = config['seg_in_discriminator_dims']
+#    elif discriminator_type == 'rec':
+#        in_discriminator_dims = config['rec_in_discriminator_dims']
+#
+#    discriminator = SpectralConvDiscriminator(blur=config['blur'], shortcut=config['shortcut'], blur_kernel=config['blur_kernel'], dpr=dpr_encoder, in_discriminator_dims=in_discriminator_dims, out_discriminator_dims=config['out_discriminator_dims'], discriminator_conv_depth=config['discriminator_depth']).to(config['device'])
+#    return discriminator
 
 def build_policy_net(config):
     policy_net = PolicyNet(blur=config['blur'], 
@@ -772,23 +767,23 @@ def build_confidence_network(config, alpha, image_size, window_size):
 
     return confidence_network
 
-def build_discriminator(config, conv_layer, alpha, in_channel, image_size):
-    discriminator_in_dim = copy(config['in_encoder_dims'])
-    discriminator_in_dim = [int(round((alpha * x) / 2) * 2) for x in discriminator_in_dim]
-    discriminator_in_dim[0] = in_channel
-
-    discriminator = Discriminator(conv_depth=config['conv_depth'],
-                                    image_size=image_size,
-                                    num_bottleneck_layers=config['num_bottleneck_layers'],
-                                    drop_path_rate=config['drop_path_rate'],
-                                    out_encoder_dims=[int(round((alpha * x) / 2) * 2) for x in config['out_encoder_dims']],
-                                    norm=config['norm'],
-                                    device=config['device'],
-                                    in_encoder_dims=discriminator_in_dim,
-                                    conv_layer=conv_layer,
-                                    bottleneck_heads=int(alpha * config['bottleneck_heads']))
-
-    return discriminator
+#def build_discriminator(config, conv_layer, alpha, in_channel, image_size):
+#    discriminator_in_dim = copy(config['in_encoder_dims'])
+#    discriminator_in_dim = [int(round((alpha * x) / 2) * 2) for x in discriminator_in_dim]
+#    discriminator_in_dim[0] = in_channel
+#
+#    discriminator = Discriminator(conv_depth=config['conv_depth'],
+#                                    image_size=image_size,
+#                                    num_bottleneck_layers=config['num_bottleneck_layers'],
+#                                    drop_path_rate=config['drop_path_rate'],
+#                                    out_encoder_dims=[int(round((alpha * x) / 2) * 2) for x in config['out_encoder_dims']],
+#                                    norm=config['norm'],
+#                                    device=config['device'],
+#                                    in_encoder_dims=discriminator_in_dim,
+#                                    conv_layer=conv_layer,
+#                                    bottleneck_heads=int(alpha * config['bottleneck_heads']))
+#
+#    return discriminator
 
 def load_weights(model, path):
     model.load_state_dict(path)
@@ -836,20 +831,93 @@ def build_video_model(config, conv_layer, conv_layer_1d, norm_2d, norm_1d, log_f
     return model
 
 
-def build_flow_model(config, conv_layer, norm, image_size):
+def build_discriminator(config, conv_layer, norm, image_size):
+    model = Discriminator(out_encoder_dims=config['discriminator_out_dims'],
+                          device=config['device'],
+                          in_dims=config['discriminator_in_dims'],
+                          image_size=image_size,
+                          conv_layer=conv_layer,
+                          conv_depth=config['discriminator_depth'],
+                          drop_path_rate=config['drop_path_rate'],
+                          bottleneck_heads=config['bottleneck_heads'],
+                          norm_2d=norm)
+        
+    model = model.to(config['device'])
+
+    return model
+
+
+def build_flow_model(config, conv_layer_2d, conv_layer_1d, norm_2d, norm_1d, image_size, log_function):
 
     model = OpticalFlowModel(deep_supervision=config['deep_supervision'],
              out_encoder_dims=config['out_encoder_dims'],
              device=config['device'],
              in_dims=config['in_encoder_dims'],
              nb_layers=config['nb_layers'],
+             image_size=image_size,
+             blackout=config['blackout'],
+             num_bottleneck_layers=config['num_bottleneck_layers'],
+             conv_layer_2d=conv_layer_2d,
+             conv_layer_1d=conv_layer_1d,
+             conv_depth=config['conv_depth'],
+             bottleneck_heads=config['bottleneck_heads'],
+             drop_path_rate=config['drop_path_rate'],
+             log_function=log_function,
+             nb_tokens=config['nb_tokens'],
+             dot_multiplier=config['dot_multiplier'],
+             norm_1d=norm_1d,
+             norm_2d=norm_2d)
+        
+    model = model.to(config['device'])
+
+    return model
+
+
+def build_flow_model_4(config, conv_layer_2d, conv_layer_1d, norm_2d, norm_1d, image_size, log_function):
+
+    model = OpticalFlowModel4(deep_supervision=config['deep_supervision'],
+             out_encoder_dims=config['out_encoder_dims'],
+             device=config['device'],
+             in_dims=config['in_encoder_dims'],
+             nb_layers=config['nb_layers'],
+             image_size=image_size,
+             blackout=config['blackout'],
+             num_bottleneck_layers=config['num_bottleneck_layers'],
+             conv_layer_2d=conv_layer_2d,
+             conv_layer_1d=conv_layer_1d,
+             conv_depth=config['conv_depth'],
+             bottleneck_heads=config['bottleneck_heads'],
+             drop_path_rate=config['drop_path_rate'],
+             log_function=log_function,
+             nb_tokens=config['nb_tokens'],
+             dot_multiplier=config['dot_multiplier'],
+             lookback=config['lookback'],
+             norm_1d=norm_1d,
+             norm_2d=norm_2d)
+        
+    model = model.to(config['device'])
+
+    return model
+
+
+def build_flow_model_2(config, conv_layer, norm, image_size, log_function):
+
+    model = OpticalFlowModel2(deep_supervision=config['deep_supervision'],
+             out_encoder_dims=config['out_encoder_dims'],
+             device=config['device'],
+             in_dims=config['in_encoder_dims'],
+             nb_layers=config['nb_layers'],
              video_length=config['video_length'],
              image_size=image_size,
+             blackout=config['blackout'],
              num_bottleneck_layers=config['num_bottleneck_layers'],
              conv_layer=conv_layer,
              conv_depth=config['conv_depth'],
              bottleneck_heads=config['bottleneck_heads'],
              drop_path_rate=config['drop_path_rate'],
+             log_function=log_function,
+             nb_tokens=config['nb_tokens'],
+             dot_multiplier=config['dot_multiplier'],
              norm_2d=norm)
         
     model = model.to(config['device'])
@@ -1029,28 +1097,6 @@ def create_loggers(path):
     console_logger.addHandler(my_handler)
     file_logger.addHandler(fileHandler)
     return console_logger, file_logger
-
-def count_parameters(console_logger, file_logger, config, models):
-    params_sum = 0
-    for k, v in models.items():
-        nb_params =  sum(p.numel() for p in v[0].parameters() if p.requires_grad)
-        params_sum += nb_params
-        file_logger.info('*'*200)
-        console_logger.info(f"The {k} has {nb_params:,} parameters")
-        file_logger.info(f"The {k} has {nb_params:,} parameters")
-        file_logger.info(yaml.safe_dump(config, default_flow_style=None, sort_keys=False))
-
-        model_stats = summary(v[0], input_size=v[1], 
-                            col_names=["input_size", "output_size", "num_params", "mult_adds"], 
-                            col_width=16,
-                            verbose=0)
-        model_stats.formatting.verbose = 1
-        file_logger.info(model_stats)
-    
-    console_logger.info(f"The whole model has {params_sum:,} parameters")
-    file_logger.info(f"The whole model has {params_sum:,} parameters")
-
-    #image_size = config['big_image_size'] if config['binary'] else config['image_size']
 
 
 def set_augmentations(config, module, img_size, autoencoder):

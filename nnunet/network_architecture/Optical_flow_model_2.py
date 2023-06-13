@@ -29,7 +29,7 @@ from ..lib.vq_vae import VectorQuantizer, VectorQuantizerEMA, VanillaVAE, Quanti
 from torch.cuda.amp import autocast
 from nnunet.utilities.random_stuff import no_op
 from typing import Union, Tuple
-from ..lib.vit_transformer import _get_clones, TransformerDecoder, TransformerFlowEncoder, ModulationTransformer, TransformerFlowDecoder, SpatioTemporalTransformer, SpatialTransformerLayer, SlotTransformer, TransformerEncoderLayer, SlotAttention, CrossTransformerEncoderLayer, CrossRelativeSpatialTransformerLayer
+from ..lib.vit_transformer import _get_clones, TransformerDecoder, TransformerFlowEncoder, TransformerFlowEncoderContext, ModulationTransformer, TransformerFlowDecoder, SpatioTemporalTransformer, SpatialTransformerLayer, SlotTransformer, TransformerEncoderLayer, SlotAttention, CrossTransformerEncoderLayer, CrossRelativeSpatialTransformerLayer
 from batchgenerators.augmentations.utils import pad_nd_image
 from ..training.dataloading.dataset_loading import get_idx, select_idx
 from ..lib.position_embedding import PositionEmbeddingSine2d, PositionEmbeddingSine1d
@@ -76,10 +76,10 @@ class OpticalFlowModel(SegmentationNetwork):
                 device,
                 in_dims,
                 nb_layers,
+                video_length,
                 image_size,
                 num_bottleneck_layers,
-                conv_layer_2d,
-                conv_layer_1d,
+                conv_layer,
                 conv_depth,
                 bottleneck_heads,
                 drop_path_rate,
@@ -87,7 +87,6 @@ class OpticalFlowModel(SegmentationNetwork):
                 log_function,
                 dot_multiplier,
                 nb_tokens,
-                norm_1d,
                 norm_2d):
         super(OpticalFlowModel, self).__init__()
         
@@ -99,6 +98,7 @@ class OpticalFlowModel(SegmentationNetwork):
         self.bottleneck_heads = bottleneck_heads
         self.do_ds = deep_supervision
         self.conv_op=nn.Conv2d
+        self.video_length = video_length
         self.nb_layers = nb_layers
         self.log_function = log_function
         self.blackout = blackout
@@ -115,18 +115,22 @@ class OpticalFlowModel(SegmentationNetwork):
         dpr_decoder = [x[::-1] for x in dpr_encoder[::-1]]
         dpr_bottleneck = dpr[-1]
 
-        self.encoder = Encoder(conv_layer=conv_layer_2d, norm=norm_2d, out_dims=out_encoder_dims, device=device, in_dims=in_dims, conv_depth=conv_depth, dpr=dpr_encoder)
+        in_dims_context = copy(in_dims)
+        in_dims_context[0] = video_length
+
+        self.encoder = Encoder(conv_layer=conv_layer, norm=norm_2d, out_dims=out_encoder_dims, device=device, in_dims=in_dims, conv_depth=conv_depth, dpr=dpr_encoder)
+        self.context_encoder = Encoder(conv_layer=conv_layer, norm=norm_2d, out_dims=out_encoder_dims, device=device, in_dims=in_dims_context, conv_depth=conv_depth, dpr=dpr_encoder)
         in_dims[0] = self.num_classes
         conv_depth_decoder = conv_depth[::-1]
 
-        self.seg_decoder = decoder_alt.SegmentationDecoder2(dot_multiplier=dot_multiplier, deep_supervision=deep_supervision, conv_depth=conv_depth_decoder, conv_layer=conv_layer_2d, dpr=dpr_decoder, in_encoder_dims=in_dims[::-1], out_encoder_dims=out_encoder_dims[::-1], num_classes=self.num_classes, img_size=image_size, norm=norm_2d)
-        self.flow_decoder = decoder_alt.SegmentationDecoder2(dot_multiplier=dot_multiplier, deep_supervision=deep_supervision, conv_depth=conv_depth_decoder, conv_layer=conv_layer_2d, dpr=dpr_decoder, in_encoder_dims=in_dims[::-1], out_encoder_dims=out_encoder_dims[::-1], num_classes=2, img_size=image_size, norm=norm_2d)
+        self.seg_decoder = decoder_alt.SegmentationDecoder2(dot_multiplier=dot_multiplier, deep_supervision=deep_supervision, conv_depth=conv_depth_decoder, conv_layer=conv_layer, dpr=dpr_decoder, in_encoder_dims=in_dims[::-1], out_encoder_dims=out_encoder_dims[::-1], num_classes=self.num_classes, img_size=image_size, norm=norm_2d)
+        self.flow_decoder = decoder_alt.SegmentationDecoder2(dot_multiplier=dot_multiplier, deep_supervision=deep_supervision, conv_depth=conv_depth_decoder, conv_layer=conv_layer, dpr=dpr_decoder, in_encoder_dims=in_dims[::-1], out_encoder_dims=out_encoder_dims[::-1], num_classes=2, img_size=image_size, norm=norm_2d)
 
         H, W = (int(image_size / 2**(self.num_stages)), int(image_size / 2**(self.num_stages)))
         #d_ffn = min(2048, self.d_model * 4)
-        self.transformer_flow_encoder = TransformerFlowEncoder(dim=self.d_model, nhead=self.bottleneck_heads, num_layers=self.nb_layers, nb_tokens=nb_tokens)
         
-        self.conv_1d = nn.Conv1d(in_channels=self.d_model, out_channels=self.d_model, kernel_size=17, padding='same')
+        #self.transformer_flow_encoder = TransformerFlowEncoder(dim=self.d_model, nhead=self.bottleneck_heads, num_layers=self.nb_layers, video_length=video_length, nb_tokens=nb_tokens)
+        self.transformer_flow_encoder = TransformerFlowEncoderContext(dim=self.d_model, nhead=self.bottleneck_heads, num_layers=self.nb_layers, video_length=video_length, nb_tokens=nb_tokens)
 
         self.skip_co_reduction_list = nn.ModuleList()
         for idx, dim in enumerate(out_encoder_dims):
@@ -169,6 +173,13 @@ class OpticalFlowModel(SegmentationNetwork):
                 'registered_input_backward': [],
                 'registered_seg': []}
         
+        context = unlabeled.squeeze(2) # T, B, H, W
+        context_1 = context.permute(1, 0, 2, 3).contiguous() # B, T, H, W
+        #context_2 = torch.flip(context_1, dims=[1])
+
+        context_features_1, context_skip_connections_1 = self.context_encoder(context_1)
+        #context_features_2, context_skip_connections_2 = self.context_encoder(context_2)
+        
         #if self.training and self.blackout and not unlabeled.requires_grad:
         #    nb_masked = np.rint(np.random.uniform(0, 0.2) * len(unlabeled)).astype(int)
         #    indices = np.random.randint(0, len(unlabeled), nb_masked)
@@ -197,12 +208,6 @@ class OpticalFlowModel(SegmentationNetwork):
             unlabeled_feature_list.append(unlabeled_features)
         unlabeled_features = torch.stack(unlabeled_feature_list, dim=0) # T, B, C, H, W
 
-        pos_1d = torch.flatten(unlabeled_features, start_dim=-2).mean(-1) # T, B, C
-        pos_1d = pos_1d.permute(1, 2, 0).contiguous()
-        pos_1d = self.conv_1d(pos_1d)
-        pos_1d_1 = pos_1d[:, :, :-1]
-        pos_1d_2 = pos_1d[:, :, 1:]
-
         feature_1 = unlabeled_features[:-1]
         feature_2 = unlabeled_features[1:]
         feature_1_skip_co = unlabeled_skip_co_list[:-1]
@@ -210,13 +215,12 @@ class OpticalFlowModel(SegmentationNetwork):
 
         T, B, C, H, W = feature_1.shape
 
-        feature_1, feature_2 = self.transformer_flow_encoder(spatial_features_1=feature_1, 
-                                                             spatial_features_2=feature_2,
-                                                             pos_1d_1=pos_1d_1,
-                                                             pos_1d_2=pos_1d_2) # T, B, H*W, C ; T, B, M, C
+        feature_1, feature_2, feature_seg = self.transformer_flow_encoder(spatial_features_1=feature_1, 
+                                                                          spatial_features_2=feature_2,
+                                                                          context_1=context_features_1) # T, B, H*W, C ; T, B, M, C
 
-        seg_list_1 = []
-        seg_list_2 = []
+        assert len(feature_seg) - 1 == len(feature_1)
+        seg_list = []
         for t in range(len(feature_1)):
 
             flow_skip_co = []
@@ -227,26 +231,29 @@ class OpticalFlowModel(SegmentationNetwork):
 
             to_decode_feature_1 = feature_1[t] # B, L, C
             to_decode_feature_2 = feature_2[t] # B, L, C
+            to_decode_feature_seg = feature_seg[t] # B, L, C
 
             to_decode_feature_1 = to_decode_feature_1.permute(0, 2, 1).contiguous().view(B, C, H, W)
             to_decode_feature_2 = to_decode_feature_2.permute(0, 2, 1).contiguous().view(B, C, H, W)
+            to_decode_feature_seg = to_decode_feature_seg.permute(0, 2, 1).contiguous().view(B, C, H, W)
 
             flow_1 = self.flow_decoder(to_decode_feature_1, flow_skip_co)
             flow_2 = self.flow_decoder(to_decode_feature_2, flow_skip_co)
-            seg_1 = self.seg_decoder(to_decode_feature_1, feature_1_skip_co[t])
-            seg_2 = self.seg_decoder(to_decode_feature_2, feature_2_skip_co[t])
+            seg = self.seg_decoder(to_decode_feature_seg, unlabeled_skip_co_list[t])
 
-            seg_list_1.append(seg_1)
-            seg_list_2.append(seg_2)
+            seg_list.append(seg)
             out['forward_flow'].append(flow_1)
             out['backward_flow'].append(flow_2)
         
+        to_decode_feature_seg = feature_seg[-1] # B, L, C
+        to_decode_feature_seg = to_decode_feature_seg.permute(0, 2, 1).contiguous().view(B, C, H, W)
+        seg = self.seg_decoder(to_decode_feature_seg, unlabeled_skip_co_list[-1])
+        seg_list.append(seg)
 
-        seg_1 = torch.stack(seg_list_1, dim=0)
-        seg_2 = torch.stack(seg_list_2, dim=0)
+        seg = torch.stack(seg_list, dim=0)
 
-        middle = torch.stack([seg_1[1:], seg_2[:-1]], dim=0).mean(0)
-        seg = torch.cat([seg_1[0][None], middle, seg_2[-1][None]], dim=0)
+        #middle = torch.stack([seg_1[1:], seg_2[:-1]], dim=0).mean(0)
+        #seg = torch.cat([seg_1[0][None], middle, seg_2[-1][None]], dim=0)
 
         out['seg'] = seg
         out['forward_flow'] = torch.stack(out['forward_flow'], dim=0)
@@ -338,6 +345,160 @@ class OpticalFlowModel(SegmentationNetwork):
                                                                pad_border_mode, pad_kwargs, all_in_gpu, False)
 
         return res
+    
+
+    def _internal_maybe_mirror_and_pred_2D_flow(self, labeled, unlabeled, processor, mirror_axes: tuple,
+                                           do_mirroring: bool = True) -> torch.tensor:
+        # if cuda available:
+        #   everything in here takes place on the GPU. If x and mult are not yet on GPU this will be taken care of here
+        #   we now return a cuda tensor! Not numpy array!
+
+        assert len(unlabeled[0].shape) == 4, 'x must be (b, c, x, y)'
+        assert len(labeled.shape) == 4, 'x must be (b, c, x, y)'
+
+        labeled = maybe_to_torch(labeled)
+        unlabeled = maybe_to_torch(unlabeled)
+
+        result_torch_flow = torch.zeros(list(unlabeled.shape[:2]) + [2] + list(unlabeled.shape[3:]), dtype=torch.float)
+
+        if torch.cuda.is_available():
+            labeled = to_cuda(labeled, gpu_id=self.get_device())
+            unlabeled = to_cuda(unlabeled, gpu_id=self.get_device())
+            result_torch_flow = result_torch_flow.cuda(self.get_device(), non_blocking=True)
+
+        if do_mirroring:
+            mirror_idx = 4
+            num_results = 2 ** len(mirror_axes)
+        else:
+            mirror_idx = 1
+            num_results = 1
+
+        with torch.no_grad():
+            mean_centroid, _ = processor.preprocess_no_registration(data=unlabeled[:, 0]) # T, C(1), H, W
+
+            cropped_unlabeled, padding_need = processor.crop_and_pad(data=unlabeled[:, 0], mean_centroid=mean_centroid)
+            padding_need = padding_need[None]
+            cropped_unlabeled = cropped_unlabeled[:, None]
+
+            cropped_labeled, _ = processor.crop_and_pad(data=labeled[0][None], mean_centroid=mean_centroid)
+            cropped_labeled = cropped_labeled[0][None]
+        
+        cropped_labeled[0] = NormalizeIntensity(nonzero=True)(cropped_labeled[0])
+        cropped_unlabeled[:, 0] = NormalizeIntensity(nonzero=True)(cropped_unlabeled[:, 0])
+
+        assert len(cropped_labeled.shape) + 1 == len(cropped_unlabeled.shape)
+
+        for m in range(mirror_idx):
+            if m == 0:
+                output = self(cropped_labeled, cropped_unlabeled)
+                flow_pred = processor.uncrop_no_registration(output['motion_flow_u_to_l'], padding_need)
+                result_torch_flow += 1 / num_results * flow_pred
+
+            if m == 1 and (1 in mirror_axes):
+                cropped_labeled_flipped = torch.flip(cropped_labeled, (3, ))
+                cropped_unlabeled_flipped = torch.flip(cropped_unlabeled, (4, ))
+                output = self(cropped_labeled_flipped, cropped_unlabeled_flipped)
+                flow_pred = processor.uncrop_no_registration(output['motion_flow_u_to_l'], padding_need)
+                result_torch_flow += 1 / num_results * torch.flip(flow_pred, (4, ))
+
+            if m == 2 and (0 in mirror_axes):
+                cropped_labeled_flipped = torch.flip(cropped_labeled, (2, ))
+                cropped_unlabeled_flipped = torch.flip(cropped_unlabeled, (3, ))
+                output = self(cropped_labeled_flipped, cropped_unlabeled_flipped)
+                flow_pred = processor.uncrop_no_registration(output['motion_flow_u_to_l'], padding_need)
+                result_torch_flow += 1 / num_results * torch.flip(flow_pred, (3, ))
+
+            if m == 3 and (0 in mirror_axes) and (1 in mirror_axes):
+                cropped_labeled_flipped = torch.flip(cropped_labeled, (3, 2))
+                cropped_unlabeled_flipped = torch.flip(cropped_unlabeled, (4, 3))
+                output = self(cropped_labeled_flipped, cropped_unlabeled_flipped)
+                flow_pred = processor.uncrop_no_registration(output['motion_flow_u_to_l'], padding_need)
+                result_torch_flow += 1 / num_results * torch.flip(flow_pred, (4, 3))
+
+        return result_torch_flow
+    
+    def _internal_maybe_mirror_and_pred_2D_seg(self, labeled, unlabeled, processor, mirror_axes: tuple,
+                                           do_mirroring: bool = True,
+                                           mult: np.ndarray or torch.tensor = None) -> torch.tensor:
+        # if cuda available:
+        #   everything in here takes place on the GPU. If x and mult are not yet on GPU this will be taken care of here
+        #   we now return a cuda tensor! Not numpy array!
+
+        assert len(unlabeled[0].shape) == 4, 'x must be (b, c, x, y)'
+        assert len(labeled.shape) == 4, 'x must be (b, c, x, y)'
+
+        labeled = maybe_to_torch(labeled)
+        unlabeled = maybe_to_torch(unlabeled)
+
+        result_torch_seg = torch.zeros(list(unlabeled.shape[:2]) + [self.num_classes] + list(unlabeled.shape[3:]), dtype=torch.float)
+
+        if torch.cuda.is_available():
+            labeled = to_cuda(labeled, gpu_id=self.get_device())
+            unlabeled = to_cuda(unlabeled, gpu_id=self.get_device())
+            result_torch_seg = result_torch_seg.cuda(self.get_device(), non_blocking=True)
+
+        if mult is not None:
+            mult = maybe_to_torch(mult)
+            if torch.cuda.is_available():
+                mult = to_cuda(mult, gpu_id=self.get_device())
+
+        if do_mirroring:
+            mirror_idx = 4
+            num_results = 2 ** len(mirror_axes)
+        else:
+            mirror_idx = 1
+            num_results = 1
+
+        with torch.no_grad():
+            mean_centroid, _ = processor.preprocess_no_registration(data=unlabeled[:, 0]) # T, C(1), H, W
+
+            cropped_unlabeled, padding_need = processor.crop_and_pad(data=unlabeled[:, 0], mean_centroid=mean_centroid)
+            padding_need = padding_need[None]
+            cropped_unlabeled = cropped_unlabeled[:, None]
+
+            cropped_labeled, _ = processor.crop_and_pad(data=labeled[0][None], mean_centroid=mean_centroid)
+            cropped_labeled = cropped_labeled[0][None]
+        
+        cropped_labeled[0] = NormalizeIntensity(nonzero=True)(cropped_labeled[0])
+        cropped_unlabeled[:, 0] = NormalizeIntensity(nonzero=True)(cropped_unlabeled[:, 0])
+
+        assert len(cropped_labeled.shape) + 1 == len(cropped_unlabeled.shape)
+
+        for m in range(mirror_idx):
+            if m == 0:
+                output = self(cropped_labeled, cropped_unlabeled)
+                seg_pred = processor.uncrop_no_registration(output['unlabeled_predictions'], padding_need)
+                seg_pred = self.inference_apply_nonlin(seg_pred)
+                result_torch_seg += 1 / num_results * seg_pred
+
+            if m == 1 and (1 in mirror_axes):
+                cropped_labeled_flipped = torch.flip(cropped_labeled, (3, ))
+                cropped_unlabeled_flipped = torch.flip(cropped_unlabeled, (4, ))
+                output = self(cropped_labeled_flipped, cropped_unlabeled_flipped)
+                seg_pred = processor.uncrop_no_registration(output['unlabeled_predictions'], padding_need)
+                seg_pred = self.inference_apply_nonlin(seg_pred)
+                result_torch_seg += 1 / num_results * torch.flip(seg_pred, (4, ))
+
+            if m == 2 and (0 in mirror_axes):
+                cropped_labeled_flipped = torch.flip(cropped_labeled, (2, ))
+                cropped_unlabeled_flipped = torch.flip(cropped_unlabeled, (3, ))
+                output = self(cropped_labeled_flipped, cropped_unlabeled_flipped)
+                seg_pred = processor.uncrop_no_registration(output['unlabeled_predictions'], padding_need)
+                seg_pred = self.inference_apply_nonlin(seg_pred)
+                result_torch_seg += 1 / num_results * torch.flip(seg_pred, (3, ))
+
+            if m == 3 and (0 in mirror_axes) and (1 in mirror_axes):
+                cropped_labeled_flipped = torch.flip(cropped_labeled, (3, 2))
+                cropped_unlabeled_flipped = torch.flip(cropped_unlabeled, (4, 3))
+                output = self(cropped_labeled_flipped, cropped_unlabeled_flipped)
+                seg_pred = processor.uncrop_no_registration(output['unlabeled_predictions'], padding_need)
+                seg_pred = self.inference_apply_nonlin(seg_pred)
+                result_torch_seg += 1 / num_results * torch.flip(seg_pred, (4, 3))
+        
+        if mult is not None:
+            result_torch_seg[:, :] *= mult
+
+        return result_torch_seg
 
 
     def _internal_maybe_mirror_and_pred_2D(self, unlabeled, processor, mirror_axes: tuple,
@@ -459,12 +620,8 @@ class OpticalFlowModel(SegmentationNetwork):
                 result_torch_seg += 1 / num_results * torch.flip(seg_pred, (4, 3))
                 #result_torch_flow += 1 / num_results * torch.flip(flow_pred, (4, 3))
 
-        result_torch_seg = result_torch_seg.permute(1, 0, 2, 3, 4).contiguous()
-        result_torch_flow = result_torch_flow.permute(1, 0, 2, 3, 4).contiguous()
         result_torch_seg = processor.uncrop_no_registration(result_torch_seg, padding_need)
         result_torch_flow = processor.uncrop_no_registration(result_torch_flow, padding_need)
-        result_torch_seg = result_torch_seg.permute(1, 0, 2, 3, 4).contiguous()
-        result_torch_flow = result_torch_flow.permute(1, 0, 2, 3, 4).contiguous()
         
         #matplotlib.use('QtAgg')
         #fig, ax = plt.subplots(1, 1)

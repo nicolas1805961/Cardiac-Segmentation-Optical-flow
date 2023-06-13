@@ -12,7 +12,6 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
-from ruamel.yaml import YAML
 from torch.autograd import Variable
 from nnunet.training.network_training.data_augmentation import Augmenter
 from torchvision.transforms.functional import gaussian_blur
@@ -47,7 +46,7 @@ import matplotlib.pylab as pl
 import matplotlib.pyplot as plt
 from copy import copy
 from time import time, sleep, strftime
-#import yaml
+import yaml
 import numpy as np
 import torch
 from nnunet.torchinfo.torchinfo.torchinfo import summary
@@ -77,9 +76,9 @@ from monai.losses import DiceFocalLoss, DiceLoss
 from torch.utils.tensorboard import SummaryWriter
 from nnunet.training.loss_functions.dice_loss import DC_and_CE_loss, DC_and_focal_loss, DC_and_topk_loss, DC_and_CE_loss_Weighted, SoftDiceLoss
 from nnunet.training.loss_functions.crossentropy import RobustCrossEntropyLoss, WeightedRobustCrossEntropyLoss
-from nnunet.training.dataloading.dataset_loading import DataLoaderFlowTrain, DataLoaderFlowValidation
+from nnunet.training.dataloading.dataset_loading import DataLoaderFlow3
 from nnunet.training.dataloading.dataset_loading import load_dataset, load_unlabeled_dataset
-from nnunet.network_architecture.MTL_model import ModelWrap
+from nnunet.network_architecture.Optical_flow_model_3 import ModelWrap
 from nnunet.lib.utils import RFR, ConvBlocks, Resblock, LayerNorm, RFR_1d, Resblock1D, ConvBlocks1D, MotionEstimation
 from nnunet.lib.loss import SeparabilityLoss, ContrastiveLoss
 from nnunet.training.data_augmentation.cutmix import cutmix, batched_rand_bbox
@@ -87,23 +86,18 @@ import shutil
 from nnunet.visualization.visualization import Visualizer
 from nnunet.training.network_training.processor import Processor
 
-class nnMTLTrainerV2Flow(nnUNetTrainer):
+class nnMTLTrainerV2Flow3(nnUNetTrainer):
     """
     Info for Fabian: same as internal nnUNetTrainerV2_2
     """
 
     def __init__(self, plans_file, fold, output_folder=None, dataset_directory=None, batch_dice=True, stage=None,
-                 unpack_data=True, deterministic=True, fp16=False, config=None):
+                 unpack_data=True, deterministic=True, fp16=False, inference=False):
         super().__init__(plans_file, fold, output_folder, dataset_directory, batch_dice, stage, unpack_data,
                          deterministic, fp16)
 
         self.cropper_config = read_config(os.path.join(Path.cwd(), 'adversarial_acdc.yaml'), False, False)
-        if config is None:
-            self.inference = False
-            self.config = read_config(os.path.join(Path.cwd(), 'video.yaml'), False, True)
-        else:
-            self.inference = True
-            self.config = config
+        self.config = read_config(os.path.join(Path.cwd(), 'video.yaml'), False, True)
         self.cropper_weights_folder_path = 'binary'
         self.video_length = self.config['video_length']
         self.crop = self.config['crop']
@@ -114,7 +108,6 @@ class nnMTLTrainerV2Flow(nnUNetTrainer):
         self.area_size = self.config['area_size']
         self.step = self.config['step']
         self.binary = False
-        self.blackout = self.config['blackout']
         
         self.image_size = self.config['patch_size'][0]
         self.window_size = 7 if self.image_size == 224 else 9 if self.image_size == 288 else None
@@ -128,24 +121,20 @@ class nnMTLTrainerV2Flow(nnUNetTrainer):
         self.use_progress_bar=True
         self.one_vs_all = True
         self.motion_estimation = MotionEstimation()
-        self.load_only_batchnorm = self.config['load_only_batchnorm']
 
-        self.fine_tuning = True if self.video_length > 2 and not self.inference else False
-        #self.fine_tuning = False
+        #self.fine_tuning = True if self.video_length > 2 else False
+        self.fine_tuning = False
 
         self.deep_supervision = self.config['deep_supervision']
-        self.segmentation_loss_weight = self.config['segmentation_loss_weight']
+        self.labeled_segmentation_weight = self.config['labeled_segmentation_weight']
+        self.unlabeled_segmentation_weight = self.config['unlabeled_segmentation_weight']
         self.regularization_weight_xy = self.config['regularization_weight_xy']
         self.regularization_weight_z = self.config['regularization_weight_z']
         self.adversarial_weight = self.config['adversarial_weight']
-        self.consistency_loss_weight = self.config['consistency_loss_weight']
         self.do_adv = self.config['do_adv']
 
-        self.discriminator_lr = self.config['discriminator_lr']
-        self.discriminator_decay = self.config['discriminator_decay']
-
-        weights = np.array([1 / (2 ** i) for i in range(len(self.config['conv_depth']))])
-        self.ds_weights = weights / weights.sum()
+        self.strong_network_lr = self.config['strong_network_lr']
+        self.strong_network_decay = self.config['strong_network_decay']
 
         self.iter_nb = 0
         self.epoch_iter_nb = 0
@@ -154,9 +143,9 @@ class nnMTLTrainerV2Flow(nnUNetTrainer):
         self.train_loss = []
         
         #loss_weights = torch.tensor(self.config['224_loss_weights'], device=self.config['device'])
-        self.segmentation_flow_loss_weight = self.config['segmentation_flow_loss_weight']
+        #self.segmentation_flow_loss_weight = self.config['segmentation_flow_loss_weight']
         self.image_flow_loss_weight = self.config['image_flow_loss_weight']
-        self.long_image_flow_loss_weight = self.config['long_image_flow_loss_weight']
+        #self.long_image_flow_loss_weight = self.config['long_image_flow_loss_weight']
 
         timestr = strftime("%Y-%m-%d_%HH%M")
         self.log_dir = os.path.join(copy(self.output_folder), timestr)
@@ -172,10 +161,10 @@ class nnMTLTrainerV2Flow(nnUNetTrainer):
                                     area_size=self.area_size[-1],
                                     crop_size=self.crop_size)
             
-        if config is None:
-            self.output_folder = self.log_dir
-        else:
+        if inference:
             self.output_folder = output_folder
+        else:
+            self.output_folder = self.log_dir
 
         #if output_folder.count(os.sep) < 2:
         #    self.output_folder = output_folder
@@ -192,15 +181,10 @@ class nnMTLTrainerV2Flow(nnUNetTrainer):
         self.loss_data = self.setup_loss_data()
 
     def setup_loss_data(self):
-        loss_data = {'segmentation': [self.segmentation_loss_weight, float('nan')]}
-        loss_data['image_flow'] = [self.image_flow_loss_weight, float('nan')]
-        if not self.deep_supervision:
-            loss_data['segmentation_flow'] = [self.segmentation_flow_loss_weight, float('nan')]
-            loss_data['long_forward_image_flow'] = [self.long_image_flow_loss_weight, float('nan')]
-            loss_data['long_backward_image_flow'] = [self.long_image_flow_loss_weight, float('nan')]
-            loss_data['consistency'] = [self.consistency_loss_weight, float('nan')]
-        if self.do_adv:
-            loss_data['adversarial'] = [self.adversarial_weight, float('nan')]
+        loss_data = {'labeled_segmentation': [self.labeled_segmentation_weight, float('nan')]}
+        loss_data['unlabeled_segmentation'] = [self.unlabeled_segmentation_weight, float('nan')]
+        loss_data['forward_image_flow'] = [self.image_flow_loss_weight, float('nan')]
+        loss_data['backward_image_flow'] = [self.image_flow_loss_weight, float('nan')]
         return loss_data
     
     def setup_loss_functions(self):
@@ -263,10 +247,10 @@ class nnMTLTrainerV2Flow(nnUNetTrainer):
             # now wrap the loss
             seg_weights = weights
 
-            #if self.deep_supervision:
-            #    self.segmentation_loss = MultipleOutputLoss2(self.segmentation_loss, seg_weights)
-            #    self.image_flow_loss = MultipleOutputLoss2(self.image_flow_loss, seg_weights)
-            #    self.seg_flow_loss = MultipleOutputLoss2(self.seg_flow_loss, seg_weights)
+            if self.deep_supervision:
+                self.segmentation_loss = MultipleOutputLoss2(self.segmentation_loss, seg_weights)
+                self.image_flow_loss = MultipleOutputLoss2(self.image_flow_loss, seg_weights)
+                self.seg_flow_loss = MultipleOutputLoss2(self.seg_flow_loss, seg_weights)
 
             ################# END ###################
 
@@ -299,20 +283,16 @@ class nnMTLTrainerV2Flow(nnUNetTrainer):
                 pass
 
 
-            assert isinstance(self.network, (SegmentationNetwork, nn.DataParallel))
+            assert isinstance(self.weak_network, (SegmentationNetwork, nn.DataParallel))
+            assert isinstance(self.strong_network, (SegmentationNetwork, nn.DataParallel))
         else:
             self.print_to_log_file('self.was_initialized is True, not running self.initialize again')
         self.was_initialized = True
 
     
     def count_parameters(self, config, models):
-        if not self.inference:
-            yaml = YAML()
-            with open(os.path.join(self.log_dir, 'config.yaml'), 'wb') as f:
-                yaml.dump(config, f)
-                self.print_to_log_file(config, also_print_to_console=False)
-
         params_sum = 0
+        self.print_to_log_file(yaml.safe_dump(config, default_flow_style=None, sort_keys=False), also_print_to_console=False)
         for k, v in models.items():
             nb_params =  sum(p.numel() for p in v[0].parameters() if p.requires_grad)
             self.print_to_log_file(f"{k} has {nb_params:,} parameters")
@@ -349,8 +329,8 @@ class nnMTLTrainerV2Flow(nnUNetTrainer):
                     module.bias.requires_grad_(False)
                 module.eval()
 
-    def load_video_weights(self, model, file_name):
-        weight_path = os.path.join(self.video_weights_folder_path, file_name)
+    def load_video_weights(self, model):
+        weight_path = os.path.join(self.video_weights_folder_path, 'model_final_checkpoint.model')
         loaded_state_dict = torch.load(weight_path)['state_dict']
         #print(loaded_state_dict.keys())
         current_model_dict = model.state_dict()
@@ -360,16 +340,9 @@ class nnMTLTrainerV2Flow(nnUNetTrainer):
         for k, v in loaded_state_dict.items():
             for module_name, module in model.named_modules():
                 if list(module.children()) == []:
-                    if self.load_only_batchnorm:
-                        if isinstance(module, nn.BatchNorm2d) and module_name in k:
-                            new_state_dict[k] = v
-                    else:
-                        if module_name in k:
-                            new_state_dict[k] = v
-                            #if new_state_dict[k].shape != v.shape:
-                            #    print(k)
-                            #else:
-                            #    new_state_dict[k] = v
+                    #if isinstance(module, nn.BatchNorm2d) and module_name in k:
+                    if module_name in k:
+                        new_state_dict[k] = v
 
         missing_keys, unexpected_keys = model.load_state_dict(new_state_dict, strict=False)
 
@@ -395,20 +368,12 @@ class nnMTLTrainerV2Flow(nnUNetTrainer):
         wanted_norm = self.config['norm']
         if wanted_norm == 'batchnorm':
             norm_2d = nn.BatchNorm2d
-            norm_1d = nn.BatchNorm1d
+            norm_1d = nn.InstanceNorm1d
         elif wanted_norm == 'instancenorm':
             norm_2d = nn.InstanceNorm2d
             norm_1d = nn.InstanceNorm1d
         
-        conv_layer_2d, conv_layer_1d = self.get_conv_layer(self.config)
-
-        if self.do_adv:
-            self.discriminator = build_discriminator(config=self.config, conv_layer=conv_layer_2d, norm=norm_2d, image_size=self.crop_size)
-            if self.fine_tuning:
-                self.print_to_log_file("Loading weights from pretrained discriminator")
-                self.load_video_weights(self.discriminator, file_name='discriminator_final_checkpoint.model')
-            discriminator_input = torch.randn(self.config['batch_size'], 4, self.crop_size, self.crop_size)
-            models['discriminator'] = (self.discriminator, discriminator_input)
+        conv_layer, conv_layer_1d = self.get_conv_layer(self.config)
 
         in_shape_crop = torch.randn(self.config['batch_size'], 1, self.image_size, self.image_size)
         cropping_conv_layer, _ = self.get_conv_layer(self.cropper_config)
@@ -421,24 +386,36 @@ class nnMTLTrainerV2Flow(nnUNetTrainer):
         #end_idx = int((self.crop_size / 2**len(self.config['conv_depth']))**2)
         #in_shape_mask[:, :, :, :end_idx] = 1
         #in_shape_mask = in_shape_mask.view(self.config['batch_size'], self.video_length, 1, self.crop_size, self.crop_size)
-        self.network = build_flow_model(self.config, conv_layer_2d=conv_layer_2d, norm_2d=norm_2d, conv_layer_1d=conv_layer_1d, norm_1d=norm_1d, image_size=self.crop_size, log_function=self.print_to_log_file)
-        #self.network = build_flow_model(self.config, conv_layer=conv_layer_2d, norm=norm_2d, image_size=self.crop_size, log_function=self.print_to_log_file)
+        self.weak_network = build_flow_model_3(self.config, conv_layer=conv_layer, norm=norm_2d, image_size=self.crop_size, log_function=self.print_to_log_file)
+        self.strong_network = build_flow_model_3(self.config, conv_layer=conv_layer, norm=norm_2d, image_size=self.crop_size, log_function=self.print_to_log_file)
+
+        #for p1, p2 in zip(weak_network.parameters(), strong_network.parameters()):
+        #    if p1.data.ne(p2.data).sum() > 0:
+        #        print('Networks do not have same weights')
+        #print('Networks have same weights')
+
+        #self.network = ModelWrap(model1=weak_network, model2=strong_network)
         if self.fine_tuning:
             self.print_to_log_file("Loading weights from pretrained network")
-            self.load_video_weights(self.network, file_name='model_final_checkpoint.model')
-        unlabeled_input_data = torch.randn(self.video_length, self.config['batch_size'], 1, self.crop_size, self.crop_size)
-        models['temporal_model'] = (self.network, unlabeled_input_data)
+            self.load_video_weights(self.weak_network)
+            self.load_video_weights(self.strong_network)
+        unlabeled_input_data = torch.randn(self.video_length - 1, self.config['batch_size'], 5, self.crop_size, self.crop_size)
+        labeled_input_data = torch.randn(self.config['batch_size'], 5, self.crop_size, self.crop_size)
+        models['weak network'] = (self.weak_network, [labeled_input_data, unlabeled_input_data])
+        models['strong network'] = (self.strong_network, [labeled_input_data, unlabeled_input_data])
 
         self.processor = Processor(crop_size=self.crop_size, image_size=self.image_size, cropping_network=cropping_network, nb_layers=len(self.config['conv_depth']))
 
-        self.count_parameters(self.config, models)
+        #self.count_parameters(self.config, models)
 
         #nb_inputs = 2 if self.middle else 1
         #model_input_size = [(self.config['batch_size'], 1, self.image_size, self.image_size)] * nb_inputs
 
         if torch.cuda.is_available():
-            self.network.cuda()
-        self.network.inference_apply_nonlin = softmax_helper
+            self.weak_network.cuda()
+            self.strong_network.cuda()
+        self.weak_network.inference_apply_nonlin = softmax_helper
+        self.strong_network.inference_apply_nonlin = softmax_helper
 
     def get_optimizer_scheduler(self, net, lr, decay):
         if self.feature_extractor:
@@ -464,18 +441,14 @@ class nnMTLTrainerV2Flow(nnUNetTrainer):
         return optimizer, lr_scheduler
 
     def initialize_optimizer_and_scheduler(self):
-        assert self.network is not None, "self.initialize_network must be called first"
-        self.optimizer, self.lr_scheduler = self.get_optimizer_scheduler(net=self.network, lr=self.initial_lr, decay=self.weight_decay)
+        assert self.weak_network is not None, "self.initialize_network must be called first"
+        assert self.strong_network is not None, "self.initialize_network must be called first"
+        self.optimizer, self.lr_scheduler = self.get_optimizer_scheduler(net=self.weak_network, lr=self.initial_lr, decay=self.weight_decay)
 
-        if self.do_adv:
-            self.discriminator_optimizer, self.discriminator_scheduler = self.get_optimizer_scheduler(net=self.discriminator, lr=self.discriminator_lr, decay=self.discriminator_decay)
+        self.strong_network_optimizer, self.strong_network_scheduler = self.get_optimizer_scheduler(net=self.strong_network, lr=self.strong_network_lr, decay=self.strong_network_decay)
 
     def compute_dice(self, target, num_classes, output_seg, key):
-        print(output_seg.shape)
-        print(target.shape)
         axes = tuple(range(1, len(target.shape)))
-        print(axes)
-
         tp_hard = torch.zeros((target.shape[0], num_classes - 1)).to(output_seg.device.index)
         fp_hard = torch.zeros((target.shape[0], num_classes - 1)).to(output_seg.device.index)
         fn_hard = torch.zeros((target.shape[0], num_classes - 1)).to(output_seg.device.index)
@@ -502,37 +475,43 @@ class nnMTLTrainerV2Flow(nnUNetTrainer):
             
         return seg_dice
 
-    def get_gradient_images(self, unlabeled, indices, task):
+    def get_gradient_images(self, labeled, unlabeled, indices):
         t, b, c, y, x = indices
         with torch.enable_grad():
-            self.network.zero_grad()
-            unlabeled.requires_grad = True
-            output = self.network(unlabeled)
-            if self.deep_supervision:
-                prediction = output[task][0]
-            else:
-                prediction = output[task]
-            out = prediction[t, b, c, y, x]
+            labeled_idx = -1
+            labeled = unlabeled[labeled_idx]
+            padding = torch.zeros_like(labeled)[None].repeat(len(unlabeled) - 1, 1, 4, 1, 1)
+            unlabeled_in = unlabeled[:-1]
+            unlabeled_in = torch.cat([unlabeled_in, padding], dim=2)
+            labeled_in = torch.cat([labeled, padding[0]], dim=1)
+
+            self.weak_network.zero_grad()
+            unlabeled_in.requires_grad = True
+            labeled_in.requires_grad = True
+            output = self.weak_network(labeled_in, unlabeled_in)
+            predictions = output['forward_flow']
+            out = predictions[t, b, c, y, x]
             out.backward()
 
-            gradient_image_unlabeled = torch.abs(unlabeled.grad)
+            gradient_image_unlabeled = torch.abs(unlabeled_in.grad)
+            gradient_image_labeled = torch.abs(labeled_in.grad)
             gradient_image_unlabeled = gradient_image_unlabeled[:, b, 0, :, :]
+            gradient_image_labeled = gradient_image_labeled[b, 0, :, :]
 
             unlabeled = unlabeled[:, b, 0]
-            return gradient_image_unlabeled, unlabeled
+            labeled = labeled[b, 0]
+            return gradient_image_unlabeled, gradient_image_labeled, unlabeled_in[:, b, 0], labeled_in[b, 0]
 
     
     def start_online_evaluation(self, out,
                                     out_mask,
                                     unlabeled,
-                                    with_mask,
                                     target,
                                     gradient_image_unlabeled,
+                                    gradient_image_labeled,
                                     gradient_x_unlabeled,
-                                    gradient_image_seg,
-                                    gradient_x_seg,
+                                    gradient_x_labeled,
                                     coords,
-                                    coords_seg,
                                     padding_need,
                                     labeled_idx):
         """
@@ -542,17 +521,24 @@ class nnMTLTrainerV2Flow(nnUNetTrainer):
 
         uncrop_target = self.processor.uncrop_no_registration(target[None], padding_need=padding_need)[0]
         assert list(uncrop_target.shape[-2:]) == [self.image_size, self.image_size]
-        pred = out['seg'][labeled_idx]
-        all_pred = out['seg']
+        pred = out['labeled_seg']
+        num_classes = pred.shape[1]
+        output_softmax = torch.softmax(pred, dim=1)
+        output_seg = output_softmax.argmax(1)
 
+        #matplotlib.use('QtAgg')
+        #fig, ax = plt.subplots(2, len(unlabeled))
+        #ax[1, 0].imshow(target[0, 0].cpu(), cmap='gray')
+        #for i in range(len(unlabeled)):
+        #    ax[0, i].imshow(unlabeled[i, 0, 0].cpu(), cmap='gray')
+        #plt.show()
+
+        all_pred = out['unlabeled_seg']
+        all_pred_mask = out_mask['unlabeled_seg']
         with torch.no_grad():
-            num_classes = all_pred.shape[2]
             output_softmax_all = torch.softmax(all_pred, dim=2)
-            output_seg_all = output_softmax_all.argmax(2)
-            output_seg = output_seg_all[labeled_idx]
-
-            all_pred_mask = out_mask['seg']
             output_softmax_all_mask = torch.softmax(all_pred_mask, dim=2)
+            output_seg_all = output_softmax_all.argmax(2)
             output_seg_all_mask = output_softmax_all_mask.argmax(2)
 
             #registered_seg = torch.softmax(out['registered_seg'], dim=2)
@@ -563,6 +549,7 @@ class nnMTLTrainerV2Flow(nnUNetTrainer):
             #ax[0].imshow(target[0, 0].cpu(), cmap='gray')
             #ax[1].imshow(x[0, 0].cpu(), cmap='gray')
             #plt.show()
+
 
             output_seg = self.processor.uncrop_no_registration(output_seg[None, :, None], padding_need=padding_need)[0, :, 0]
             seg_dice = self.compute_dice(uncrop_target[:, 0], num_classes, output_seg, key='seg')
@@ -578,30 +565,29 @@ class nnMTLTrainerV2Flow(nnUNetTrainer):
                     
                     #warping_distance = self.l1_loss(out['registered_input_u_to_l'][:, b, 0], labeled[None].repeat(self.video_length, 1, 1, 1, 1)[:, b, 0]).mean()
 
-                    current_pred = torch.argmax(output_softmax_all[labeled_idx, b], dim=0)
+                    current_pred = torch.argmax(output_softmax[b], dim=0)
                     current_target = target[b, 0]
                     self.vis.set_up_image_seg_best(seg_dice=seg_dice[b].mean(), gt=current_target, pred=current_pred, x=current_x)
                     self.vis.set_up_image_seg_worst(seg_dice=seg_dice[b].mean(), gt=current_target, pred=current_pred, x=current_x)
                     self.vis.set_up_image_gradient(unlabeled_gradient=gradient_image_unlabeled,
+                                                        labeled_gradient=gradient_image_labeled,
                                                         unlabeled_x=gradient_x_unlabeled,
+                                                        labeled_x=gradient_x_labeled,
                                                         gradient_coords=coords)
-                    self.vis.set_up_image_gradient_seg(unlabeled_gradient=gradient_image_seg,
-                                                        unlabeled_x=gradient_x_seg,
-                                                        gradient_coords=coords_seg)
                     self.vis.set_up_image_flow(seg_dice=seg_dice[b].mean(), 
-                                                moving=unlabeled[:-1, b, 0], 
+                                                moving=unlabeled[-1, b, 0], 
                                                 registered_input=out['registered_input_forward'][:, b, 0],
-                                                registered_seg=current_target[None].repeat(len(unlabeled) - 1, 1, 1), #registered_seg,
+                                                registered_seg=current_target,
                                                 target=current_target,
-                                                fixed=unlabeled[1:, b, 0],
+                                                fixed=unlabeled[:-1, b, 0],
                                                 motion_flow=motion_flow)
                     #self.vis.set_up_long_registered_image(seg_dice=seg_dice[b].mean(),
                     #                                      moving=unlabeled[0, b, 0],
                     #                                      registered_input=out['registered_input_forward_long'][b, 0],
                     #                                      fixed=unlabeled[-1, b, 0])
                     
-                    self.vis.set_up_image_seg_sequence(seg_dice=seg_dice[b].mean(), gt=current_target, pred=output_seg_all[:, b], x=unlabeled[:, b, 0])
-                    self.vis.set_up_image_seg_sequence_mask(seg_dice=seg_dice[b].mean(), gt=current_target, pred=output_seg_all_mask[:, b], x=with_mask[:, b, 0])
+                    self.vis.set_up_image_seg_sequence(seg_dice=seg_dice[b].mean(), gt=current_target, pred=output_seg_all[:, b], x=unlabeled[:-1, b, 0])
+                    self.vis.set_up_image_seg_sequence_mask(seg_dice=seg_dice[b].mean(), gt=current_target, pred=output_seg_all_mask[:, b], x=unlabeled[:-1, b, 0])
                     
                     #self.vis.set_up_image_weights(seg_dice=seg_dice[b].mean(), x=current_x, weights=out['weights'][b].mean(0))
                 
@@ -645,7 +631,6 @@ class nnMTLTrainerV2Flow(nnUNetTrainer):
             self.vis.log_best_seg_images(colormap=cmap, norm=norm, epoch=self.epoch)
             self.vis.log_worst_seg_images(colormap=cmap, norm=norm, epoch=self.epoch)
             self.vis.log_gradient_images(colormap=cm.plasma, epoch=self.epoch)
-            self.vis.log_gradient_images_seg(colormap=cm.plasma, epoch=self.epoch)
             #self.vis.log_worst_gradient_images(colormap=cm.plasma, epoch=self.epoch)
             #self.vis.log_long_registered_images(epoch=self.epoch)
             self.vis.log_motion_images(epoch=self.epoch, colormap_seg=cmap, norm=norm)
@@ -717,7 +702,7 @@ class nnMTLTrainerV2Flow(nnUNetTrainer):
 
         return sampling_locations, attention_weights, data, theta_coords
     
-    def run_online_evaluation(self, out, out_mask, unlabeled, with_mask, target, padding_need, labeled_idx):
+    def run_online_evaluation(self, out, out_mask, labeled, unlabeled, target, padding_need, labeled_idx):
         """
         due to deep supervision the return value and the reference are now lists of tensors. We only need the full
         resolution output because this is what we are interested in in the end. The others are ignored
@@ -728,32 +713,21 @@ class nnMTLTrainerV2Flow(nnUNetTrainer):
         gradient_image = None
         gradient_x = None
         coords = None
-        coords_seg = None
         indices_da = None
 
-        if self.deep_supervision:
-            out['forward_flow'] = out['forward_flow'][0]
-            out['backward_flow'] = out['backward_flow'][0]
-            out['seg'] = out['seg'][0]
-
         indices = self.sample_indices(target[None].repeat(self.video_length - 1, 1, 1, 1, 1))
-        indices_seg = self.sample_indices(target[None].repeat(self.video_length, 1, 1, 1, 1))
-        gradient_image_unlabeled, gradient_x_unlabeled = self.get_gradient_images(unlabeled, indices, 'forward_flow')
-        gradient_image_seg, gradient_x_seg = self.get_gradient_images(unlabeled, indices_seg, 'seg')
+        gradient_image_unlabeled, gradient_image_labeled, gradient_x_unlabeled, gradient_x_labeled = self.get_gradient_images(labeled, unlabeled, indices)
         coords = (indices[0], indices[4], indices[3]) # (t, x, y)
-        coords_seg = (indices_seg[0], indices_seg[4], indices_seg[3]) # (t, x, y)
 
         return self.start_online_evaluation(out=out,
                                             out_mask=out_mask,
                                             unlabeled=unlabeled,
-                                            with_mask=with_mask,
                                             target=target,
                                             gradient_image_unlabeled=gradient_image_unlabeled,
+                                            gradient_image_labeled=gradient_image_labeled,
                                             gradient_x_unlabeled=gradient_x_unlabeled,
-                                            gradient_image_seg=gradient_image_seg,
-                                            gradient_x_seg=gradient_x_seg,
+                                            gradient_x_labeled=gradient_x_labeled,
                                             coords=coords,
-                                            coords_seg=coords_seg,
                                             padding_need=padding_need,
                                             labeled_idx=labeled_idx)
 
@@ -771,12 +745,6 @@ class nnMTLTrainerV2Flow(nnUNetTrainer):
                             overwrite=overwrite, validation_folder_name=validation_folder_name,
                             all_in_gpu=all_in_gpu, segmentation_export_kwargs=segmentation_export_kwargs,
                             run_postprocessing_on_folds=run_postprocessing_on_folds, debug=True, output_folder=output_folder, save_flow=True)
-
-        #ret = super().validate_flow_one_step(processor=self.processor, log_function=self.print_to_log_file, step=self.step, do_mirroring=do_mirroring, use_sliding_window=use_sliding_window, step_size=step_size,
-        #                    save_softmax=save_softmax, use_gaussian=use_gaussian,
-        #                    overwrite=overwrite, validation_folder_name=validation_folder_name,
-        #                    all_in_gpu=all_in_gpu, segmentation_export_kwargs=segmentation_export_kwargs,
-        #                    run_postprocessing_on_folds=run_postprocessing_on_folds, debug=True, output_folder=output_folder, save_flow=True)
 
         self.network.do_ds = ds
         return ret
@@ -816,8 +784,37 @@ class nnMTLTrainerV2Flow(nnUNetTrainer):
         target_l = target[tuple_indices[0], tuple_indices[1]]
 
         return output_l, target_l
+    
+    def get_percent_same(self, unlabeled_seg, unlabeled_seg_mask):
+        unlabeled_seg = torch.softmax(unlabeled_seg, dim=2)
+        unlabeled_seg = torch.argmax(unlabeled_seg, dim=2, keepdim=True)
+        unlabeled_seg = torch.nn.functional.one_hot(unlabeled_seg.squeeze(2).long(), num_classes=4).permute(0, 1, 4, 2, 3).float()
+        
+        unlabeled_seg_mask = torch.softmax(unlabeled_seg_mask, dim=2)
+        unlabeled_seg_mask = torch.argmax(unlabeled_seg_mask, dim=2, keepdim=True)
+        unlabeled_seg_mask = torch.nn.functional.one_hot(unlabeled_seg_mask.squeeze(2).long(), num_classes=4).permute(0, 1, 4, 2, 3).float()
+        percent_same = torch.logical_xor(unlabeled_seg_mask, unlabeled_seg).sum() / torch.numel(unlabeled_seg_mask)
 
-    def compute_losses(self, index, unlabeled, out, target, isval):
+        self.writer.add_scalar('Iteration/percent_not_same', percent_same, self.iter_nb)
+
+    def compute_losses(self, index, unlabeled, out, out_mask, target, labeled):
+
+        #matplotlib.use('QtAgg')
+        #fig, ax = plt.subplots(1, len(unlabeled))
+        #for i in range(len(unlabeled)):
+        #    ax[i].imshow(unlabeled[i, 0, 0].cpu(), cmap='gray')
+        #plt.show()
+#
+        #matplotlib.use('QtAgg')
+        #fig, ax = plt.subplots(1, 1)
+        #ax.imshow(labeled[0, 0].cpu(), cmap='gray')
+        #plt.show()
+#
+        #matplotlib.use('QtAgg')
+        #fig, ax = plt.subplots(1, 1)
+        #ax.imshow(target[0, 0].cpu(), cmap='gray')
+        #plt.show()
+
         #regularization_weight = torch.sigmoid(self.network.regularization_loss_weight)
 
         #if not isval:
@@ -889,285 +886,84 @@ class nnMTLTrainerV2Flow(nnUNetTrainer):
         #ax[1].imshow(target.cpu()[0, 0], cmap='gray')
         #plt.show()
 
-        seg_loss_l = self.segmentation_loss(out['seg'][index], target)
-        self.loss_data['segmentation'][1] = seg_loss_l
+        labeled_seg = torch.softmax(out_mask['labeled_seg'], dim=1)
+        labeled_seg = torch.argmax(labeled_seg, dim=1, keepdim=True)
+        seg_loss_l = self.segmentation_loss(out['labeled_seg'], labeled_seg)
+        self.loss_data['labeled_segmentation'][1] = seg_loss_l
 
-        target = target[None].repeat(len(unlabeled) - 1, 1, 1, 1, 1)
+        self.get_percent_same(out['unlabeled_seg'], out_mask['unlabeled_seg'])
 
-        #matplotlib.use('QtAgg')
-        #fig, ax = plt.subplots(3, self.video_length)
-        #for i in range(self.video_length):
-        #    ax[0, i].imshow(unlabeled[0, 0, :, :, i].detach().cpu(), cmap='gray')
-        #    ax[1, i].imshow(out['registered_input_u_to_l'].permute(1, 2, 3, 4, 0)[0, 0, :, :, i].detach().cpu(), cmap='gray')
-        #    ax[2, i].imshow(out['motion_flow_u_to_l'].permute(1, 2, 3, 4, 0)[0, 0, :, :, i].detach().cpu(), cmap='gray')
-        #plt.show()
+        unlabeled_seg = torch.softmax(out_mask['unlabeled_seg'], dim=2)
+        unlabeled_seg = torch.argmax(unlabeled_seg, dim=2, keepdim=True)
 
-        #image_flow_loss_l_to_u = self.image_flow_loss(out['registered_input_l_to_u'].permute(1, 2, 3, 4, 0), unlabeled)
-        #self.loss_data['image_flow'][1] = (image_flow_loss_u_to_l + image_flow_loss_l_to_u) / 2
-        
-        #image_flow_loss_u_to_l = self.image_flow_loss(target=labeled, registered=out['registered_input_u_to_l'].permute(1, 2, 3, 4, 0), flow=out['motion_flow_u_to_l'])
-
-        assert len(out['forward_flow']) == len(out['seg']) - 1
-        assert len(unlabeled) == 1 + len(out['forward_flow'])
-
-        for i in range(len(unlabeled)):
-            cumulated_seg = out['seg'][i]
-            nb_hops = abs(index - i)
-            if i < index:
-                for j in range(nb_hops):
-                    cumulated_seg = self.motion_estimation(flow=out['forward_flow'][i + j], original=cumulated_seg)
-            elif i > index:
-                for j in range(nb_hops):
-                    cumulated_seg = self.motion_estimation(flow=out['backward_flow'][i - 1 - j], original=cumulated_seg)
-            else:
-                continue
-            out['registered_seg'].append(cumulated_seg)
-        out['registered_seg'] = torch.stack(out['registered_seg'], dim=0)
-        assert len(out['registered_seg']) == len(unlabeled) - 1
-
-        cumulated_forward = unlabeled[0]
-        cumulated_backward = unlabeled[-1]
-        for t in range(len(unlabeled) - 1):
-            backward_index = len(out['backward_flow']) - t - 1
-            cumulated_forward = self.motion_estimation(flow=out['forward_flow'][t], original=cumulated_forward)
-            cumulated_backward = self.motion_estimation(flow=out['backward_flow'][backward_index], original=cumulated_backward)
-            registered_input_forward = self.motion_estimation(flow=out['forward_flow'][t], original=unlabeled[t])
-            registered_input_backward = self.motion_estimation(flow=out['backward_flow'][t], original=unlabeled[1 + t])
-
-            registered_consistency_forward = self.motion_estimation(flow=out['forward_flow'][t], original=out['seg'][t])
-            registered_consistency_backward = self.motion_estimation(flow=out['backward_flow'][t], original=out['seg'][1 + t])
-            
-            out['registered_consistency_forward'].append(registered_consistency_forward)
-            out['registered_consistency_backward'].append(registered_consistency_backward)
-            
+        assert len(unlabeled_seg) == len(unlabeled) - 1
+        seg_loss_u_list = []
+        for i in range(len(unlabeled) - 1):
+            registered_input_forward = self.motion_estimation(flow=out['forward_flow'][i], original=labeled)
             out['registered_input_forward'].append(registered_input_forward)
+            registered_input_forward_masked = self.motion_estimation(flow=out_mask['forward_flow'][i], original=labeled)
+            out_mask['registered_input_forward'].append(registered_input_forward_masked)
+
+            registered_input_backward = self.motion_estimation(flow=out['backward_flow'][i], original=unlabeled[i])
             out['registered_input_backward'].append(registered_input_backward)
-        
+            registered_input_backward_masked = self.motion_estimation(flow=out_mask['backward_flow'][i], original=unlabeled[i])
+            out_mask['registered_input_backward'].append(registered_input_backward_masked)
+
+            seg_loss_u = self.segmentation_loss(out['unlabeled_seg'][i], unlabeled_seg[i].detach())
+            seg_loss_u_list.append(seg_loss_u)
+
+        seg_loss_u_list = torch.stack(seg_loss_u_list)
+        self.loss_data['unlabeled_segmentation'][1] = seg_loss_u_list.mean()
+
         out['registered_input_forward'] = torch.stack(out['registered_input_forward'], dim=0)
         out['registered_input_backward'] = torch.stack(out['registered_input_backward'], dim=0)
-        out['registered_consistency_forward'] = torch.stack(out['registered_consistency_forward'], dim=0)
-        out['registered_consistency_backward'] = torch.stack(out['registered_consistency_backward'], dim=0)
-        out['registered_input_forward_long'] = cumulated_forward
-        out['registered_input_backward_long'] = cumulated_backward
+        out_mask['registered_input_forward'] = torch.stack(out_mask['registered_input_forward'], dim=0)
+        out_mask['registered_input_backward'] = torch.stack(out_mask['registered_input_backward'], dim=0)
 
-        self.loss_data['long_forward_image_flow'][1] = self.mse_loss(out['registered_input_forward_long'], unlabeled[-1])
-        self.loss_data['long_backward_image_flow'][1] = self.mse_loss(out['registered_input_backward_long'], unlabeled[0])
+        forward_l = self.image_flow_loss(registered=out['registered_input_forward'], target=unlabeled[:-1], flow=out['forward_flow'])
+        backward_l = self.image_flow_loss(registered=out['registered_input_backward'], target=labeled, flow=out['backward_flow'])
+        #forward_u = self.image_flow_loss(registered=out_mask['registered_input_forward'], target=unlabeled[:-1], flow=out_mask['forward_flow'])
+        #backward_u = self.image_flow_loss(registered=out_mask['registered_input_backward'], target=labeled, flow=out_mask['backward_flow'], iter_nb=self.iter_nb)
+        #self.loss_data['forward_image_flow'][1] = (forward_l + forward_u) / 2
+        self.loss_data['forward_image_flow'][1] = forward_l
+        #self.loss_data['backward_image_flow'][1] = (backward_l + backward_u) / 2
+        self.loss_data['backward_image_flow'][1] = backward_l
 
-        seg_loss_flow = self.segmentation_loss(out['registered_seg'].permute(1, 2, 3, 4, 0), target.permute(1, 2, 3, 4, 0))
-        self.loss_data['segmentation_flow'][1] = seg_loss_flow
-
-        #middle = torch.stack([out['registered_consistency_backward'][1:], out['registered_consistency_forward'][:-1]], dim=0).mean(0)
-        #torch.cat([out['registered_consistency_backward'][0], middle, out['registered_consistency_forward'][-1]], dim=0)
-
-        rcl_list = []
-        for i in range(len(out['seg'])):
-            current_gt = torch.softmax(out['seg'][i], dim=1)
-            current_gt = torch.argmax(current_gt, dim=1, keepdim=True)
-            if i == 0:
-                rcl = self.segmentation_loss(out['registered_consistency_backward'][i], current_gt)
-            elif i == len(out['seg']) - 1:
-                rcl = self.segmentation_loss(out['registered_consistency_forward'][i - 1], current_gt)
-            else:
-                rcl_b = self.segmentation_loss(out['registered_consistency_backward'][i], current_gt)
-                rcl_f = self.segmentation_loss(out['registered_consistency_forward'][i - 1], current_gt)
-                rcl = (rcl_b + rcl_f) / 2
-            rcl_list.append(rcl.view(1,))
-        rcl = torch.cat(rcl_list)
-        self.loss_data['consistency'][1] = rcl.mean()
-
-        forward_flow_loss = self.image_flow_loss(registered=out['registered_input_forward'], target=unlabeled[1:], flow=out['forward_flow'])
-        backward_flow_loss = self.image_flow_loss(registered=out['registered_input_backward'], target=unlabeled[:-1], flow=out['backward_flow'], iter_nb=self.iter_nb)
-        self.loss_data['image_flow'][1] = (forward_flow_loss + backward_flow_loss) / 2
-
-        if self.do_adv:
-            loss_fake, output_fake = self.get_fake_loss(out, label=1, detach=False)
-            self.loss_data['adversarial'][1] = loss_fake.mean()
+        #out['forward_flow'][:-1] - out['forward_flow'][1:]
 
         return out
     
 
-    def compute_losses_ds(self, index, unlabeled, out, target, isval):
-        #regularization_weight = torch.sigmoid(self.network.regularization_loss_weight)
 
-        #if not isval:
-        #    t, b, c, y, x = self.sample_indices(target[None].repeat(self.video_length - 1, 1, 1, 1, 1)) # t, b, c, y, x
-        #    predictions = out['forward_flow'][t, b, c, y, x]
-        #    
-        #    gradients = torch.autograd.grad(
-        #        outputs=predictions,
-        #        inputs=unlabeled,
-        #        #grad_outputs=[torch.ones_like(out['forward_flow'][0, :, :, 0, 0])] * len(li),
-        #        #create_graph=True,
-        #        retain_graph=True,
-        #    )[0]
+    def compute_losses_strong(self, index, unlabeled, out_mask, target, labeled):
+
+        seg_loss_l_masked = self.segmentation_loss(out_mask['labeled_seg'], target)
+
+        self.writer.add_scalar('Iteration/strong_labeled_loss', seg_loss_l_masked, self.iter_nb)
+
+        #seg_loss_u_list = []
+        #for i in range(len(unlabeled) - 1):
+        #    registered_input_forward_masked = self.motion_estimation(flow=out_mask['forward_flow'][i], original=labeled)
+        #    out_mask['registered_input_forward'].append(registered_input_forward_masked)
 #
-        #    gradients = torch.abs(gradients)
+        #    registered_input_backward_masked = self.motion_estimation(flow=out_mask['backward_flow'][i], original=unlabeled[i])
+        #    out_mask['registered_input_backward'].append(registered_input_backward_masked)
 #
-        #    #for i in range(self.video_length):
-        #    #    print(gradients[i].mean())
-        #    #print('**********************************')
+        #seg_loss_u_list = torch.stack(seg_loss_u_list)
+        #self.loss_data['unlabeled_segmentation'][1] = seg_loss_u_list.mean()
 #
-        #    #matplotlib.use('QtAgg')
-        #    #fig, ax = plt.subplots(1, self.video_length)
-        #    #for i in range(self.video_length):
-        #    #    ax[i].imshow(gradients[i, 0, 0].cpu(), cmap='plasma')
-        #    #plt.show()
+        #out_mask['registered_input_forward'] = torch.stack(out_mask['registered_input_forward'], dim=0)
+        #out_mask['registered_input_backward'] = torch.stack(out_mask['registered_input_backward'], dim=0)
 #
-        #    strong = gradients[t:t+2]
-        #    weak = torch.cat([gradients[:t], gradients[t+2:]], dim=0)
-    #
-        #    #matplotlib.use('QtAgg')
-        #    #fig, ax = plt.subplots(1, self.video_length - 2)
-        #    #for i in range(self.video_length - 2):
-        #    #    ax[i].imshow(weak[i, 0, 0].cpu(), cmap='plasma')
-        #    #plt.show()
-#
-        #    strong = strong.permute(1, 2, 0, 3, 4).contiguous()
-        #    weak = weak.permute(1, 2, 0, 3, 4).contiguous()
-        #    strong = torch.flatten(strong, start_dim=-3)
-        #    weak = torch.flatten(weak, start_dim=-3)
-#
-        #    gradient_l = self.gradient_loss(weak.mean(-1), strong.mean(-1))
-        #    self.loss_data['gradient'][1] = gradient_l
-
-
-        #matplotlib.use("QtAgg")
-        #fig, ax = plt.subplots(2, len(output_l))
-        #for i in range(len(output_l)):
-        #    if len(output_l) == 1:
-        #        ax[0].imshow(input_l[0, 0].cpu(), cmap='gray')   
-        #        ax[1].imshow(target_l[0, 0].cpu(), cmap='gray')  
-        #    else:
-        #        ax[0, i].imshow(input_l[i, 0].cpu(), cmap='gray')   
-        #        ax[1, i].imshow(target_l[i, 0].cpu(), cmap='gray')  
-        #plt.show() 
-
-        self.writer.add_scalar('Iteration/flow_magnitude', torch.abs(out['forward_flow'][0]).mean(), self.iter_nb)
-
-        B, C, H, W = target.shape
-
-        #unlabeled = unlabeled.permute(1, 2, 3, 4, 0).contiguous()
-
-        #if gradient_labeled is not None:
-        #    gradient_loss = self.gradient_distance(gradient_labeled, gradient_unlabeled)
-        #    self.loss_data['gradient_distance'][1] = gradient_loss
-
-        #matplotlib.use('QtAgg')
-        #fig, ax = plt.subplots(1, 2)
-        #ax[0].imshow(unlabeled[index].cpu()[0, 0], cmap='gray')
-        #ax[1].imshow(target.cpu()[0, 0], cmap='gray')
-        #plt.show()
-
-        seg_loss_l = []
-        for idx, w in enumerate(self.ds_weights):
-            scale_loss = w * self.segmentation_loss(out['seg'][idx][index], target)
-            seg_loss_l.append(scale_loss.view(1,))
-        self.loss_data['segmentation'][1] = torch.cat(seg_loss_l).mean()
-
-        target = target[None].repeat(len(unlabeled) - 1, 1, 1, 1, 1)
-
-        #matplotlib.use('QtAgg')
-        #fig, ax = plt.subplots(3, self.video_length)
-        #for i in range(self.video_length):
-        #    ax[0, i].imshow(unlabeled[0, 0, :, :, i].detach().cpu(), cmap='gray')
-        #    ax[1, i].imshow(out['registered_input_u_to_l'].permute(1, 2, 3, 4, 0)[0, 0, :, :, i].detach().cpu(), cmap='gray')
-        #    ax[2, i].imshow(out['motion_flow_u_to_l'].permute(1, 2, 3, 4, 0)[0, 0, :, :, i].detach().cpu(), cmap='gray')
-        #plt.show()
-
-        #image_flow_loss_l_to_u = self.image_flow_loss(out['registered_input_l_to_u'].permute(1, 2, 3, 4, 0), unlabeled)
-        #self.loss_data['image_flow'][1] = (image_flow_loss_u_to_l + image_flow_loss_l_to_u) / 2
-        
-        #image_flow_loss_u_to_l = self.image_flow_loss(target=labeled, registered=out['registered_input_u_to_l'].permute(1, 2, 3, 4, 0), flow=out['motion_flow_u_to_l'])
-
-        assert len(out['forward_flow'][0]) == len(out['seg'][0]) - 1
-        assert len(unlabeled) == 1 + len(out['forward_flow'][0])
-
-        #for i in range(len(unlabeled)):
-        #    cumulated_seg = out['seg'][0][i]
-        #    nb_hops = abs(index - i)
-        #    if i < index:
-        #        for j in range(nb_hops):
-        #            cumulated_seg = self.motion_estimation(flow=out['forward_flow'][0][i + j], original=cumulated_seg)
-        #    elif i > index:
-        #        for j in range(nb_hops):
-        #            cumulated_seg = self.motion_estimation(flow=out['backward_flow'][0][i - 1 - j], original=cumulated_seg)
-        #    else:
-        #        continue
-        #    out['registered_seg'].append(cumulated_seg)
-        #out['registered_seg'] = torch.stack(out['registered_seg'], dim=0)
-        #assert len(out['registered_seg']) == len(unlabeled) - 1
-
-        image_loss_list = []
-        for idx, w in enumerate(self.ds_weights):
-            one_scale_list_forward = []
-            one_scale_list_backward = []
-            for t in range(len(unlabeled) - 1):
-                registered_input_forward = self.motion_estimation(flow=out['forward_flow'][idx][t], original=unlabeled[t])
-                registered_input_backward = self.motion_estimation(flow=out['backward_flow'][idx][t], original=unlabeled[1 + t])
-                one_scale_list_forward.append(registered_input_forward)
-                one_scale_list_backward.append(registered_input_backward)
-            one_scale_list_forward = torch.stack(one_scale_list_forward, dim=0)
-            one_scale_list_backward = torch.stack(one_scale_list_backward, dim=0)
-            if idx == 0:
-                out['registered_input_forward'] = one_scale_list_forward
-                out['registered_input_backward'] = one_scale_list_backward
-            forward_flow_loss = self.image_flow_loss(registered=one_scale_list_forward, target=unlabeled[1:], flow=out['forward_flow'][idx])
-            backward_flow_loss = self.image_flow_loss(registered=one_scale_list_backward, target=unlabeled[:-1], flow=out['backward_flow'][idx], iter_nb=self.iter_nb)
-            image_loss = w * ((forward_flow_loss + backward_flow_loss) / 2)
-            image_loss_list.append(image_loss)
-        self.loss_data['image_flow'][1] = torch.cat(image_loss_list).mean()
-
-        #cumulated_forward = unlabeled[0]
-        #cumulated_backward = unlabeled[-1]
-        #for t in range(len(unlabeled) - 1):
-        #    backward_index = len(out['backward_flow'][0]) - t - 1
-        #    cumulated_forward = self.motion_estimation(flow=out['forward_flow'][0][t], original=cumulated_forward)
-        #    cumulated_backward = self.motion_estimation(flow=out['backward_flow'][0][backward_index], original=cumulated_backward)
-#
-        #    registered_consistency_forward = self.motion_estimation(flow=out['forward_flow'][0][t], original=out['seg'][0][t])
-        #    registered_consistency_backward = self.motion_estimation(flow=out['backward_flow'][0][t], original=out['seg'][0][1 + t])
-        #    
-        #    out['registered_consistency_forward'].append(registered_consistency_forward)
-        #    out['registered_consistency_backward'].append(registered_consistency_backward)
-        #    
-        #    out['registered_input_forward'].append(registered_input_forward)
-        #    out['registered_input_backward'].append(registered_input_backward)
         #
-        #out['registered_consistency_forward'] = torch.stack(out['registered_consistency_forward'], dim=0)
-        #out['registered_consistency_backward'] = torch.stack(out['registered_consistency_backward'], dim=0)
-        #out['registered_input_forward_long'] = cumulated_forward
-        #out['registered_input_backward_long'] = cumulated_backward
+        #forward_u = self.image_flow_loss(registered=out_mask['registered_input_forward'], target=unlabeled[:-1], flow=out_mask['forward_flow'])
+        #backward_u = self.image_flow_loss(registered=out_mask['registered_input_backward'], target=labeled, flow=out_mask['backward_flow'], iter_nb=self.iter_nb)
+        #self.loss_data['forward_image_flow'][1] = forward_u
+        #self.loss_data['backward_image_flow'][1] = backward_u
 
-        #self.loss_data['long_forward_image_flow'][1] = self.mse_loss(out['registered_input_forward_long'], unlabeled[-1])
-        #self.loss_data['long_backward_image_flow'][1] = self.mse_loss(out['registered_input_backward_long'], unlabeled[0])
-#
-        #seg_loss_flow = self.segmentation_loss(out['registered_seg'].permute(1, 2, 3, 4, 0), target.permute(1, 2, 3, 4, 0))
-        #self.loss_data['segmentation_flow'][1] = seg_loss_flow
+        #out['forward_flow'][:-1] - out['forward_flow'][1:]
 
-        #middle = torch.stack([out['registered_consistency_backward'][1:], out['registered_consistency_forward'][:-1]], dim=0).mean(0)
-        #torch.cat([out['registered_consistency_backward'][0], middle, out['registered_consistency_forward'][-1]], dim=0)
-
-        #rcl_list = []
-        #for i in range(len(out['seg'][0])):
-        #    current_gt = torch.softmax(out['seg'][0][i], dim=1)
-        #    current_gt = torch.argmax(current_gt, dim=1, keepdim=True)
-        #    if i == 0:
-        #        rcl = self.segmentation_loss(out['registered_consistency_backward'][i], current_gt)
-        #    elif i == len(out['seg'][0]) - 1:
-        #        rcl = self.segmentation_loss(out['registered_consistency_forward'][i - 1], current_gt)
-        #    else:
-        #        rcl_b = self.segmentation_loss(out['registered_consistency_backward'][i], current_gt)
-        #        rcl_f = self.segmentation_loss(out['registered_consistency_forward'][i - 1], current_gt)
-        #        rcl = (rcl_b + rcl_f) / 2
-        #    rcl_list.append(rcl.view(1,))
-        #rcl = torch.cat(rcl_list)
-        #self.loss_data['consistency'][1] = rcl.mean()
-
-        if self.do_adv:
-            loss_fake, output_fake = self.get_fake_loss(out, label=1, detach=False)
-            self.loss_data['adversarial'][1] = loss_fake.mean()
-
-        return out
+        return seg_loss_l_masked
 
 
     def select_deep_supervision(self, x):
@@ -1214,18 +1010,37 @@ class nnMTLTrainerV2Flow(nnUNetTrainer):
 
         #unlabeled.requires_grad = True
 
-        if self.blackout:
-            p = torch.rand(1)
-            if p < 0.5:
-                unlabeled_in = torch.clone(unlabeled)
-                unlabeled_in[data_dict['labeled_idx']] = 0
-            else:
-                unlabeled_in = unlabeled
-        else:
-            unlabeled_in = unlabeled
+        #labeled_idx = data_dict['labeled_idx']
+        #assert labeled_idx == self.video_length - 1
+        #labeled = unlabeled[labeled_idx]
+        #mask = torch.nn.functional.one_hot(target.squeeze(1).long(), num_classes=4).permute(0, 3, 1, 2).float()
+        #padding = torch.zeros_like(mask)[None].repeat(len(unlabeled) - 1, 1, 1, 1, 1)
+        #unlabeled_in = unlabeled[:-1]
+        #unlabeled_in = torch.cat([unlabeled_in, padding], dim=2)
+        #labeled_in = torch.cat([labeled, padding[0]], dim=1)
+        #mask_in = torch.cat([labeled, mask], dim=1)
 
-        out = self.network(unlabeled_in)
+        labeled_idx = data_dict['labeled_idx']
+        labeled = unlabeled[labeled_idx]
+        mask = torch.nn.functional.one_hot(target.squeeze(1).long(), num_classes=4).permute(0, 3, 1, 2).float()
+        padding = torch.zeros_like(mask)[None].repeat(len(unlabeled) - 1, 1, 1, 1, 1)
+        unlabeled_in = torch.cat([unlabeled[:labeled_idx], unlabeled[labeled_idx + 1:]], dim=0)
+        unlabeled_in = torch.cat([unlabeled_in, padding], dim=2)
+        labeled_in = torch.cat([labeled, padding[0]], dim=1)
+        mask_in = torch.cat([labeled, mask], dim=1)
+
+        #matplotlib.use('QtAgg')
+        #fig, ax = plt.subplots(3, 5)
+        #for i in range(5):
+        #    ax[0, i].imshow(labeled_in[0, i].cpu(), cmap='gray')
+        #    ax[1, i].imshow(mask_in[0, i].cpu(), cmap='gray')
+        #    ax[2, i].imshow(unlabeled_in[0, 0, i].cpu(), cmap='gray')
+        #plt.show()
+
+        out = self.weak_network(labeled_in, unlabeled_in)
+        out_mask = self.strong_network(mask_in, unlabeled_in)
         self.optimizer.zero_grad()
+        self.strong_network_optimizer.zero_grad()
 
         #self.log_weights(out['weights'])
 
@@ -1246,10 +1061,7 @@ class nnMTLTrainerV2Flow(nnUNetTrainer):
         #unlabeled = unlabeled.cuda()
         #unlabeled.retain_grad()
 #
-        if not self.deep_supervision:
-            out = self.compute_losses(index=data_dict['labeled_idx'], unlabeled=unlabeled, out=out, target=target, isval=False)
-        else:
-            out = self.compute_losses_ds(index=data_dict['labeled_idx'], unlabeled=unlabeled, out=out, target=target, isval=False)
+        out = self.compute_losses(index=labeled_idx, unlabeled=unlabeled, out=out, out_mask=out_mask, target=target, labeled=labeled)
         l = self.consolidate_only_one_loss_data(self.loss_data, log=True)
 
         #if self.iter_nb > 500:
@@ -1261,21 +1073,18 @@ class nnMTLTrainerV2Flow(nnUNetTrainer):
 
         self.train_loss.append(l.mean().detach().cpu())
         l.mean().backward()
-        torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+        torch.nn.utils.clip_grad_norm_(self.weak_network.parameters(), 12)
         self.optimizer.step()
 
         if self.iter_nb == 0:
-            for param_name, param in self.network.named_parameters():
-                for module_name, module in self.network.named_modules():
+            for param_name, param in self.weak_network.named_parameters():
+                for module_name, module in self.weak_network.named_modules():
                     if list(module.children()) == []:
                         if not isinstance(module, nn.BatchNorm2d) and module_name in param_name:
                             if param.grad is None:
                                 print(param_name)
                                 print(param.is_leaf)
                                 print(param.requires_grad)
-        
-        if self.do_adv:
-            self.train_discriminator(target, out)
         
             #decoder_nb = 0
             #spatio_temporal_nb = 0
@@ -1288,6 +1097,19 @@ class nnMTLTrainerV2Flow(nnUNetTrainer):
             #        spatio_temporal_nb += param.numel()
             #print(f'decoder_nb: {decoder_nb}')
             #print(f'spatio_temporal_nb: {spatio_temporal_nb}')
+
+        l_strong = self.compute_losses_strong(index=labeled_idx, unlabeled=unlabeled, out_mask=out_mask, target=target, labeled=labeled)
+
+        l_strong.mean().backward()
+        torch.nn.utils.clip_grad_norm_(self.strong_network.parameters(), 12)
+        self.strong_network_optimizer.step()
+
+        #if self.iter_nb > 500:
+        #    matplotlib.use('QtAgg')
+        #    fig, ax = plt.subplots(1, 1)
+        #    ax.imshow(out['motion_flow_u_to_l'][0, 0, 0].detach().cpu(), cmap='gray')
+        #    plt.show()
+        #del loss_data
 
         self.iter_nb += 1
 
@@ -1316,38 +1138,37 @@ class nnMTLTrainerV2Flow(nnUNetTrainer):
         #    unlabeled = to_cuda(unlabeled)
         #    target = to_cuda(target)
 
-        if self.blackout:
-            with_mask = torch.clone(unlabeled)
-            with_mask[data_dict['labeled_idx']] = 0
-        else:
-            with_mask = unlabeled
+        labeled_idx = data_dict['labeled_idx']
+        assert labeled_idx == self.video_length - 1
+        labeled = unlabeled[labeled_idx]
+        mask = torch.nn.functional.one_hot(target.squeeze(1).long(), num_classes=4).permute(0, 3, 1, 2).float()
+        padding = torch.zeros_like(mask)[None].repeat(len(unlabeled) - 1, 1, 1, 1, 1)
+        unlabeled_in = unlabeled[:-1]
+        unlabeled_in = torch.cat([unlabeled_in, padding], dim=2)
+        labeled_in = torch.cat([labeled, padding[0]], dim=1)
+        mask_in = torch.cat([labeled, mask], dim=1)
 
-        out = self.network(unlabeled)
-        if self.deep_supervision:
-            out = self.compute_losses_ds(index=data_dict['labeled_idx'], unlabeled=unlabeled, out=out, target=target, isval=True)
-        else:
-            out = self.compute_losses(index=data_dict['labeled_idx'], unlabeled=unlabeled, out=out, target=target, isval=True)
+        #matplotlib.use('QtAgg')
+        #fig, ax = plt.subplots(3, len(unlabeled))
+        #ax[0, 0].imshow(labeled[0, 0].cpu(), cmap='gray')
+        #ax[1, 0].imshow(target[0, 0].cpu(), cmap='gray')
+        #for i in range(len(unlabeled)):
+        #    ax[2, i].imshow(unlabeled[i, 0, 0].cpu(), cmap='gray')
+        #plt.show()
+
+
+        out = self.weak_network(labeled_in, unlabeled_in)
+        out_mask = self.strong_network(mask_in, unlabeled_in)
+        out = self.compute_losses(index=labeled_idx, unlabeled=unlabeled, out=out, out_mask=out_mask, target=target, labeled=labeled)
         l = self.consolidate_only_one_loss_data(self.loss_data, log=False)
         #del loss_data
 
         self.val_loss.append(l.mean().detach().cpu())
 
-        if self.blackout:
-            out_mask = self.network(with_mask)
-        else:
-            out_mask = out
-
-        #matplotlib.use('QtAgg')
-        #fig, ax = plt.subplots(2, len(unlabeled))
-        #for i in range(len(unlabeled)):
-        #    ax[0, i].imshow(unlabeled[i, 0, 0].cpu(), cmap='gray')
-        #    ax[1, i].imshow(with_mask[i, 0, 0].cpu(), cmap='gray')
-        #plt.show()
-
         if self.log_images:
             self.run_online_evaluation(out=out,
                                        out_mask=out_mask,
-                                       with_mask=with_mask,
+                                       labeled=labeled,
                                        unlabeled=unlabeled,
                                        target=target,
                                        padding_need=data_dict['padding_need'],
@@ -1689,23 +1510,18 @@ class nnMTLTrainerV2Flow(nnUNetTrainer):
             ep = self.epoch + 1
             if self.config['scheduler'] == 'cosine':
                 self.lr_scheduler.step()
-                if self.do_adv:
-                    self.discriminator_scheduler.step()
+                self.strong_network_scheduler.step()
             else:
                 self.optimizer.param_groups[0]['lr'] = poly_lr(ep, self.max_num_epochs, self.initial_lr, 0.9)
-                if self.do_adv:
-                    self.discriminator_optimizer.param_groups[0]['lr'] = poly_lr(ep, self.max_num_epochs, self.discriminator_lr, 0.9)
-            if self.do_adv:
-                lrs = {'Flow_lr': self.optimizer.param_groups[0]['lr'], 'Discriminator_lr': self.discriminator_optimizer.param_groups[0]['lr']}
-                self.writer.add_scalars('Epoch/Learning rate', lrs, self.epoch)
-            else:
-                self.writer.add_scalar('Epoch/Learning rate', self.optimizer.param_groups[0]['lr'], self.epoch)
+                self.strong_network_optimizer.param_groups[0]['lr'] = poly_lr(ep, self.max_num_epochs, self.strong_network_lr, 0.9)
+            lrs = {'Flow_lr': self.optimizer.param_groups[0]['lr'], 'Strong_network_lr': self.strong_network_optimizer.param_groups[0]['lr']}
+            self.writer.add_scalars('Epoch/Learning rate', lrs, self.epoch)
+            #self.writer.add_scalar('Epoch/Learning rate', self.optimizer.param_groups[0]['lr'], self.epoch)
         else:
             ep = epoch
             if not self.config['scheduler'] == 'cosine':
                 self.optimizer.param_groups[0]['lr'] = poly_lr(ep, self.max_num_epochs, self.initial_lr, 0.9)
-                if self.do_adv:
-                    self.discriminator_optimizer.param_groups[0]['lr'] = poly_lr(ep, self.max_num_epochs, self.discriminator_lr, 0.9)
+                self.strong_network_optimizer.param_groups[0]['lr'] = poly_lr(ep, self.max_num_epochs, self.strong_network_lr, 0.9)
 
         self.print_to_log_file("lr:", np.round(self.optimizer.param_groups[0]['lr'], decimals=6))
 
@@ -1735,23 +1551,6 @@ class nnMTLTrainerV2Flow(nnUNetTrainer):
                                        "sometimes causes issues such as this one. Momentum has now been reduced to "
                                        "0.95 and network weights have been reinitialized")
         return continue_training
-    
-
-    def maybe_save_checkpoint(self):
-        """
-        Saves a checkpoint every save_ever epochs.
-        :return:
-        """
-        if self.save_intermediate_checkpoints and (self.epoch % self.save_every == (self.save_every - 1)):
-            self.print_to_log_file("saving scheduled checkpoint file...")
-            if not self.save_latest_only:
-                self.save_checkpoint(join(self.output_folder, "model_ep_%03.0d.model" % (self.epoch + 1)))
-                if self.do_adv:
-                    self.save_checkpoint_discriminator(join(self.output_folder, "discriminator_ep_%03.0d.model" % (self.epoch + 1)))
-            self.save_checkpoint(join(self.output_folder, "model_latest.model"))
-            if self.do_adv:
-                self.save_checkpoint_discriminator(join(self.output_folder, "discriminator_latest.model"))
-            self.print_to_log_file("done")
 
     
     def run_training_flow(self):
@@ -1783,12 +1582,12 @@ class nnMTLTrainerV2Flow(nnUNetTrainer):
             train_losses_epoch = []
 
             # train one epoch
-            self.network.train()
-            if self.do_adv:
-                self.discriminator.train()
+            self.weak_network.train()
+            self.strong_network.train()
 
             if self.fine_tuning:
-                self.freeze_batchnorm_layers(self.network)
+                self.freeze_batchnorm_layers(self.weak_network)
+                self.freeze_batchnorm_layers(self.strong_network)
 
             if self.use_progress_bar:
                 with trange(self.num_batches_per_epoch) as tbar:
@@ -1811,7 +1610,8 @@ class nnMTLTrainerV2Flow(nnUNetTrainer):
             if self.epoch % self.config['epoch_log'] == 0:
                 with torch.no_grad():
                     # validation with train=False
-                    self.network.eval()
+                    self.weak_network.eval()
+                    self.strong_network.eval()
                     val_losses = []
                     for b in range(self.num_val_batches_per_epoch):
                         self.epoch_iter_nb = b
@@ -1821,11 +1621,11 @@ class nnMTLTrainerV2Flow(nnUNetTrainer):
                     self.print_to_log_file("validation loss: %.4f" % self.all_val_losses[-1])
 
                     if self.also_val_in_tr_mode:
-                        self.network.train()
-                        if self.do_adv:
-                            self.discriminator.train()
+                        self.weak_network.train()
+                        self.strong_network.train()
                         if self.fine_tuning:
-                            self.freeze_batchnorm_layers(self.network)
+                            self.freeze_batchnorm_layers(self.weak_network)
+                            self.freeze_batchnorm_layers(self.strong_network)
                         # validation with train=True
                         val_losses = []
                         for b in range(self.num_val_batches_per_epoch):
@@ -1836,7 +1636,7 @@ class nnMTLTrainerV2Flow(nnUNetTrainer):
                         self.print_to_log_file("validation loss (train=True): %.4f" % self.all_val_losses_tr_mode[-1])
 
                     self.finish_online_evaluation()
-                    max_memory_allocated = torch.cuda.max_memory_allocated(device=self.network.get_device())
+                    max_memory_allocated = torch.cuda.max_memory_allocated(device=self.weak_network.get_device())
                     self.print_to_log_file("Max GPU Memory allocated:", max_memory_allocated / 10e8, "Gb")
                     self.print_to_log_file("Max CPU Memory allocated:", psutil.Process(os.getpid()).memory_info().rss / 10e8, "Gb")
 
@@ -1860,8 +1660,6 @@ class nnMTLTrainerV2Flow(nnUNetTrainer):
         self.epoch -= 1  # if we don't do this we can get a problem with loading model_final_checkpoint.
 
         if self.save_final_checkpoint: self.save_checkpoint(join(self.output_folder, "model_final_checkpoint.model"))
-        if self.do_adv and self.save_final_checkpoint:
-            self.save_checkpoint_discriminator(join(self.output_folder, "discriminator_final_checkpoint.model"))
         # now we can delete latest as it will be identical with final
         if isfile(join(self.output_folder, "model_latest.model")):
             os.remove(join(self.output_folder, "model_latest.model"))
@@ -1878,11 +1676,12 @@ class nnMTLTrainerV2Flow(nnUNetTrainer):
         """
         self.maybe_update_lr(self.epoch)  # if we dont overwrite epoch then self.epoch+1 is used which is not what we
         # want at the start of the training
-        ds = self.network.do_ds
+        ds = self.weak_network.do_ds
         #self.network.do_ds = True
         self.save_debug_information()
         ret = self.run_training_flow()
-        self.network.do_ds = ds
+        self.weak_network.do_ds = ds
+        self.strong_network.do_ds = ds
         return ret
 
     
@@ -1895,10 +1694,10 @@ class nnMTLTrainerV2Flow(nnUNetTrainer):
         self.do_split()
         dl_un_tr = None
         dl_un_val = None
-        dl_tr = DataLoaderFlowTrain(self.dataset_tr, self.basic_generator_patch_size, self.patch_size, self.batch_size, unlabeled_dataset=self.dataset_un_tr, video_length=self.video_length, step=self.step, force_one_label=self.force_one_label,
+        dl_tr = DataLoaderFlow3(self.dataset_tr, self.basic_generator_patch_size, self.patch_size, self.batch_size, is_val=False, unlabeled_dataset=self.dataset_un_tr, video_length=self.video_length, step=self.step, force_one_label=self.force_one_label,
                                     crop_size=self.crop_size, processor=self.processor, oversample_foreground_percent=self.oversample_foreground_percent,
                                     pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
-        dl_val = DataLoaderFlowTrain(self.dataset_val, self.patch_size, self.patch_size, self.batch_size, unlabeled_dataset=self.dataset_un_val, video_length=self.video_length, step=self.step, force_one_label=self.force_one_label,
+        dl_val = DataLoaderFlow3(self.dataset_val, self.patch_size, self.patch_size, self.batch_size, is_val=True, unlabeled_dataset=self.dataset_un_val, video_length=self.video_length, step=self.step, force_one_label=self.force_one_label,
                                     crop_size=self.crop_size, processor=self.processor, oversample_foreground_percent=self.oversample_foreground_percent,
                                     pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
         return dl_tr, dl_val, dl_un_tr, dl_un_val
@@ -1915,18 +1714,48 @@ class nnMTLTrainerV2Flow(nnUNetTrainer):
         loss_real = self.adv_loss(output_real, label).reshape(1)
         #loss_real.backward()
         return loss_real, output_real
+    
 
-    def get_fake_loss(self, out, label, detach):
-        if self.deep_supervision:
-            one_hot_segs = torch.nn.functional.softmax(out['seg'][0], dim=2)
-        else:
-            one_hot_segs = torch.nn.functional.softmax(out['seg'], dim=2)
+    def get_fake_loss_2(self, out, label, detach):
+        one_hot_segs = torch.nn.functional.softmax(out['seg'], dim=2)
         one_hot_segs = torch.argmax(one_hot_segs, dim=2).long()
         one_hot_segs = torch.nn.functional.one_hot(one_hot_segs, num_classes=4).permute(0, 1, 4, 2, 3).float()
+        video_pred_forward = out['registered_input_forward'].squeeze(2).permute(1, 0, 2, 3).contiguous()
+        video_pred_backward = out['registered_input_backward'].squeeze(2).permute(1, 0, 2, 3).contiguous()
+        middle = torch.stack([video_pred_backward[:, 1:], video_pred_forward[:, :-1]], dim=0).mean(0)
+        video_pred = torch.cat([video_pred_backward[:, 0][:, None], middle, video_pred_forward[:, -1][:, None]], dim=1)
         loss_fake_list = []
         output_fake_list = []
         for i in range(len(one_hot_segs)):
-            fake = one_hot_segs[i]
+            fake = torch.cat([one_hot_segs[i], video_pred], dim=1)
+            if detach:
+                fake = fake.detach()
+            
+            #matplotlib.use('QtAgg')
+            #fig, ax = plt.subplots(1, fake.shape[1])
+            #for i in range(fake.shape[1]):
+            #    ax[i].imshow(fake[0, i].detach().cpu(), cmap='gray')
+            #plt.show()
+
+            loss_fake, output_fake = self.get_discriminator_loss(fake, label=label)
+            loss_fake_list.append(loss_fake)
+            output_fake_list.append(output_fake)
+        loss_fake = torch.cat(loss_fake_list).mean()
+        output_fake = torch.cat(output_fake_list)
+        return loss_fake, output_fake
+
+    def get_fake_loss(self, out, label, detach):
+        one_hot_segs = torch.nn.functional.softmax(out['seg'], dim=2)
+        one_hot_segs = torch.argmax(one_hot_segs, dim=2).long()
+        one_hot_segs = torch.nn.functional.one_hot(one_hot_segs, num_classes=4).permute(0, 1, 4, 2, 3).float()
+        video_pred_forward = out['registered_input_forward'].squeeze(2).permute(1, 0, 2, 3).contiguous()
+        video_pred_backward = out['registered_input_backward'].squeeze(2).permute(1, 0, 2, 3).contiguous()
+        middle = torch.stack([video_pred_backward[:, 1:], video_pred_forward[:, :-1]], dim=0).mean(0)
+        video_pred = torch.cat([video_pred_backward[:, 0][:, None], middle, video_pred_forward[:, -1][:, None]], dim=1)
+        loss_fake_list = []
+        output_fake_list = []
+        for i in range(len(one_hot_segs)):
+            fake = torch.cat([one_hot_segs[i], video_pred], dim=1)
             if detach:
                 fake = fake.detach()
             
@@ -1943,13 +1772,38 @@ class nnMTLTrainerV2Flow(nnUNetTrainer):
         output_fake = torch.cat(output_fake_list)
         return loss_fake, output_fake
     
-    def train_discriminator(self, target, out):
+    def train_discriminator(self, target, video, out):
         self.discriminator.zero_grad()
         self.discriminator_optimizer.zero_grad()
 
         one_hot_target = torch.nn.functional.one_hot(target.squeeze(1).long(), num_classes=4).permute(0, 3, 1, 2).float()
+        video = video.squeeze(2).permute(1, 0, 2, 3).contiguous()
+        real = torch.cat([one_hot_target, video], dim=1)
 
-        loss_real, output_real = self.get_discriminator_loss(one_hot_target, label=1)
+        loss_real, output_real = self.get_discriminator_loss(real, label=1)
+        loss_real.backward()
+
+        loss_fake, output_fake = self.get_fake_loss(out, label=0, detach=True)
+        loss_fake.backward()
+        
+        discriminator_loss = loss_real + loss_fake
+
+        self.writer.add_scalar('Discriminator/Real', output_real.mean(), self.iter_nb)
+        self.writer.add_scalar('Discriminator/Fake', output_fake.mean(), self.iter_nb)
+        self.writer.add_scalar('Discriminator/Loss', discriminator_loss, self.iter_nb)
+
+        self.discriminator_optimizer.step()
+
+    def train_discriminator_2(self, target, video, out):
+        self.discriminator.zero_grad()
+        self.discriminator_optimizer.zero_grad()
+
+        one_hot_target = torch.nn.functional.one_hot(target.squeeze(1).long(), num_classes=4).permute(0, 3, 1, 2).float()
+        one_hot_target.repeat()
+        video = video.squeeze(2).permute(1, 0, 2, 3).contiguous()
+        real = torch.cat([one_hot_target, video], dim=1)
+
+        loss_real, output_real = self.get_discriminator_loss(real, label=1)
         loss_real.backward()
 
         loss_fake, output_fake = self.get_fake_loss(out, label=0, detach=True)

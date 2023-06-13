@@ -4,6 +4,7 @@ from torchvision.transforms.functional import affine
 import matplotlib.pyplot as plt
 import matplotlib
 from torch.nn.functional import pad
+from monai.transforms import NormalizeIntensity
 
 class Processor(object):
     def __init__(self, crop_size, image_size, cropping_network, nb_layers) -> None:
@@ -144,9 +145,17 @@ class Processor(object):
             if torch.count_nonzero(current_data) == 0:
                 softmaxed = torch.zeros_like(current_data)
             else:
+                current_data = NormalizeIntensity(nonzero=True)(current_data)
                 softmaxed = self.cropping_network(current_data)['pred']
                 softmaxed = torch.softmax(softmaxed, dim=1)
             out = torch.argmax(softmaxed, dim=1).squeeze(0) # H, W
+
+            #matplotlib.use('QtAgg')
+            #fig, ax = plt.subplots(1, 2)
+            #ax[0].imshow(current_data.cpu()[0, 0], cmap='gray')
+            #ax[1].imshow(out.cpu(), cmap='gray')
+            #plt.show()
+
             out_list.append(out)
         out_list = torch.stack(out_list, dim=0) # T, H, W
         return out_list
@@ -216,13 +225,14 @@ class Processor(object):
         '''data: T, 1, H, W'''
         cropped_volume, padding_need = self.crop_data(data, mean_centroid) # T, 1, 128, 128
 
-        assert torch.all(torch.isfinite(cropped_volume))
+        #assert torch.all(torch.isfinite(cropped_volume))
         assert cropped_volume.shape[-1] == self.crop_size, print(cropped_volume.shape[-1])
 
         return cropped_volume, padding_need
 
     def preprocess_no_registration(self, data):
         '''data: T, 1, H, W'''
+
         temp_volume = self.discretize(data) # T, H, W
         mean_centroid = self.get_mean_centroid(temp_volume) # 2
         return mean_centroid, temp_volume

@@ -14,7 +14,7 @@ import torch
 import sys
 import torch.nn as nn
 import matplotlib.pyplot as plt
-from ..lib.encoder import Encoder
+from ..lib.encoder import Encoder, Encoder1D
 from ..lib.utils import MLP, MotionEstimation, DeformableTransformer, ConvBlocks, Filter, ConvBlock, GetSeparability, GetCrossSimilarityMatrix, ReplicateChannels, To_image, From_image, rescale, CCA
 from ..lib import swin_transformer_2
 from ..lib import decoder_alt
@@ -29,7 +29,7 @@ from ..lib.vq_vae import VectorQuantizer, VectorQuantizerEMA, VanillaVAE, Quanti
 from torch.cuda.amp import autocast
 from nnunet.utilities.random_stuff import no_op
 from typing import Union, Tuple
-from ..lib.vit_transformer import _get_clones, TransformerDecoder, TransformerFlowEncoder, ModulationTransformer, TransformerFlowDecoder, SpatioTemporalTransformer, SpatialTransformerLayer, SlotTransformer, TransformerEncoderLayer, SlotAttention, CrossTransformerEncoderLayer, CrossRelativeSpatialTransformerLayer
+from ..lib.vit_transformer import _get_clones, TransformerDecoder, TransformerFlowEncoderConv, TransformerFlowEncoder, ModulationTransformer, TransformerFlowDecoder, SpatioTemporalTransformer, SpatialTransformerLayer, SlotTransformer, TransformerEncoderLayer, SlotAttention, CrossTransformerEncoderLayer, CrossRelativeSpatialTransformerLayer
 from batchgenerators.augmentations.utils import pad_nd_image
 from ..training.dataloading.dataset_loading import get_idx, select_idx
 from ..lib.position_embedding import PositionEmbeddingSine2d, PositionEmbeddingSine1d
@@ -90,7 +90,6 @@ class OpticalFlowModel(SegmentationNetwork):
                 norm_1d,
                 norm_2d):
         super(OpticalFlowModel, self).__init__()
-        
         self.num_stages = (len(conv_depth))
         self.num_bottleneck_layers = num_bottleneck_layers
         self.d_model = out_encoder_dims[-1] * 2
@@ -115,16 +114,23 @@ class OpticalFlowModel(SegmentationNetwork):
         dpr_decoder = [x[::-1] for x in dpr_encoder[::-1]]
         dpr_bottleneck = dpr[-1]
 
+        #self.encoder_1d = Encoder1D(conv_layer=conv_layer_1d, norm=norm_1d, conv_depth=conv_depth, dpr=dpr_decoder, out_dims=out_encoder_dims)
+
         self.encoder = Encoder(conv_layer=conv_layer_2d, norm=norm_2d, out_dims=out_encoder_dims, device=device, in_dims=in_dims, conv_depth=conv_depth, dpr=dpr_encoder)
-        in_dims[0] = self.num_classes
+        decoder_in_dims = in_dims[:]
+        decoder_in_dims[0] = self.num_classes
         conv_depth_decoder = conv_depth[::-1]
 
-        self.seg_decoder = decoder_alt.SegmentationDecoder2(dot_multiplier=dot_multiplier, deep_supervision=deep_supervision, conv_depth=conv_depth_decoder, conv_layer=conv_layer_2d, dpr=dpr_decoder, in_encoder_dims=in_dims[::-1], out_encoder_dims=out_encoder_dims[::-1], num_classes=self.num_classes, img_size=image_size, norm=norm_2d)
-        self.flow_decoder = decoder_alt.SegmentationDecoder2(dot_multiplier=dot_multiplier, deep_supervision=deep_supervision, conv_depth=conv_depth_decoder, conv_layer=conv_layer_2d, dpr=dpr_decoder, in_encoder_dims=in_dims[::-1], out_encoder_dims=out_encoder_dims[::-1], num_classes=2, img_size=image_size, norm=norm_2d)
+        self.seg_decoder = decoder_alt.SegmentationDecoder2(dot_multiplier=dot_multiplier, deep_supervision=deep_supervision, conv_depth=conv_depth_decoder, conv_layer=conv_layer_2d, dpr=dpr_decoder, in_encoder_dims=decoder_in_dims[::-1], out_encoder_dims=out_encoder_dims[::-1], num_classes=self.num_classes, img_size=image_size, norm=norm_2d)
+        self.flow_decoder = decoder_alt.SegmentationDecoder2(dot_multiplier=dot_multiplier, deep_supervision=deep_supervision, conv_depth=conv_depth_decoder, conv_layer=conv_layer_2d, dpr=dpr_decoder, in_encoder_dims=decoder_in_dims[::-1], out_encoder_dims=out_encoder_dims[::-1], num_classes=2, img_size=image_size, norm=norm_2d)
 
         H, W = (int(image_size / 2**(self.num_stages)), int(image_size / 2**(self.num_stages)))
         #d_ffn = min(2048, self.d_model * 4)
-        self.transformer_flow_encoder = TransformerFlowEncoder(dim=self.d_model, nhead=self.bottleneck_heads, num_layers=self.nb_layers, nb_tokens=nb_tokens)
+        self.transformer_flow_encoder = TransformerFlowEncoderConv(dim=self.d_model, nhead=self.bottleneck_heads, num_layers=self.nb_layers, nb_tokens=nb_tokens)
+        
+        #for i in range(nb_conv_1d):
+        #    conv_1d = nn.Sequential(nn.Conv1d(in_channels=self.d_model, out_channels=self.d_model, kernel_size=3, padding='same'),
+        #                            )
         
         self.conv_1d = nn.Conv1d(in_channels=self.d_model, out_channels=self.d_model, kernel_size=17, padding='same')
 
@@ -154,6 +160,16 @@ class OpticalFlowModel(SegmentationNetwork):
         output_feature_map = output_feature_map.permute(0, 2, 1).contiguous() # B, C, L
         output_feature_map = memory_bus @ output_feature_map # B, M, L
         return output_feature_map
+
+    def organize_deep_supervision(self, outputs):
+        all_scale_list = []
+        for i in range(self.num_stages):
+            one_scale_list = []
+            for t in range(len(outputs)):
+                one_scale_list.append(outputs[t][i])
+            one_scale_list = torch.stack(one_scale_list, dim=0)
+            all_scale_list.append(one_scale_list)
+        return all_scale_list
 
     def forward(self, unlabeled):
         out = {'seg': None,
@@ -185,6 +201,10 @@ class OpticalFlowModel(SegmentationNetwork):
         unlabeled_feature_list = []
         unlabeled_skip_co_list = []
 
+        #pos_1d = self.encoder_1d(unlabeled)
+        #pos_1d_1 = pos_1d[:, :, :-1]
+        #pos_1d_2 = pos_1d[:, :, 1:]
+
         #matplotlib.use('QtAgg')
         #fig, ax = plt.subplots(1, len(unlabeled))
         #for u in range(len(unlabeled)):
@@ -210,13 +230,13 @@ class OpticalFlowModel(SegmentationNetwork):
 
         T, B, C, H, W = feature_1.shape
 
-        feature_1, feature_2 = self.transformer_flow_encoder(spatial_features_1=feature_1, 
-                                                             spatial_features_2=feature_2,
-                                                             pos_1d_1=pos_1d_1,
-                                                             pos_1d_2=pos_1d_2) # T, B, H*W, C ; T, B, M, C
+        feature_1, feature_2, feature_seg = self.transformer_flow_encoder(spatial_features_1=feature_1, 
+                                                                          spatial_features_2=feature_2,
+                                                                          pos_1d_1=pos_1d_1,
+                                                                          pos_1d_2=pos_1d_2) # T, B, H*W, C ; T, B, M, C
 
-        seg_list_1 = []
-        seg_list_2 = []
+        assert len(feature_seg) - 1 == len(feature_1)
+        seg_list = []
         for t in range(len(feature_1)):
 
             flow_skip_co = []
@@ -227,30 +247,36 @@ class OpticalFlowModel(SegmentationNetwork):
 
             to_decode_feature_1 = feature_1[t] # B, L, C
             to_decode_feature_2 = feature_2[t] # B, L, C
+            to_decode_feature_seg = feature_seg[t] # B, L, C
 
             to_decode_feature_1 = to_decode_feature_1.permute(0, 2, 1).contiguous().view(B, C, H, W)
             to_decode_feature_2 = to_decode_feature_2.permute(0, 2, 1).contiguous().view(B, C, H, W)
+            to_decode_feature_seg = to_decode_feature_seg.permute(0, 2, 1).contiguous().view(B, C, H, W)
 
             flow_1 = self.flow_decoder(to_decode_feature_1, flow_skip_co)
             flow_2 = self.flow_decoder(to_decode_feature_2, flow_skip_co)
-            seg_1 = self.seg_decoder(to_decode_feature_1, feature_1_skip_co[t])
-            seg_2 = self.seg_decoder(to_decode_feature_2, feature_2_skip_co[t])
+            seg = self.seg_decoder(to_decode_feature_seg, unlabeled_skip_co_list[t])
 
-            seg_list_1.append(seg_1)
-            seg_list_2.append(seg_2)
+            seg_list.append(seg)
             out['forward_flow'].append(flow_1)
             out['backward_flow'].append(flow_2)
         
+        to_decode_feature_seg = feature_seg[-1] # B, L, C
+        to_decode_feature_seg = to_decode_feature_seg.permute(0, 2, 1).contiguous().view(B, C, H, W)
+        seg = self.seg_decoder(to_decode_feature_seg, unlabeled_skip_co_list[-1])
+        seg_list.append(seg)
 
-        seg_1 = torch.stack(seg_list_1, dim=0)
-        seg_2 = torch.stack(seg_list_2, dim=0)
+        out['seg'] = self.organize_deep_supervision(seg_list)
+        out['forward_flow'] = self.organize_deep_supervision(out['forward_flow'])
+        out['backward_flow'] = self.organize_deep_supervision(out['backward_flow'])
 
-        middle = torch.stack([seg_1[1:], seg_2[:-1]], dim=0).mean(0)
-        seg = torch.cat([seg_1[0][None], middle, seg_2[-1][None]], dim=0)
+        if not self.do_ds:
+            out['seg'] = out['seg'][0]
+            out['forward_flow'] = out['forward_flow'][0]
+            out['backward_flow'] = out['backward_flow'][0]
 
-        out['seg'] = seg
-        out['forward_flow'] = torch.stack(out['forward_flow'], dim=0)
-        out['backward_flow'] = torch.stack(out['backward_flow'], dim=0)
+        #middle = torch.stack([seg_1[1:], seg_2[:-1]], dim=0).mean(0)
+        #seg = torch.cat([seg_1[0][None], middle, seg_2[-1][None]], dim=0)
 
         return out
     
@@ -338,7 +364,6 @@ class OpticalFlowModel(SegmentationNetwork):
                                                                pad_border_mode, pad_kwargs, all_in_gpu, False)
 
         return res
-
 
     def _internal_maybe_mirror_and_pred_2D(self, unlabeled, processor, mirror_axes: tuple,
                                            do_mirroring: bool = True) -> torch.tensor:
@@ -459,12 +484,8 @@ class OpticalFlowModel(SegmentationNetwork):
                 result_torch_seg += 1 / num_results * torch.flip(seg_pred, (4, 3))
                 #result_torch_flow += 1 / num_results * torch.flip(flow_pred, (4, 3))
 
-        result_torch_seg = result_torch_seg.permute(1, 0, 2, 3, 4).contiguous()
-        result_torch_flow = result_torch_flow.permute(1, 0, 2, 3, 4).contiguous()
         result_torch_seg = processor.uncrop_no_registration(result_torch_seg, padding_need)
         result_torch_flow = processor.uncrop_no_registration(result_torch_flow, padding_need)
-        result_torch_seg = result_torch_seg.permute(1, 0, 2, 3, 4).contiguous()
-        result_torch_flow = result_torch_flow.permute(1, 0, 2, 3, 4).contiguous()
         
         #matplotlib.use('QtAgg')
         #fig, ax = plt.subplots(1, 1)

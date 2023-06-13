@@ -7,12 +7,13 @@ import os
 from timm.models.layers import trunc_normal_
 from . import swin_transformer_3d
 from .vit_transformer import SlotAttention, SpatioTemporalTransformer, TransformerEncoderLayer
-from .utils import TransformerDecoderBlock, ConvDecoderDeformableAttentionIdentity, DeformableAttention, SkipCoDeformableAttention, SpatialTransformerNetwork, CCA, ReplicateChannels, ConvBlock, GetCrossSimilarityMatrix, SelFuseFeature, DeepSupervision3D, CCA3D, ConvLayer3D, From_image3D, From_image, To_image, To_image3D, DeepSupervision, PatchExpand, concat_merge_linear_rescale, concat_merge_conv_rescale, concat_merge_linear, PatchExpandSwin3D, PatchExpandConv3D
+from .utils import TransformerDecoderBlock, ConvDecoderDeformableAttentionIdentity, DeformableAttention, SkipCoDeformableAttention, SpatialTransformerNetwork, CCA, ReplicateChannels, ConvBlock, GetCrossSimilarityMatrix, SelFuseFeature, From_image, To_image, DeepSupervision, PatchExpand, concat_merge_linear_rescale, concat_merge_conv_rescale, concat_merge_linear
 from . import swin_transformer_2
 from . import swin_cross_attention
 import matplotlib.pyplot as plt
 #from .swin_cross_attention_2 import SwinFilterBlock, SwinFilterBlockIdentity
 from .swin_cross_attention import SwinFilterBlock, SwinFilterBlockIdentity
+from . import swin_cross_attention_old
 from torch.nn.functional import grid_sample
 from torchvision.transforms.functional import gaussian_blur
 from torch.nn.functional import interpolate
@@ -655,7 +656,7 @@ class SegmentationDecoder(nn.Module):
                                                                 norm=norm,
                                                                 depth=2)
 
-                #encoder_skip_connection_handler = SwinFilterBlock(in_dim=out_encoder_dims[i_layer], 
+                #encoder_skip_connection_handler = swin_cross_attention_old.SwinFilterBlock(in_dim=out_encoder_dims[i_layer], 
                 #                                                out_dim=out_encoder_dims[i_layer],
                 #                                                input_resolution=input_resolution,
                 #                                                num_heads=spatial_cross_attention_num_heads[i_layer],
@@ -717,6 +718,7 @@ class SegmentationDecoder(nn.Module):
 
     def forward(self, x, encoder_skip_connections):
         output_list = []
+        vis = None
 
         #x = self.norm(x)
         for i, (layer_up,
@@ -737,6 +739,7 @@ class SegmentationDecoder(nn.Module):
             if encoder_skip_connection is not None:
                 if self.filter_skip_co_segmentation:
                     encoder_skip_connection = encoder_skip_layer(x, encoder_skip_connection)
+                    #encoder_skip_connection, vis = encoder_skip_layer(x, encoder_skip_connection)
                 x = torch.cat((encoder_skip_connection, x), dim=1)
             x = resizer_layer(x)
             x = layer_up(x)
@@ -766,6 +769,7 @@ class SegmentationDecoder(nn.Module):
         output_list = output_list[::-1]
 
         return output_list
+        #return output_list, vis
 
 
 class SegmentationDecoder2(nn.Module):
@@ -804,6 +808,8 @@ class SegmentationDecoder2(nn.Module):
                 img_size,
                 norm,
                 deep_supervision,
+                dot_multiplier,
+                skip_co=True,
                 last_activation='identity',
                 **kwargs):
         super().__init__()
@@ -812,19 +818,31 @@ class SegmentationDecoder2(nn.Module):
         self.img_size = img_size
         self.num_classes = num_classes
         self.deep_supervision = deep_supervision
+        self.skip_co = skip_co
+        self.dot_multiplier = dot_multiplier
+        self.deep_supervision = deep_supervision
         
         # build decoder layers
         self.layers = nn.ModuleList()
         self.upsample_layers = nn.ModuleList()
+        self.deep_supervision_layers = nn.ModuleList()
 
         for i_layer in range(self.num_stages):
             in_dim = out_encoder_dims[i_layer] * 2 if i_layer == 0 else in_encoder_dims[i_layer - 1]
 
             upsample_layer = PatchExpand(norm=norm, in_dim=in_dim, out_dim=out_encoder_dims[i_layer], swin_abs_pos=False)
 
-            #out_dim = out_encoder_dims[i_layer] * 2 if i_layer == self.num_stages - 1 else in_encoder_dims[i_layer]
-            out_dim = out_encoder_dims[i_layer] if i_layer == self.num_stages - 1 else in_encoder_dims[i_layer]
-            layer_up = conv_layer(in_dim=out_encoder_dims[i_layer] * 2, 
+            deep_supervision_layer = nn.Identity()
+            if deep_supervision and i_layer < self.num_stages - 1:
+                deep_supervision_layer = nn.ConvTranspose2d(in_channels=in_encoder_dims[i_layer],
+                                                            out_channels=self.num_classes,
+                                                            stride=2**(self.num_stages - (i_layer + 1)),
+                                                            kernel_size=2**(self.num_stages - (i_layer + 1)))
+
+            #out_dim = out_encoder_dims[i_layer] * self.dot_multiplier if i_layer == self.num_stages - 1 else in_encoder_dims[i_layer]
+            out_dim = num_classes if i_layer == self.num_stages - 1 else in_encoder_dims[i_layer]
+            in_dim = out_encoder_dims[i_layer] * self.dot_multiplier if skip_co else out_encoder_dims[i_layer]
+            layer_up = conv_layer(in_dim=in_dim, 
                             out_dim=out_dim,
                             nb_blocks=conv_depth[i_layer], 
                             kernel_size=3,
@@ -832,15 +850,7 @@ class SegmentationDecoder2(nn.Module):
                             norm=norm)
             self.layers.append(layer_up)
             self.upsample_layers.append(upsample_layer)
-
-        #self.norm = nn.LayerNorm(out_encoder_dims[0] * 2)
-        #self.norm_up = norm_layer(self.embed_dim)
-        if last_activation == 'sigmoid':
-            self.last_activation = torch.nn.Sigmoid()
-        elif last_activation == 'softmax':
-            self.last_activation = torch.nn.Softmax(dim=1)
-        elif last_activation == 'identity':
-            self.last_activation = nn.Identity()
+            self.deep_supervision_layers.append(deep_supervision_layer)
     
 
     def forward(self, x, encoder_skip_connections):
@@ -849,19 +859,22 @@ class SegmentationDecoder2(nn.Module):
         for i, (layer_up,
                 upsample_layer,
                 encoder_skip_connection,
+                deep_supervision_layer,
                 ) in enumerate(zip(
                     self.layers,
                     self.upsample_layers,
-                    reversed(encoder_skip_connections)
+                    reversed(encoder_skip_connections),
+                    self.deep_supervision_layers
                     )):
             x = upsample_layer(x)
-            x = torch.cat((encoder_skip_connection, x), dim=1)
+            if self.skip_co:
+                x = torch.cat((encoder_skip_connection, x), dim=1)
             x = layer_up(x)
-            out.append(x)
+            out.append(deep_supervision_layer(x))
 
         out = out[::-1]
-        if not self.deep_supervision:
-            out = out[0]
+        #if not self.deep_supervision:
+        #    out = out[0]
         return out
 
 

@@ -432,6 +432,71 @@ class Encoder(nn.Module):
         return x, skip_connections
     
 
+
+class Encoder1D(nn.Module):
+    r""" Swin Transformer
+        A PyTorch impl of : `Swin Transformer: Hierarchical Vision Transformer using Shifted Windows`  -
+          https://arxiv.org/pdf/2103.14030
+
+    Args:
+        img_size (int | tuple(int)): Input image size. Default 224
+        patch_size (int | tuple(int)): Patch size. Default: 4
+        in_chans (int): Number of input image channels. Default: 3
+        num_classes (int): Number of classes for classification head. Default: 1000
+        embed_dim (int): Patch embedding dimension. Default: 96
+        depths (tuple(int)): Depth of each Swin Transformer layer.
+        num_heads (tuple(int)): Number of attention heads in different layers.
+        window_size (int): Window size. Default: 7
+        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim. Default: 4
+        qkv_bias (bool): If True, add a learnable bias to query, key, value. Default: True
+        qk_scale (float): Override default qk scale of head_dim ** -0.5 if set. Default: None
+        drop_rate (float): Dropout rate. Default: 0
+        attn_drop_rate (float): Attention dropout rate. Default: 0
+        drop_path_rate (float): Stochastic depth rate. Default: 0.1
+        norm_layer (nn.Module): Normalization layer. Default: nn.LayerNorm.
+        ape (bool): If True, add absolute position embedding to the patch embedding. Default: False
+        patch_norm (bool): If True, add normalization after patch embedding. Default: True
+        use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False
+    """
+
+    def __init__(self, conv_layer, norm, conv_depth, dpr, out_dims):
+        super().__init__()
+
+        self.num_stages = len(conv_depth)
+        in_dims = out_dims
+        in_dims[0] = 1
+        out_dims = [2*x for x in out_dims]
+        out_dims[0] = in_dims[1]
+
+        self.conv_1d = nn.Sequential(nn.Conv1d(in_channels=out_dims[-1], out_channels=out_dims[-1], kernel_size=3, padding=1),
+                                    nn.BatchNorm1d(out_dims[-1]))
+
+        # build encoder layers
+        self.layers = nn.ModuleList()
+        for i_layer in range(self.num_stages):
+            layer = conv_layer(in_dim=in_dims[i_layer],
+                                kernel_size=3,
+                                out_dim=out_dims[i_layer],
+                                nb_blocks=conv_depth[i_layer], 
+                                dpr=dpr[i_layer],
+                                norm=norm)
+            self.layers.append(layer)
+
+        #self.norm = norm_layer(self.num_features)
+        #self.norm_after_conv = norm_layer(embed_dim)
+
+    def forward(self, x):
+        x = torch.flatten(x, start_dim=-2).mean(-1) # T, B, 1
+        x = x.permute(1, 2, 0).contiguous()
+
+        for layer in self.layers:
+            x = layer(x)
+        
+        x = self.conv_1d(x)
+        
+        return x
+    
+
 class Encoder3D(nn.Module):
     r""" Swin Transformer
         A PyTorch impl of : `Swin Transformer: Hierarchical Vision Transformer using Shifted Windows`  -

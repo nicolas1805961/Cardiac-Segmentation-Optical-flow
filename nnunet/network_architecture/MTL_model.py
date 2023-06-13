@@ -5,6 +5,7 @@
 # Written by Ze Liu
 # --------------------------------------------------------
 
+from monai.transforms import NormalizeIntensity
 import psutil
 import os
 from nnunet.analysis import flop_count_operators
@@ -35,6 +36,15 @@ from batchgenerators.augmentations.utils import pad_nd_image
 from ..training.dataloading.dataset_loading import get_idx, select_idx
 from ..lib.position_embedding import PositionEmbeddingSine2d, PositionEmbeddingLearned
 from torch.nn import init
+import random
+import string
+
+
+def get_random_string(length):
+    # choose from all lowercase letter
+    letters = string.ascii_lowercase
+    result_str = ''.join(random.choice(letters) for i in range(length))
+    return result_str
 
 class ModelWrap(SegmentationNetwork):
     def __init__(self, model1, model2, do_ds):
@@ -437,6 +447,22 @@ class MTLmodel(SegmentationNetwork):
             x_encoded = self.extra_bottleneck_block_2(x_encoded)
 
             seg = self.decoder(x_encoded, encoder_skip_connections)
+            #seg, vis = self.decoder(x_encoded, encoder_skip_connections)
+
+            #matplotlib.use('QtAgg')
+            #print('ooook')
+            #fig, ax = plt.subplots(1, 3, figsize=(16.0, 9.0))
+            #ax[0].imshow(x.cpu()[0, 0], cmap='gray')
+            #ax[1].imshow(vis[0], cmap='plasma', vmin=vis[0].min(), vmax=vis[0].max())
+            #ax[2].imshow(vis[1], cmap='plasma', vmin=vis[1].min(), vmax=vis[1].max())
+            #ax[0].set_axis_off()
+            #ax[1].set_axis_off()
+            #ax[2].set_axis_off()
+            #plt.subplots_adjust(wspace=0.05, hspace=0.05, top=0.95, bottom=0.05, left=0.05, right=0.95)
+            #plt.show()
+            #fig.savefig(os.path.join('visualization_sfb_2', get_random_string(10) + '.png'), transparent=True, dpi=100)
+            ##plt.waitforbuttonpress()
+            #plt.close(fig)
             
             if not self.do_ds:
                 seg = seg[0]
@@ -534,7 +560,7 @@ class MTLmodel(SegmentationNetwork):
                    step_size: float = 0.5, patch_size: Tuple[int, ...] = None, regions_class_order: Tuple[int, ...] = None,
                    use_gaussian: bool = False, pad_border_mode: str = "constant",
                    pad_kwargs: dict = None, all_in_gpu: bool = False,
-                   verbose: bool = True, mixed_precision: bool = True, get_flops=False) -> Tuple[np.ndarray, np.ndarray]:
+                   verbose: bool = True, mixed_precision: bool = True, get_flops=False, binary=False) -> Tuple[np.ndarray, np.ndarray]:
         """
         Use this function to predict a 3D image. It does not matter whether the network is a 2D or 3D U-Net, it will
         detect that automatically and run the appropriate code.
@@ -619,7 +645,7 @@ class MTLmodel(SegmentationNetwork):
                         else:
                             res = self._internal_predict_3D_2Dconv_tiled(x, patch_size, do_mirroring, mirror_axes, step_size,
                                                                         regions_class_order, use_gaussian, pad_border_mode,
-                                                                        pad_kwargs, all_in_gpu, False, get_flops=get_flops)
+                                                                        pad_kwargs, all_in_gpu, False, get_flops=get_flops, binary=binary)
                     else:
                         res = self._internal_predict_3D_2Dconv(x, patch_size, do_mirroring, mirror_axes, regions_class_order,
                                                                pad_border_mode, pad_kwargs, all_in_gpu, False)
@@ -788,13 +814,15 @@ class MTLmodel(SegmentationNetwork):
 
     def _internal_maybe_mirror_and_pred_2D(self, x: Union[np.ndarray, torch.tensor], mirror_axes: tuple,
                                             get_time_stats=False,
-                                           do_mirroring: bool = True,
-                                           mult: np.ndarray or torch.tensor = None):
+                                            binary=False,
+                                            do_mirroring: bool = True,
+                                            mult: np.ndarray or torch.tensor = None):
         # if cuda available:
         #   everything in here takes place on the GPU. If x and mult are not yet on GPU this will be taken care of here
         #   we now return a cuda tensor! Not numpy array!
 
         assert len(x.shape) == 4, 'x must be (b, c, x, y)'
+        out_flop = inference_time = None
 
         x = maybe_to_torch(x)
         result_torch = torch.zeros([x.shape[0], self.num_classes] + list(x.shape[2:]), dtype=torch.float)
@@ -825,8 +853,10 @@ class MTLmodel(SegmentationNetwork):
             end.record()
             torch.cuda.synchronize()
             inference_time = start.elapsed_time(end)
-        else:
-            out_flop = inference_time = None
+
+        if binary:
+            assert x.shape[0] == 1
+            x[0] = NormalizeIntensity(nonzero=True)(x[0])
 
         for m in range(mirror_idx):
             if m == 0:

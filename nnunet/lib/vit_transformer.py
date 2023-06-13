@@ -858,6 +858,57 @@ class TransformerFlowDecoder(nn.Module):
             out_list.append(query)
 
         return out_list[::-1]
+
+
+class TransformerFlowLayerContext(nn.Module):
+
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.0,
+                 activation="relu", normalize_before=False):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.cross_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.context_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        # Implementation of Feedforward model
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+        self.norm4 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+        self.dropout4 = nn.Dropout(dropout)
+
+        self.activation = nn.GELU()
+        self.normalize_before = normalize_before
+
+    def with_pos_embed(self, tensor, pos: Optional[Tensor]):
+        return tensor if pos is None else tensor + pos
+
+    def forward_post(self, myself, other, context, pos):
+        q = k = self.with_pos_embed(myself, pos)
+        tgt2 = self.self_attn(q, k, value=myself)[0]
+        myself = myself + self.dropout1(tgt2)
+        myself = self.norm1(myself)
+
+        tgt2 = self.cross_attn(query=self.with_pos_embed(myself, pos), key=self.with_pos_embed(other, pos), value=other)[0]
+        myself = myself + self.dropout2(tgt2)
+        myself = self.norm2(myself)
+
+        tgt2 = self.context_attn(query=self.with_pos_embed(myself, pos), key=self.with_pos_embed(context, pos), value=context)[0]
+        myself = myself + self.dropout3(tgt2)
+        myself = self.norm3(myself)
+
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(myself))))
+        myself = myself + self.dropout4(tgt2)
+        myself = self.norm4(myself)
+        return myself
+
+    def forward(self, myself, other, context, pos):
+        return self.forward_post(myself, other, context, pos)
     
 
 class TransformerFlowLayer(nn.Module):
@@ -885,13 +936,13 @@ class TransformerFlowLayer(nn.Module):
     def with_pos_embed(self, tensor, pos: Optional[Tensor]):
         return tensor if pos is None else tensor + pos
 
-    def forward_post(self, myself, other, pos):
-        q = k = self.with_pos_embed(myself, pos)
+    def forward_post(self, myself, other, sa_query_pos, ca_query_pos, key_pos):
+        q = k = self.with_pos_embed(myself, sa_query_pos)
         tgt2 = self.self_attn(q, k, value=myself)[0]
         myself = myself + self.dropout1(tgt2)
         myself = self.norm1(myself)
 
-        tgt2 = self.cross_attn(query=self.with_pos_embed(myself, pos), key=self.with_pos_embed(other, pos), value=other)[0]
+        tgt2 = self.cross_attn(query=self.with_pos_embed(myself, ca_query_pos), key=self.with_pos_embed(other, key_pos), value=other)[0]
         myself = myself + self.dropout2(tgt2)
         myself = self.norm2(myself)
 
@@ -900,13 +951,15 @@ class TransformerFlowLayer(nn.Module):
         myself = self.norm3(myself)
         return myself
 
-    def forward(self, myself, other, pos):
-        return self.forward_post(myself, other, pos)
+    def forward(self, myself, other, sa_query_pos, ca_query_pos, key_pos):
+        return self.forward_post(myself, other, sa_query_pos, ca_query_pos, key_pos)
+    
 
-
-class TransformerFlowEncoder(nn.Module):
-    def __init__(self, dim, nhead, num_layers, video_length):
+class TransformerFlowEncoder3(nn.Module):
+    def __init__(self, dim, nhead, num_layers, video_length, nb_tokens):
         super().__init__()
+
+        self.nb_tokens = nb_tokens
 
         spatial_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
         self.spatial_layers = _get_clones(spatial_layer, num_layers)
@@ -915,82 +968,821 @@ class TransformerFlowEncoder(nn.Module):
         self.temporal_layers = _get_clones(temporal_layer, num_layers)
 
         self.pos_obj_2d = PositionEmbeddingSine2d(num_pos_feats=dim // 2, normalize=True)
-        self.pos_obj_1d = PositionEmbeddingSine1d(num_pos_feats=dim, normalize=True)
+        #self.pos_obj_1d = PositionEmbeddingSine1d(num_pos_feats=dim, normalize=True)
 
-        self.token_pos = nn.Parameter(torch.randn(6, dim))
-        self.temporal_tokens = nn.Parameter(torch.randn(6 * video_length, dim))
+        self.unlabeled_pos_1d = nn.Parameter(torch.randn(video_length - 1, dim))
+        self.labeled_pos_1d = nn.Parameter(torch.randn(1, dim))
+
+        self.token_pos = nn.Parameter(torch.randn(self.nb_tokens, dim))
+        self.unlabeled_temporal_tokens = nn.Parameter(torch.randn(video_length - 1, self.nb_tokens, dim))
+        self.labeled_temporal_tokens = nn.Parameter(torch.randn(1, self.nb_tokens, dim))
     
     
     def forward(self, labeled_spatial_features, unlabeled_spatial_features):
         '''labeled_spatial_features: B, C, H, W
-            unlabeled_spatial_features: T, B, C, H, W'''
+            unlabeled_spatial_features: T-1, B, C, H, W'''
         
         shape = unlabeled_spatial_features.shape
         T, B, C, H, W = shape
 
-        labeled_spatial_features = labeled_spatial_features[None, :, :, :, :].repeat(T, 1, 1, 1, 1)
+        labeled_spatial_features = labeled_spatial_features[None].repeat(len(unlabeled_spatial_features), 1, 1, 1, 1)
         labeled_spatial_features = labeled_spatial_features.permute(0, 1, 3, 4, 2).contiguous() # T, B, H, W, C
-        labeled_spatial_features = labeled_spatial_features.view(T * B, H * W, C)
+        labeled_spatial_features = labeled_spatial_features.view(T, B, H * W, C).view(T * B, H * W, C)
 
         unlabeled_spatial_features = unlabeled_spatial_features.permute(0, 1, 3, 4, 2).contiguous() # T, B, H, W, C
-        unlabeled_spatial_features = unlabeled_spatial_features.view(T * B, H * W, C)
+        unlabeled_spatial_features = unlabeled_spatial_features.view(T, B, H * W, C).view(T * B, H * W, C)
 
         pos_2d = self.pos_obj_2d(shape_util=(B, H, W), device=labeled_spatial_features.device)
         pos_2d = pos_2d.permute(0, 2, 3, 1).contiguous()
         pos_2d = pos_2d.view(B, H * W, C).repeat(T, 1, 1)
 
-        pos_1d = self.pos_obj_1d(shape_util=(B, T), device=labeled_spatial_features.device) # B, C, T
-        pos_1d = pos_1d.permute(0, 2, 1).contiguous() # B, T, C
-        pos_1d = pos_1d.repeat(6, 2, 1) # B * 6, T * 2, C
-        token_pos = self.token_pos[None, :, :].repeat(T * B, 1, 1)
+        unlabeled_pos_1d = self.unlabeled_pos_1d[None, :, None, :].repeat(B, 1, self.nb_tokens, 1).view(B, T * self.nb_tokens, C)
+        labeled_pos_1d = self.labeled_pos_1d[None, :, None, :].repeat(B, T, self.nb_tokens, 1).view(B, T * self.nb_tokens, C)
 
-        temporal_tokens = self.temporal_tokens[None, :, :].repeat(B, 1, 1).view(T * B, 6, C)
-        labeled_token_features = temporal_tokens
-        unlabeled_token_features = temporal_tokens
+        unlabeled_temporal_features = self.unlabeled_temporal_tokens[None].repeat(B, 1, 1, 1).view(B, T * self.nb_tokens, C)
+        labeled_temporal_features = self.labeled_temporal_tokens[None].repeat(B, T, 1, 1).view(B, T * self.nb_tokens, C)
 
-        pos = torch.cat([pos_2d, token_pos], dim=1)
+        token_pos = self.token_pos[None].repeat(T * B, 1, 1) # T*B, M, C
+        spatial_pos = torch.cat([pos_2d, token_pos], dim=1)
+
+        token_pos = self.token_pos[None, None].repeat(B, T, 1, 1).view(B, T * self.nb_tokens, C)
+
+        labeled_temporal_pos = labeled_pos_1d + token_pos
+        unlabeled_temporal_pos = unlabeled_pos_1d + token_pos
+        temporal_pos = torch.cat([labeled_temporal_pos, unlabeled_temporal_pos], dim=1)
 
         for spatial_layer, temporal_layer in zip(self.spatial_layers, self.temporal_layers):
-            labeled = torch.cat([labeled_spatial_features, labeled_token_features], dim=1)
-            unlabeled = torch.cat([unlabeled_spatial_features, unlabeled_token_features], dim=1)
+            #temporal_features = torch.cat([labeled_temporal_features, unlabeled_temporal_features], dim=1)
+            #temporal_features = temporal_layer(temporal_features, pos=temporal_pos)[0]
+#
+            #labeled_temporal_features = temporal_features[:, :T*self.nb_tokens]
+            #unlabeled_temporal_features = temporal_features[:, T*self.nb_tokens:]
+#
+            #labeled_temporal_features = labeled_temporal_features.permute(1, 0, 2).contiguous() # T*M, B, C
+            #unlabeled_temporal_features = unlabeled_temporal_features.permute(1, 0, 2).contiguous() # T*M, B, C
+#
+            #labeled_temporal_features = labeled_temporal_features.view(T, self.nb_tokens, B, C)
+            #unlabeled_temporal_features = unlabeled_temporal_features.view(T, self.nb_tokens, B, C)
+#
+            #labeled_temporal_features = labeled_temporal_features.permute(0, 2, 1, 3).contiguous() # T, B, M, C
+            #unlabeled_temporal_features = unlabeled_temporal_features.permute(0, 2, 1, 3).contiguous() # T, B, M, C
+#
+            #labeled_temporal_features = labeled_temporal_features.view(T*B, self.nb_tokens, C)
+            #unlabeled_temporal_features = unlabeled_temporal_features.view(T*B, self.nb_tokens, C)
+#
+            #labeled_feature = torch.cat([labeled_spatial_features, labeled_temporal_features], dim=1)
+            #unlabeled_feature = torch.cat([unlabeled_spatial_features, unlabeled_temporal_features], dim=1)
 
-            labeled = spatial_layer(labeled, unlabeled, pos)
-            unlabeled = spatial_layer(unlabeled, labeled, pos)
+            #labeled_feature = spatial_layer(labeled_feature, unlabeled_feature, spatial_pos)
+            #unlabeled_feature = spatial_layer(unlabeled_feature, labeled_feature, spatial_pos)
 
-            labeled_spatial_features = labeled[:, :-6]
-            labeled_token_features = labeled[:, -6:] # T * B, 6, C
-            labeled_token_features = labeled_token_features.view(T, B, 6, C)
-            labeled_token_features = labeled_token_features.permute(1, 2, 0, 3).contiguous() # B, 6, T, C
+            labeled_spatial_features = spatial_layer(labeled_spatial_features, unlabeled_spatial_features, pos_2d)
+            unlabeled_spatial_features = spatial_layer(unlabeled_spatial_features, labeled_spatial_features, pos_2d)
 
-            unlabeled_spatial_features = unlabeled[:, :-6]
-            unlabeled_token_features = unlabeled[:, -6:] # T * B, 6, C
-            unlabeled_token_features = unlabeled_token_features.view(T, B, 6, C)
-            unlabeled_token_features = unlabeled_token_features.permute(1, 2, 0, 3).contiguous() # B, 6, T, C
+            #labeled_spatial_features = labeled_feature[:, :H*W] # T*B, H*W, C
+            #labeled_temporal_features = labeled_feature[:, H*W:] # T*B, M, C
+            #unlabeled_spatial_features = unlabeled_feature[:, :H*W] # T*B, H*W, C
+            #unlabeled_temporal_features = unlabeled_feature[:, H*W:] # T*B, M, C
+#
+            #labeled_temporal_features = labeled_temporal_features.view(T, B, self.nb_tokens, C)
+            #unlabeled_temporal_features = unlabeled_temporal_features.view(T, B, self.nb_tokens, C)
+#
+            #labeled_temporal_features = labeled_temporal_features.permute(1, 0, 2, 3).contiguous() # B, T, M, C
+            #unlabeled_temporal_features = unlabeled_temporal_features.permute(1, 0, 2, 3).contiguous() # B, T, M, C
+#
+            #labeled_temporal_features = labeled_temporal_features.view(B, T * self.nb_tokens, C)
+            #unlabeled_temporal_features = unlabeled_temporal_features.view(B, T * self.nb_tokens, C)
 
-            token_features = torch.stack([labeled_token_features, unlabeled_token_features], dim=3) # B, 6, T, 2, C
-            token_features = token_features.view(B * 6, T * 2, C)
+        labeled_spatial_features = labeled_spatial_features.view(T, B, H * W, C)
+        unlabeled_spatial_features = unlabeled_spatial_features.view(T, B, H * W, C)
 
-            token_features = temporal_layer(src=token_features, pos=pos_1d)[0] # B * 6, T * 2, C
-            token_features = token_features.view(B, 6, T, 2, C)
+        return labeled_spatial_features, unlabeled_spatial_features
 
-            labeled_token_features = token_features[:, :, :, 0, :] # B, 6, T, C
-            labeled_token_features = labeled_token_features.permute(2, 0, 1, 3).contiguous() # T, B, 6, C
-            labeled_token_features = labeled_token_features.view(T * B, 6, C)
 
-            unlabeled_token_features = token_features[:, :, :, 1, :] # B, 6, T, C
-            unlabeled_token_features = unlabeled_token_features.permute(2, 0, 1, 3).contiguous() # T, B, 6, C
-            unlabeled_token_features = unlabeled_token_features.view(T * B, 6, C)
+class TransformerFlowEncoder(nn.Module):
+    def __init__(self, dim, nhead, num_layers, nb_tokens):
+        super().__init__()
 
-        labeled_spatial_features = labeled_spatial_features.view(T, B, H, W, C)
-        labeled_spatial_features = labeled_spatial_features.permute(0, 1, 4, 2, 3).contiguous()
+        self.nb_tokens = nb_tokens
 
-        unlabeled_spatial_features = unlabeled_spatial_features.view(T, B, H, W, C)
-        unlabeled_spatial_features = unlabeled_spatial_features.permute(0, 1, 4, 2, 3).contiguous()
+        spatial_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
+        self.spatial_layers = _get_clones(spatial_layer, num_layers)
 
-        labeled_token_features = labeled_token_features.view(T, B, 6, C)
-        unlabeled_token_features = unlabeled_token_features.view(T, B, 6, C)
+        temporal_layer = TransformerEncoderLayer(d_model=dim, nhead=nhead)
+        self.temporal_layers = _get_clones(temporal_layer, num_layers)
 
-        return labeled_spatial_features, unlabeled_spatial_features, labeled_token_features, unlabeled_token_features
+        #temporal_layer = TransformerEncoderLayer(d_model=dim, nhead=nhead)
+        #self.temporal_layers = _get_clones(temporal_layer, num_layers)
+
+        self.pos_obj_2d = PositionEmbeddingSine2d(num_pos_feats=dim // 2, normalize=True)
+        #self.pos_obj_1d = PositionEmbeddingSine1d(num_pos_feats=dim, normalize=True)
+
+        self.token_pos = nn.Parameter(torch.randn(self.nb_tokens, dim))
+        self.temporal_tokens = nn.Parameter(torch.randn(self.nb_tokens, dim))
+    
+    
+    def forward(self, spatial_features_1, spatial_features_2, pos_1d_1, pos_1d_2):
+        '''spatial_features_1: T-1, B, C, H, W
+            spatial_features_2: T-1, B, C, H, W
+            pos_1d_1: B, C, T-1
+            pos_1d_2: B, C, T-1'''
+        
+        shape = spatial_features_1.shape
+        T, B, C, H, W = shape
+
+        pos_1d_1 = pos_1d_1.permute(0, 2, 1)[:, :, None, :].repeat(1, 1, self.nb_tokens, 1).view(B, T * self.nb_tokens, C)
+        pos_1d_2 = pos_1d_2.permute(0, 2, 1)[:, :, None, :].repeat(1, 1, self.nb_tokens, 1).view(B, T * self.nb_tokens, C)
+
+        spatial_features_1 = spatial_features_1.permute(0, 1, 3, 4, 2).contiguous() # T, B, H, W, C
+        spatial_features_1 = spatial_features_1.view(T, B, H * W, C).view(T * B, H * W, C)
+
+        spatial_features_2 = spatial_features_2.permute(0, 1, 3, 4, 2).contiguous() # T, B, H, W, C
+        spatial_features_2 = spatial_features_2.view(T, B, H * W, C).view(T * B, H * W, C)
+
+        pos_2d = self.pos_obj_2d(shape_util=(B, H, W), device=spatial_features_1.device)
+        pos_2d = pos_2d.permute(0, 2, 3, 1).contiguous()
+        pos_2d = pos_2d.view(B, H * W, C).repeat(T, 1, 1)
+
+        temporal_features_1 = self.temporal_tokens[None, None].repeat(B, T, 1, 1).view(B, T * self.nb_tokens, C)
+        temporal_features_2 = self.temporal_tokens[None, None].repeat(B, T, 1, 1).view(B, T * self.nb_tokens, C)
+
+        token_pos = self.token_pos[None].repeat(T * B, 1, 1) # T*B, M, C
+        spatial_pos = torch.cat([pos_2d, token_pos], dim=1)
+
+        token_pos = self.token_pos[None, None].repeat(B, T, 1, 1).view(B, T * self.nb_tokens, C)
+
+        temporal_pos_1 = pos_1d_1 + token_pos
+        temporal_pos_2 = pos_1d_2 + token_pos
+        temporal_pos = torch.cat([temporal_pos_1, temporal_pos_2], dim=1)
+
+        #pos_1d = self.pos_obj_1d(shape_util=(B, T), device=labeled_spatial_features.device) # B, C, T
+        #pos_1d = pos_1d.permute(0, 2, 1).contiguous() # B, T, C
+        #pos_1d = pos_1d.repeat(1, 2*self.nb_tokens, 1) # B, 2*T*nb_tokens, C
+        #pos_1d = self.pos_1d[None, :, :].repeat(B, 1, 1)
+        #token_pos = self.token_pos[None, :, :].repeat(T * B, 1, 1)
+
+        #temporal_tokens = self.temporal_tokens[:, None, :, :, :].repeat(1, B, 1, 1, 1) # (T-1), B, 2, nb_tokens, C
+        #temporal_tokens = temporal_tokens.view(T * B, 2, self.nb_tokens, C)
+        #temporal_features_1 = temporal_tokens[:, 0]
+        #temporal_features_2 = temporal_tokens[:, 1]
+
+        #pos = torch.cat([pos_2d, token_pos], dim=1)
+
+
+        for spatial_layer, temporal_layer in zip(self.spatial_layers, self.temporal_layers):
+            temporal_features = torch.cat([temporal_features_1, temporal_features_2], dim=1)
+            temporal_features = temporal_layer(temporal_features, pos=temporal_pos)[0]
+
+            temporal_features_1 = temporal_features[:, :T*self.nb_tokens]
+            temporal_features_2 = temporal_features[:, T*self.nb_tokens:]
+
+            temporal_features_1 = temporal_features_1.permute(1, 0, 2).contiguous() # T*M, B, C
+            temporal_features_2 = temporal_features_2.permute(1, 0, 2).contiguous() # T*M, B, C
+
+            temporal_features_1 = temporal_features_1.view(T, self.nb_tokens, B, C)
+            temporal_features_2 = temporal_features_2.view(T, self.nb_tokens, B, C)
+
+            temporal_features_1 = temporal_features_1.permute(0, 2, 1, 3).contiguous() # T, B, M, C
+            temporal_features_2 = temporal_features_2.permute(0, 2, 1, 3).contiguous() # T, B, M, C
+
+            temporal_features_1 = temporal_features_1.view(T*B, self.nb_tokens, C)
+            temporal_features_2 = temporal_features_2.view(T*B, self.nb_tokens, C)
+
+            feature_1 = torch.cat([spatial_features_1, temporal_features_1], dim=1)
+            feature_2 = torch.cat([spatial_features_2, temporal_features_2], dim=1)
+
+            feature_1 = spatial_layer(feature_1, feature_2, spatial_pos)
+            feature_2 = spatial_layer(feature_2, feature_1, spatial_pos)
+
+            spatial_features_1 = feature_1[:, :H*W] # T*B, H*W, C
+            temporal_features_1 = feature_1[:, H*W:] # T*B, M, C
+            spatial_features_2 = feature_2[:, :H*W] # T*B, H*W, C
+            temporal_features_2 = feature_2[:, H*W:] # T*B, M, C
+
+            temporal_features_1 = temporal_features_1.view(T, B, self.nb_tokens, C)
+            temporal_features_2 = temporal_features_2.view(T, B, self.nb_tokens, C)
+
+            temporal_features_1 = temporal_features_1.permute(1, 0, 2, 3).contiguous() # B, T, M, C
+            temporal_features_2 = temporal_features_2.permute(1, 0, 2, 3).contiguous() # B, T, M, C
+
+            temporal_features_1 = temporal_features_1.view(B, T * self.nb_tokens, C)
+            temporal_features_2 = temporal_features_2.view(B, T * self.nb_tokens, C)
+        
+
+        spatial_features_1 = spatial_features_1.view(T, B, H * W, C)
+        spatial_features_2 = spatial_features_2.view(T, B, H * W, C)
+
+        #spatial_features_seg = spatial_features_seg.view((T + 1) * B, H * W, C)
+        #pos_2d = torch.cat([pos_2d, pos_2d[-1][None].repeat(B, 1, 1)], dim=0)
+        #for seg_layer in self.seg_layers:
+        #    spatial_features_seg = seg_layer(spatial_features_seg, pos=pos_2d)[0]
+        #spatial_features_seg = spatial_features_seg.view((T + 1), B, H * W, C)
+
+        return spatial_features_1, spatial_features_2
+    
+
+
+class TransformerFlowEncoderConv(nn.Module):
+    def __init__(self, dim, nhead, num_layers, nb_tokens):
+        super().__init__()
+
+        self.nb_tokens = nb_tokens
+
+        spatial_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
+        self.spatial_layers = _get_clones(spatial_layer, num_layers)
+
+        temporal_layer = TransformerEncoderLayer(d_model=dim, nhead=nhead)
+        self.temporal_layers = _get_clones(temporal_layer, num_layers)
+
+        #seg_layer = TransformerEncoderLayer(d_model=dim, nhead=nhead)
+        #self.seg_layers = _get_clones(seg_layer, num_layers)
+
+        #temporal_layer = TransformerEncoderLayer(d_model=dim, nhead=nhead)
+        #self.temporal_layers = _get_clones(temporal_layer, num_layers)
+
+        self.pos_obj_2d = PositionEmbeddingSine2d(num_pos_feats=dim // 2, normalize=True)
+        #self.pos_obj_1d = PositionEmbeddingSine1d(num_pos_feats=dim, normalize=True)
+
+        self.token_pos = nn.Parameter(torch.randn(self.nb_tokens, dim))
+        self.temporal_tokens = nn.Parameter(torch.randn(self.nb_tokens, dim))
+    
+    
+    def forward(self, spatial_features_1, spatial_features_2, pos_1d_1, pos_1d_2):
+        '''spatial_features_1: T-1, B, C, H, W
+            spatial_features_2: T-1, B, C, H, W
+            pos_1d_1: B, C, T-1
+            pos_1d_2: B, C, T-1'''
+        
+        shape = spatial_features_1.shape
+        T, B, C, H, W = shape
+
+        pos_1d_1 = pos_1d_1.permute(0, 2, 1)[:, :, None, :].repeat(1, 1, self.nb_tokens, 1).view(B, T * self.nb_tokens, C)
+        pos_1d_2 = pos_1d_2.permute(0, 2, 1)[:, :, None, :].repeat(1, 1, self.nb_tokens, 1).view(B, T * self.nb_tokens, C)
+
+        spatial_features_1 = spatial_features_1.permute(0, 1, 3, 4, 2).contiguous() # T, B, H, W, C
+        spatial_features_1 = spatial_features_1.view(T, B, H * W, C).view(T * B, H * W, C)
+
+        spatial_features_2 = spatial_features_2.permute(0, 1, 3, 4, 2).contiguous() # T, B, H, W, C
+        spatial_features_2 = spatial_features_2.view(T, B, H * W, C).view(T * B, H * W, C)
+
+        pos_2d = self.pos_obj_2d(shape_util=(B, H, W), device=spatial_features_1.device)
+        pos_2d = pos_2d.permute(0, 2, 3, 1).contiguous()
+        pos_2d = pos_2d.view(B, H * W, C).repeat(T, 1, 1)
+
+        temporal_features_1 = self.temporal_tokens[None, None].repeat(B, T, 1, 1).view(B, T * self.nb_tokens, C)
+        temporal_features_2 = self.temporal_tokens[None, None].repeat(B, T, 1, 1).view(B, T * self.nb_tokens, C)
+
+        token_pos = self.token_pos[None].repeat(T * B, 1, 1) # T*B, M, C
+        spatial_pos = torch.cat([pos_2d, token_pos], dim=1)
+
+        token_pos = self.token_pos[None, None].repeat(B, T, 1, 1).view(B, T * self.nb_tokens, C)
+
+        temporal_pos_1 = pos_1d_1 + token_pos
+        temporal_pos_2 = pos_1d_2 + token_pos
+        temporal_pos = torch.cat([temporal_pos_1, temporal_pos_2], dim=1)
+
+        #pos_1d = self.pos_obj_1d(shape_util=(B, T), device=labeled_spatial_features.device) # B, C, T
+        #pos_1d = pos_1d.permute(0, 2, 1).contiguous() # B, T, C
+        #pos_1d = pos_1d.repeat(1, 2*self.nb_tokens, 1) # B, 2*T*nb_tokens, C
+        #pos_1d = self.pos_1d[None, :, :].repeat(B, 1, 1)
+        #token_pos = self.token_pos[None, :, :].repeat(T * B, 1, 1)
+
+        #temporal_tokens = self.temporal_tokens[:, None, :, :, :].repeat(1, B, 1, 1, 1) # (T-1), B, 2, nb_tokens, C
+        #temporal_tokens = temporal_tokens.view(T * B, 2, self.nb_tokens, C)
+        #temporal_features_1 = temporal_tokens[:, 0]
+        #temporal_features_2 = temporal_tokens[:, 1]
+
+        #pos = torch.cat([pos_2d, token_pos], dim=1)
+
+
+        for spatial_layer, temporal_layer in zip(self.spatial_layers, self.temporal_layers):
+            temporal_features = torch.cat([temporal_features_1, temporal_features_2], dim=1)
+            temporal_features = temporal_layer(temporal_features, pos=temporal_pos)[0]
+
+            temporal_features_1 = temporal_features[:, :T*self.nb_tokens]
+            temporal_features_2 = temporal_features[:, T*self.nb_tokens:]
+
+            temporal_features_1 = temporal_features_1.permute(1, 0, 2).contiguous() # T*M, B, C
+            temporal_features_2 = temporal_features_2.permute(1, 0, 2).contiguous() # T*M, B, C
+
+            temporal_features_1 = temporal_features_1.view(T, self.nb_tokens, B, C)
+            temporal_features_2 = temporal_features_2.view(T, self.nb_tokens, B, C)
+
+            temporal_features_1 = temporal_features_1.permute(0, 2, 1, 3).contiguous() # T, B, M, C
+            temporal_features_2 = temporal_features_2.permute(0, 2, 1, 3).contiguous() # T, B, M, C
+
+            temporal_features_1 = temporal_features_1.view(T*B, self.nb_tokens, C)
+            temporal_features_2 = temporal_features_2.view(T*B, self.nb_tokens, C)
+
+            feature_1 = torch.cat([spatial_features_1, temporal_features_1], dim=1)
+            feature_2 = torch.cat([spatial_features_2, temporal_features_2], dim=1)
+
+            feature_1 = spatial_layer(feature_1, feature_2, sa_query_pos=spatial_pos, ca_query_pos=spatial_pos, key_pos=spatial_pos)
+            feature_2 = spatial_layer(feature_2, feature_1, sa_query_pos=spatial_pos, ca_query_pos=spatial_pos, key_pos=spatial_pos)
+
+            spatial_features_1 = feature_1[:, :H*W] # T*B, H*W, C
+            temporal_features_1 = feature_1[:, H*W:] # T*B, M, C
+            spatial_features_2 = feature_2[:, :H*W] # T*B, H*W, C
+            temporal_features_2 = feature_2[:, H*W:] # T*B, M, C
+
+            #spatial_features_1 = spatial_features_1.view(T, B, H * W, C)
+            #spatial_features_2 = spatial_features_2.view(T, B, H * W, C)
+
+            #padding = torch.zeros_like(spatial_features_1[0]).unsqueeze(0)
+            #spatial_features_1_seg = torch.cat([spatial_features_1, padding], dim=0)
+            #spatial_features_2_seg = torch.cat([padding, spatial_features_2], dim=0)
+            #spatial_features_seg = spatial_features_1_seg + spatial_features_2_seg
+
+            #spatial_features_1 = spatial_features_seg[:-1]
+            #spatial_features_2 = spatial_features_seg[1:]
+#
+            #spatial_features_1 = spatial_features_1.view(T * B, H * W, C)
+            #spatial_features_2 = spatial_features_2.view(T * B, H * W, C)
+
+            temporal_features_1 = temporal_features_1.view(T, B, self.nb_tokens, C)
+            temporal_features_2 = temporal_features_2.view(T, B, self.nb_tokens, C)
+
+            temporal_features_1 = temporal_features_1.permute(1, 0, 2, 3).contiguous() # B, T, M, C
+            temporal_features_2 = temporal_features_2.permute(1, 0, 2, 3).contiguous() # B, T, M, C
+
+            temporal_features_1 = temporal_features_1.view(B, T * self.nb_tokens, C)
+            temporal_features_2 = temporal_features_2.view(B, T * self.nb_tokens, C)
+        
+
+        spatial_features_1 = spatial_features_1.view(T, B, H * W, C)
+        spatial_features_2 = spatial_features_2.view(T, B, H * W, C)
+
+        padding = torch.zeros_like(spatial_features_1[0]).unsqueeze(0)
+        spatial_features_1_seg = torch.cat([spatial_features_1, padding], dim=0)
+        spatial_features_2_seg = torch.cat([padding, spatial_features_2], dim=0)
+        spatial_features_seg = spatial_features_1_seg + spatial_features_2_seg
+
+        #spatial_features_seg = spatial_features_seg.view((T + 1) * B, H * W, C)
+        #pos_2d = torch.cat([pos_2d, pos_2d[-1][None].repeat(B, 1, 1)], dim=0)
+        #for seg_layer in self.seg_layers:
+        #    spatial_features_seg = seg_layer(spatial_features_seg, pos=pos_2d)[0]
+        #spatial_features_seg = spatial_features_seg.view((T + 1), B, H * W, C)
+
+        return spatial_features_1, spatial_features_2, spatial_features_seg
+
+
+
+class TransformerFlowEncoderIterative(nn.Module):
+    def __init__(self, dim, nhead, num_layers, nb_tokens, lookback):
+        super().__init__()
+
+        self.nb_tokens = nb_tokens
+        self.lookback = lookback
+
+        spatial_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
+        self.spatial_layers = _get_clones(spatial_layer, num_layers)
+
+        #temporal_layer = TransformerEncoderLayer(d_model=dim, nhead=nhead)
+        #self.temporal_layers = _get_clones(temporal_layer, num_layers)
+
+        #seg_layer = TransformerEncoderLayer(d_model=dim, nhead=nhead)
+        #self.seg_layers = _get_clones(seg_layer, num_layers)
+
+        #temporal_layer = TransformerEncoderLayer(d_model=dim, nhead=nhead)
+        #self.temporal_layers = _get_clones(temporal_layer, num_layers)
+
+        self.pos_obj_2d = PositionEmbeddingSine2d(num_pos_feats=dim // 2, normalize=True)
+        #self.pos_obj_1d = PositionEmbeddingSine1d(num_pos_feats=dim, normalize=True)
+
+        #self.token_pos = nn.Parameter(torch.randn(self.nb_tokens, dim))
+        #self.temporal_tokens = nn.Parameter(torch.randn(self.nb_tokens, dim))
+    
+    
+    def forward(self, spatial_features, pos_1d):
+        '''spatial_features_1: T, B, C, H, W
+            pos_1d: B, C, T'''
+        
+        shape = spatial_features.shape
+        T, B, C, H, W = shape
+
+        pos_1d = pos_1d.permute(2, 0, 1)[:, :, None, :].repeat(1, 1, H * W, 1)
+
+        spatial_features = spatial_features.permute(0, 1, 3, 4, 2).contiguous() # T, B, H, W, C
+        spatial_features = spatial_features.view(T, B, H * W, C)
+
+        pos_2d = self.pos_obj_2d(shape_util=(B, H, W), device=spatial_features.device)
+        pos_2d = pos_2d.permute(0, 2, 3, 1).contiguous()
+        pos_2d = pos_2d.view(B, H * W, C)
+
+        #pos_1d = self.pos_obj_1d(shape_util=(B, T), device=labeled_spatial_features.device) # B, C, T
+        #pos_1d = pos_1d.permute(0, 2, 1).contiguous() # B, T, C
+        #pos_1d = pos_1d.repeat(1, 2*self.nb_tokens, 1) # B, 2*T*nb_tokens, C
+        #pos_1d = self.pos_1d[None, :, :].repeat(B, 1, 1)
+        #token_pos = self.token_pos[None, :, :].repeat(T * B, 1, 1)
+
+        #temporal_tokens = self.temporal_tokens[:, None, :, :, :].repeat(1, B, 1, 1, 1) # (T-1), B, 2, nb_tokens, C
+        #temporal_tokens = temporal_tokens.view(T * B, 2, self.nb_tokens, C)
+        #temporal_features_1 = temporal_tokens[:, 0]
+        #temporal_features_2 = temporal_tokens[:, 1]
+
+        #pos = torch.cat([pos_2d, token_pos], dim=1)
+
+        past_pos_1d = pos_1d[:-1]
+        for spatial_layer in self.spatial_layers:
+            past_features = torch.zeros_like(spatial_features)[:-1] # T - 1, B, H*W, C
+            for i in range(len(spatial_features)):
+
+                #matplotlib.use('QtAgg')
+                #fig, ax = plt.subplots(2, len(spatial_features))
+                #past_features = past_features.permute(0, 1, 3, 2).contiguous().view(T - 1, B, C, H, W)
+                #spatial_features = spatial_features.permute(0, 1, 3, 2).contiguous().view(T, B, C, H, W)
+                #for j in range(len(spatial_features)):
+                #    ax[0, j].imshow(spatial_features[j, 0, 0].detach().cpu())
+                #    if j < len(spatial_features) - 1:
+                #        ax[1, j].imshow(past_features[j, 0, 0].detach().cpu())
+                #plt.show()
+                #past_features = past_features.permute(0, 1, 3, 4, 2).contiguous().view(T-1, B, H * W, C)
+                #spatial_features = spatial_features.permute(0, 1, 3, 4, 2).contiguous().view(T, B, H * W, C)
+
+                #fig, ax = plt.subplots(2, 1)
+                #ax[0].imshow(past_features[i, 0, 0].detach().cpu())
+                #ax[1].imshow(spatial_features[i, 0, 0].detach().cpu())
+                #plt.show()
+
+                start = max(0, i - self.lookback)
+                stop = i
+
+                current_spatial_feature = spatial_features[i]
+                current_pos_1d = pos_1d[i]
+                if i == 0:
+                    previous_spatial_feature = torch.zeros_like(current_spatial_feature).unsqueeze(0).repeat(self.lookback, 1, 1, 1)
+                    previous_pos_1d = torch.zeros_like(current_pos_1d).unsqueeze(0).repeat(self.lookback, 1, 1, 1)
+                else:
+                    previous_spatial_feature = past_features[start:stop]
+                    previous_spatial_feature = torch.nn.functional.pad(previous_spatial_feature, pad=(0, 0, 0, 0, 0, 0, max(0, self.lookback - len(previous_spatial_feature)), 0))
+                    previous_pos_1d = past_pos_1d[start:stop]
+                    previous_pos_1d = torch.nn.functional.pad(previous_pos_1d, pad=(0, 0, 0, 0, 0, 0, max(0, self.lookback - len(previous_pos_1d)), 0))
+
+                previous_pos_1d = previous_pos_1d.permute(0, 2, 1, 3).contiguous()
+                previous_pos_1d = previous_pos_1d.view(self.lookback * H * W, B, C)
+                previous_pos_1d = previous_pos_1d.permute(1, 0, 2).contiguous()
+
+                ca_query_pos = pos_2d + current_pos_1d
+
+                key_pos_2d = pos_2d[:, None, :, :].repeat(1, self.lookback, 1, 1)
+                key_pos_2d = key_pos_2d.permute(1, 2, 0, 3).contiguous()
+                key_pos_2d = key_pos_2d.view(self.lookback * H * W, B, C)
+                key_pos_2d = key_pos_2d.permute(1, 0, 2).contiguous()
+                key_pos = key_pos_2d + previous_pos_1d
+
+                previous_spatial_feature = previous_spatial_feature.permute(0, 2, 1, 3).contiguous()
+                previous_spatial_feature = previous_spatial_feature.view(self.lookback * H * W, B, C)
+                previous_spatial_feature = previous_spatial_feature.permute(1, 0, 2).contiguous()
+
+                current_spatial_feature = spatial_layer(current_spatial_feature, previous_spatial_feature, sa_query_pos=pos_2d, ca_query_pos=ca_query_pos, key_pos=key_pos)
+                if i == len(spatial_features) - 1:
+                    spatial_features = torch.cat([past_features, current_spatial_feature.unsqueeze(0)], dim=0)
+                else:
+                    past_features[i] = current_spatial_feature
+        return spatial_features
+            
+
+class TransformerFlowEncoderIterativeMiddle(nn.Module):
+    def __init__(self, dim, nhead, num_layers, nb_tokens, lookback):
+        super().__init__()
+
+        self.nb_tokens = nb_tokens
+        self.lookback = lookback
+        assert lookback % 2 == 0
+
+        spatial_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
+        self.spatial_layers = _get_clones(spatial_layer, num_layers)
+
+        #seg_layer = TransformerEncoderLayer(d_model=dim, nhead=nhead)
+        #self.seg_layers = _get_clones(seg_layer, num_layers)
+
+        #temporal_layer = TransformerEncoderLayer(d_model=dim, nhead=nhead)
+        #self.temporal_layers = _get_clones(temporal_layer, num_layers)
+
+        self.pos_obj_2d = PositionEmbeddingSine2d(num_pos_feats=dim // 2, normalize=True)
+        #self.pos_obj_1d = PositionEmbeddingSine1d(num_pos_feats=dim, normalize=True)
+
+        #self.token_pos = nn.Parameter(torch.randn(self.nb_tokens, dim))
+        #self.temporal_tokens = nn.Parameter(torch.randn(self.nb_tokens, dim))
+    
+    
+    def forward(self, spatial_features, pos_1d):
+        '''spatial_features_1: T, B, C, H, W
+            pos_1d: B, C, T'''
+        
+        shape = spatial_features.shape
+        T, B, C, H, W = shape
+
+        pos_1d = pos_1d.permute(2, 0, 1)[:, :, None, :].repeat(1, 1, H * W, 1)
+
+        spatial_features = spatial_features.permute(0, 1, 3, 4, 2).contiguous() # T, B, H, W, C
+        spatial_features = spatial_features.view(T, B, H * W, C)
+
+        pos_2d = self.pos_obj_2d(shape_util=(B, H, W), device=spatial_features.device)
+        pos_2d = pos_2d.permute(0, 2, 3, 1).contiguous()
+        pos_2d = pos_2d.view(B, H * W, C)
+
+        #pos_1d = self.pos_obj_1d(shape_util=(B, T), device=labeled_spatial_features.device) # B, C, T
+        #pos_1d = pos_1d.permute(0, 2, 1).contiguous() # B, T, C
+        #pos_1d = pos_1d.repeat(1, 2*self.nb_tokens, 1) # B, 2*T*nb_tokens, C
+        #pos_1d = self.pos_1d[None, :, :].repeat(B, 1, 1)
+        #token_pos = self.token_pos[None, :, :].repeat(T * B, 1, 1)
+
+        #temporal_tokens = self.temporal_tokens[:, None, :, :, :].repeat(1, B, 1, 1, 1) # (T-1), B, 2, nb_tokens, C
+        #temporal_tokens = temporal_tokens.view(T * B, 2, self.nb_tokens, C)
+        #temporal_features_1 = temporal_tokens[:, 0]
+        #temporal_features_2 = temporal_tokens[:, 1]
+
+        #pos = torch.cat([pos_2d, token_pos], dim=1)
+        past_pos_1d = pos_1d[:-1]
+        for spatial_layer in self.spatial_layers:
+            past_features = torch.zeros_like(spatial_features)[:-1] # T - 1, B, H*W, C
+            for i in range(len(spatial_features)):
+
+                #matplotlib.use('QtAgg')
+                #fig, ax = plt.subplots(2, len(spatial_features))
+                #past_features = past_features.permute(0, 1, 3, 2).contiguous().view(T - 1, B, C, H, W)
+                #spatial_features = spatial_features.permute(0, 1, 3, 2).contiguous().view(T, B, C, H, W)
+                #for j in range(len(spatial_features)):
+                #    ax[0, j].imshow(spatial_features[j, 0, 0].detach().cpu())
+                #    if j < len(spatial_features) - 1:
+                #        ax[1, j].imshow(past_features[j, 0, 0].detach().cpu())
+                #plt.show()
+                #past_features = past_features.permute(0, 1, 3, 4, 2).contiguous().view(T-1, B, H * W, C)
+                #spatial_features = spatial_features.permute(0, 1, 3, 4, 2).contiguous().view(T, B, H * W, C)
+
+                #fig, ax = plt.subplots(2, 1)
+                #ax[0].imshow(past_features[i, 0, 0].detach().cpu())
+                #ax[1].imshow(spatial_features[i, 0, 0].detach().cpu())
+                #plt.show()
+
+                start = max(0, i - (self.lookback // 2))
+                stop = min(len(spatial_features), i + (self.lookback // 2) + 1)
+
+                current_spatial_feature = spatial_features[i]
+                current_pos_1d = pos_1d[i]
+                if i == 0:
+                    previous_spatial_feature = torch.zeros_like(current_spatial_feature).unsqueeze(0).repeat(self.lookback // 2, 1, 1, 1)
+                    previous_pos_1d = torch.zeros_like(current_pos_1d).unsqueeze(0).repeat(self.lookback // 2, 1, 1, 1)
+                else:
+                    previous_spatial_feature = past_features[start:i]
+                    previous_spatial_feature = torch.nn.functional.pad(previous_spatial_feature, pad=(0, 0, 0, 0, 0, 0, max(0, (self.lookback // 2) - len(previous_spatial_feature)), 0))
+                    previous_pos_1d = past_pos_1d[start:i]
+                    previous_pos_1d = torch.nn.functional.pad(previous_pos_1d, pad=(0, 0, 0, 0, 0, 0, max(0, (self.lookback // 2) - len(previous_pos_1d)), 0))
+                
+                if i == len(spatial_features) - 1:
+                    next_spatial_feature = torch.zeros_like(current_spatial_feature).unsqueeze(0).repeat(self.lookback // 2, 1, 1, 1)
+                    next_pos_1d = torch.zeros_like(current_pos_1d).unsqueeze(0).repeat(self.lookback // 2, 1, 1, 1)
+                else:
+                    next_spatial_feature = spatial_features[i+1:stop]
+                    next_spatial_feature = torch.nn.functional.pad(next_spatial_feature, pad=(0, 0, 0, 0, 0, 0, 0, max(0, (self.lookback // 2) - len(next_spatial_feature))))
+                    next_pos_1d = pos_1d[i+1:stop]
+                    next_pos_1d = torch.nn.functional.pad(next_pos_1d, pad=(0, 0, 0, 0, 0, 0, 0, max(0, (self.lookback // 2) - len(next_pos_1d))))
+
+                key_pos_1d = torch.cat([previous_pos_1d, next_pos_1d], dim=0)
+                key_spatial_feature = torch.cat([previous_spatial_feature, next_spatial_feature], dim=0)
+
+                key_pos_1d = key_pos_1d.permute(0, 2, 1, 3).contiguous()
+                key_pos_1d = key_pos_1d.view(self.lookback * H * W, B, C)
+                key_pos_1d = key_pos_1d.permute(1, 0, 2).contiguous()
+
+                ca_query_pos = pos_2d + current_pos_1d
+
+                key_pos_2d = pos_2d[:, None, :, :].repeat(1, self.lookback, 1, 1)
+                key_pos_2d = key_pos_2d.permute(1, 2, 0, 3).contiguous()
+                key_pos_2d = key_pos_2d.view(self.lookback * H * W, B, C)
+                key_pos_2d = key_pos_2d.permute(1, 0, 2).contiguous()
+
+                key_pos = key_pos_2d + key_pos_1d
+
+                key_spatial_feature = key_spatial_feature.permute(0, 2, 1, 3).contiguous()
+                key_spatial_feature = key_spatial_feature.view(self.lookback * H * W, B, C)
+                key_spatial_feature = key_spatial_feature.permute(1, 0, 2).contiguous()
+
+                current_spatial_feature = spatial_layer(current_spatial_feature, key_spatial_feature, sa_query_pos=pos_2d, ca_query_pos=ca_query_pos, key_pos=key_pos)
+                if i == len(spatial_features) - 1:
+                    spatial_features = torch.cat([past_features, current_spatial_feature.unsqueeze(0)], dim=0)
+                else:
+                    past_features[i] = current_spatial_feature
+        return spatial_features
+    
+
+
+#class TransformerFlowEncoderIterative(nn.Module):
+#    def __init__(self, dim, nhead, num_layers, nb_tokens, lookback):
+#        super().__init__()
+#
+#        self.nb_tokens = nb_tokens
+#        self.lookback = lookback
+#
+#        spatial_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
+#        self.spatial_layers = _get_clones(spatial_layer, num_layers)
+#
+#        self.conv_1d = nn.Conv1d(in_channels=dim, out_channels=dim, kernel_size=self.lookback + 1, padding='same')
+#
+#        #temporal_layer = TransformerEncoderLayer(d_model=dim, nhead=nhead)
+#        #self.temporal_layers = _get_clones(temporal_layer, num_layers)
+#
+#        #seg_layer = TransformerEncoderLayer(d_model=dim, nhead=nhead)
+#        #self.seg_layers = _get_clones(seg_layer, num_layers)
+#
+#        #temporal_layer = TransformerEncoderLayer(d_model=dim, nhead=nhead)
+#        #self.temporal_layers = _get_clones(temporal_layer, num_layers)
+#
+#        self.pos_obj_2d = PositionEmbeddingSine2d(num_pos_feats=dim // 2, normalize=True)
+#        #self.pos_obj_1d = PositionEmbeddingSine1d(num_pos_feats=dim, normalize=True)
+#
+#        #self.token_pos = nn.Parameter(torch.randn(self.nb_tokens, dim))
+#        #self.temporal_tokens = nn.Parameter(torch.randn(self.nb_tokens, dim))
+#    
+#    
+#    def forward(self, spatial_features):
+#        '''spatial_features_1: T, B, C, H, W
+#            pos_1d: B, C, T'''
+#        
+#        shape = spatial_features.shape
+#        T, B, C, H, W = shape
+#
+#        #pos_1d = pos_1d.permute(2, 0, 1)[:, :, None, :].repeat(1, 1, H * W, 1)
+#
+#        spatial_features = spatial_features.permute(0, 1, 3, 4, 2).contiguous() # T, B, H, W, C
+#        spatial_features = spatial_features.view(T, B, H * W, C)
+#
+#        pos_2d = self.pos_obj_2d(shape_util=(B, H, W), device=spatial_features.device)
+#        pos_2d = pos_2d.permute(0, 2, 3, 1).contiguous()
+#        pos_2d = pos_2d.view(B, H * W, C)
+#
+#        #pos_1d = self.pos_obj_1d(shape_util=(B, T), device=labeled_spatial_features.device) # B, C, T
+#        #pos_1d = pos_1d.permute(0, 2, 1).contiguous() # B, T, C
+#        #pos_1d = pos_1d.repeat(1, 2*self.nb_tokens, 1) # B, 2*T*nb_tokens, C
+#        #pos_1d = self.pos_1d[None, :, :].repeat(B, 1, 1)
+#        #token_pos = self.token_pos[None, :, :].repeat(T * B, 1, 1)
+#
+#        #temporal_tokens = self.temporal_tokens[:, None, :, :, :].repeat(1, B, 1, 1, 1) # (T-1), B, 2, nb_tokens, C
+#        #temporal_tokens = temporal_tokens.view(T * B, 2, self.nb_tokens, C)
+#        #temporal_features_1 = temporal_tokens[:, 0]
+#        #temporal_features_2 = temporal_tokens[:, 1]
+#
+#        #pos = torch.cat([pos_2d, token_pos], dim=1)
+#
+#        #past_pos_1d = pos_1d[:-1]
+#        for spatial_layer in self.spatial_layers:
+#            past_features = torch.zeros_like(spatial_features)[:-1] # T - 1, B, H*W, C
+#            for i in range(len(spatial_features)):
+#
+#                #matplotlib.use('QtAgg')
+#                #fig, ax = plt.subplots(2, len(spatial_features))
+#                #past_features = past_features.permute(0, 1, 3, 2).contiguous().view(T - 1, B, C, H, W)
+#                #spatial_features = spatial_features.permute(0, 1, 3, 2).contiguous().view(T, B, C, H, W)
+#                #for j in range(len(spatial_features)):
+#                #    ax[0, j].imshow(spatial_features[j, 0, 0].detach().cpu())
+#                #    if j < len(spatial_features) - 1:
+#                #        ax[1, j].imshow(past_features[j, 0, 0].detach().cpu())
+#                #plt.show()
+#                #past_features = past_features.permute(0, 1, 3, 4, 2).contiguous().view(T-1, B, H * W, C)
+#                #spatial_features = spatial_features.permute(0, 1, 3, 4, 2).contiguous().view(T, B, H * W, C)
+#
+#                #fig, ax = plt.subplots(2, 1)
+#                #ax[0].imshow(past_features[i, 0, 0].detach().cpu())
+#                #ax[1].imshow(spatial_features[i, 0, 0].detach().cpu())
+#                #plt.show()
+#
+#                start = max(0, i - self.lookback)
+#                stop = i
+#
+#                current_spatial_feature = spatial_features[i]
+#                #current_pos_1d = pos_1d[i]
+#                if i == 0:
+#                    previous_spatial_feature = torch.zeros_like(current_spatial_feature).unsqueeze(0).repeat(self.lookback, 1, 1, 1)
+#                    #previous_pos_1d = torch.zeros_like(current_pos_1d).unsqueeze(0).repeat(self.lookback, 1, 1, 1)
+#                else:
+#                    previous_spatial_feature = past_features[start:stop]
+#                    previous_spatial_feature = torch.nn.functional.pad(previous_spatial_feature, pad=(0, 0, 0, 0, 0, 0, max(0, self.lookback - len(previous_spatial_feature)), 0))
+#                    #previous_pos_1d = past_pos_1d[start:stop]
+#                    #previous_pos_1d = torch.nn.functional.pad(previous_pos_1d, pad=(0, 0, 0, 0, 0, 0, max(0, self.lookback - len(previous_pos_1d)), 0))
+#
+#                all_features = torch.cat([previous_spatial_feature, current_spatial_feature.unsqueeze(0)], dim=0) # lookback + 1, B, H*W, C
+#                all_features = all_features.permute(1, 3, 0, 2).mean(-1) # B, C, lookback + 1
+#                #print(torch.any(previous_spatial_feature.flatten(1, -1), dim=-1))
+#                pos_1d = self.conv_1d(all_features)
+#                current_pos_1d = pos_1d[:, :, -1]
+#                previous_pos_1d = pos_1d[:, :, :-1]
+#
+#                current_pos_1d = current_pos_1d[:, None, :].repeat(1, H * W, 1)
+#                
+#                previous_pos_1d = previous_pos_1d.permute(2, 0, 1).contiguous()
+#                previous_pos_1d = previous_pos_1d[:, None, :, :].repeat(1, H * W, 1, 1)
+#                previous_pos_1d = previous_pos_1d.view(len(previous_pos_1d) * H * W, B, C)
+#                previous_pos_1d = previous_pos_1d.permute(1, 0, 2).contiguous()
+#
+#                query_pos = pos_2d + current_pos_1d
+#
+#                key_pos_2d = pos_2d[:, None, :, :].repeat(1, len(previous_spatial_feature), 1, 1)
+#                key_pos_2d = key_pos_2d.permute(1, 2, 0, 3).contiguous()
+#                key_pos_2d = key_pos_2d.view(len(previous_spatial_feature) * H * W, B, C)
+#                key_pos_2d = key_pos_2d.permute(1, 0, 2).contiguous()
+#                key_pos = key_pos_2d + previous_pos_1d
+#
+#                previous_spatial_feature = previous_spatial_feature.permute(0, 2, 1, 3).contiguous()
+#                previous_spatial_feature = previous_spatial_feature.view(len(previous_spatial_feature) * H * W, B, C)
+#                previous_spatial_feature = previous_spatial_feature.permute(1, 0, 2).contiguous()
+#
+#                current_spatial_feature = spatial_layer(current_spatial_feature, previous_spatial_feature, query_pos=query_pos, key_pos=key_pos)
+#                if i == len(spatial_features) - 1:
+#                    spatial_features = torch.cat([past_features, current_spatial_feature.unsqueeze(0)], dim=0)
+#                else:
+#                    past_features[i] = current_spatial_feature
+#        return spatial_features
+    
+
+
+class TransformerFlowEncoderContext(nn.Module):
+    def __init__(self, dim, nhead, num_layers, video_length, nb_tokens):
+        super().__init__()
+
+        self.nb_tokens = nb_tokens
+
+        spatial_layer = TransformerFlowLayerContext(d_model=dim, nhead=nhead)
+        self.spatial_layers = _get_clones(spatial_layer, num_layers)
+
+        context_layer = TransformerEncoderLayer(d_model=dim, nhead=nhead)
+        self.context_layers = _get_clones(context_layer, num_layers)
+
+        #temporal_layer = TransformerEncoderLayer(d_model=dim, nhead=nhead)
+        #self.temporal_layers = _get_clones(temporal_layer, num_layers)
+
+        self.pos_obj_2d = PositionEmbeddingSine2d(num_pos_feats=dim // 2, normalize=True)
+        #self.pos_obj_1d = PositionEmbeddingSine1d(num_pos_feats=dim, normalize=True)
+
+        self.pos_1d = nn.Parameter(torch.randn(video_length, dim))
+
+        #self.token_pos = nn.Parameter(torch.randn(self.nb_tokens, dim))
+        #self.temporal_tokens = nn.Parameter(torch.randn(video_length - 1, 2, self.nb_tokens, dim))
+    
+    
+    def forward(self, spatial_features_1, spatial_features_2, context_1):
+        '''spatial_features_1: T-1, B, C, H, W
+            spatial_features_2: T-1, B, C, H, W'''
+        
+        shape = spatial_features_1.shape
+        T, B, C, H, W = shape
+
+        context_1 = context_1[None].repeat(T, 1, 1, 1, 1)
+        context_1 = context_1.permute(0, 1, 3, 4, 2).contiguous() # T, B, H, W, C
+        context_1 = context_1.view(T, B, H * W, C).view(T * B, H * W, C)
+
+        #context_2 = context_2[None].repeat(T, 1, 1, 1, 1)
+        #context_2 = context_2.permute(0, 1, 3, 4, 2).contiguous() # T, B, H, W, C
+        #context_2 = context_2.view(T, B, H * W, C).view(T * B, H * W, C)
+
+        spatial_features_1 = spatial_features_1.permute(0, 1, 3, 4, 2).contiguous() # T, B, H, W, C
+        spatial_features_1 = spatial_features_1.view(T, B, H * W, C).view(T * B, H * W, C)
+
+        spatial_features_2 = spatial_features_2.permute(0, 1, 3, 4, 2).contiguous() # T, B, H, W, C
+        spatial_features_2 = spatial_features_2.view(T, B, H * W, C).view(T * B, H * W, C)
+
+        pos_2d = self.pos_obj_2d(shape_util=(B, H, W), device=spatial_features_1.device)
+        pos_2d = pos_2d.permute(0, 2, 3, 1).contiguous()
+        pos_2d = pos_2d.view(B, H * W, C).repeat(T, 1, 1)
+
+        pos_1d = self.pos_1d[:, None, None, :].repeat(1, B, H*W, 1) # T, B, H*W, C
+        pos_1d_1 = pos_1d[:-1]
+        pos_1d_2 = pos_1d[1:]
+        pos_1d_1 = pos_1d_1.view(T * B, H * W, C)
+        pos_1d_2 = pos_1d_2.view(T * B, H * W, C)
+
+        #pos_1d = self.pos_obj_1d(shape_util=(B, T), device=labeled_spatial_features.device) # B, C, T
+        #pos_1d = pos_1d.permute(0, 2, 1).contiguous() # B, T, C
+        #pos_1d = pos_1d.repeat(1, 2*self.nb_tokens, 1) # B, 2*T*nb_tokens, C
+        #pos_1d = self.pos_1d[None, :, :].repeat(B, 1, 1)
+        #token_pos = self.token_pos[None, :, :].repeat(T * B, 1, 1)
+
+        #temporal_tokens = self.temporal_tokens[:, None, :, :, :].repeat(1, B, 1, 1, 1) # (T-1), B, 2, nb_tokens, C
+        #temporal_tokens = temporal_tokens.view(T * B, 2, self.nb_tokens, C)
+        #feature_1_tokens = temporal_tokens[:, 0]
+        #feature_2_tokens = temporal_tokens[:, 1]
+
+        #pos = torch.cat([pos_2d, token_pos], dim=1)
+
+        for spatial_layer, context_layer in zip(self.spatial_layers, self.context_layers):
+            context_1 = context_layer(context_1, pos=pos_2d)[0]
+            #context_2 = context_layer(context_2, pos=pos_2d)[0]
+
+            spatial_features_1 = spatial_features_1 + pos_1d_1
+            spatial_features_2 = spatial_features_2 + pos_1d_2
+
+            spatial_features_1 = spatial_layer(spatial_features_1, spatial_features_2, context_1, pos_2d)
+            spatial_features_2 = spatial_layer(spatial_features_2, spatial_features_1, context_1, pos_2d)
+
+        spatial_features_1 = spatial_features_1.view(T, B, H * W, C)
+        spatial_features_2 = spatial_features_2.view(T, B, H * W, C)
+
+        padding = torch.zeros_like(spatial_features_1[0]).unsqueeze(0)
+        spatial_features_1_seg = torch.cat([spatial_features_1, padding], dim=0)
+        spatial_features_2_seg = torch.cat([padding, spatial_features_2], dim=0)
+        spatial_features_seg = spatial_features_1_seg + spatial_features_2_seg
+
+        return spatial_features_1, spatial_features_2, spatial_features_seg
 
 class TransformerDecoderLayer(nn.Module):
     def __init__(self, dim, num_heads, d_ffn, dropout=0.0):
@@ -1333,7 +2125,7 @@ class CrossRelativeSpatialTransformerLayer(nn.Module):
 
 class CrossTransformerEncoderLayer(nn.Module):
 
-    def __init__(self, d_model, nhead, dim_feedforward, dropout=0.0,
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.0,
                  activation="gelu", normalize_before=False):
         super().__init__()
         self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
@@ -1374,7 +2166,7 @@ class CrossTransformerEncoderLayer(nn.Module):
                 src_key_padding_mask: Optional[Tensor] = None,
                 query_pos: Optional[Tensor] = None,
                 key_pos: Optional[Tensor] = None):
-        return self.forward_post(query, key, value, src_mask, src_key_padding_mask, query_pos=query_pos, key_pos=key_pos)
+        return self.forward_post(query, key, value, src_mask, src_key_padding_mask, query_pos=query_pos, key_pos=key_pos)[0]
 
 
 class RelativeTransformerEncoderLayer(nn.Module):
