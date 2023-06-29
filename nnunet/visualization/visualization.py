@@ -36,24 +36,16 @@ class Visualizer(object):
     def __init__(self, 
                 unlabeled, 
                 adversarial_loss,
-                middle_unlabeled,
-                middle,
                 registered_seg,
                 writer,
-                area_size=None,
-                wide_attention=None,
                 crop_size=None):
         self.unlabeled = unlabeled
-        self.middle_unlabeled = middle_unlabeled
         self.adversarial_loss = adversarial_loss
         self.affinity = False
-        self.middle = middle
         self.registered_seg = registered_seg
         self.writer = writer
         self.dices = []
         self.eval_images = self.initialize_image_data()
-        self.area_size = area_size
-        self.wide_attention = wide_attention
         self.crop_size = crop_size
     
     def reset(self):
@@ -83,6 +75,8 @@ class Visualizer(object):
         eval_images['weights'] = None
         eval_images['seg_sequence'] = None
         eval_images['seg_sequence_mask'] = None
+        eval_images['seg_registered'] = None
+        eval_images['seg_registered_long'] = None
 
         for key in eval_images.keys():
             data = []
@@ -127,6 +121,13 @@ class Visualizer(object):
                     payload = {'input': None,
                                 'pred': None,
                                 'gt': None}
+                    score = -1
+                    data.append(payload)
+                    scores.append(score)
+            elif key == 'seg_registered_long':
+                for i in range(log_images_nb):
+                    payload = {'seg_registered_long': None,
+                                'target': None}
                     score = -1
                     data.append(payload)
                     scores.append(score)
@@ -177,6 +178,12 @@ class Visualizer(object):
                             'fixed': None,
                             'target': None,
                             'motion_flow': None}
+                score = -1
+                data.append(payload)
+                scores.append(score)
+            elif key == 'seg_registered':
+                payload = {'seg_registered': None,
+                           'target': None}
                 score = -1
                 data.append(payload)
                 scores.append(score)
@@ -527,9 +534,9 @@ class Visualizer(object):
         self.writer.add_images(os.path.join('Registered_x', 'registered_seg').replace('\\', '/'), registered_seg_list, epoch, dataformats='NHWC')
 
     def log_long_registered_images(self, epoch):
-        moving = self.eval_images['long_registered'][0, 0]['moving'] # H, W
-        fixed = self.eval_images['long_registered'][0, 0]['fixed'] # H, W
-        registered_input = self.eval_images['long_registered'][0, 0]['registered_input'] # H, W
+        moving = self.eval_images['long_registered'][0, -1]['moving'] # H, W
+        fixed = self.eval_images['long_registered'][0, -1]['fixed'] # H, W
+        registered_input = self.eval_images['long_registered'][0, -1]['registered_input'] # H, W
 
         moving = self.get_images_ready_for_display(moving, colormap=None)
         fixed = self.get_images_ready_for_display(fixed, colormap=None)
@@ -540,12 +547,27 @@ class Visualizer(object):
         self.writer.add_images(os.path.join('Long registration', 'registered_input').replace('\\', '/'), registered_input, epoch, dataformats='HWC')
 
 
+    def log_seg_registered_images(self, colormap_seg, norm, epoch):
+        target = self.eval_images['seg_registered'][0, -1]['target'] # H, W
+        seg = self.eval_images['seg_registered'][0, -1]['seg_registered'] # T, H, W
+
+        target = self.get_seg_images_ready_for_display(target, colormap=colormap_seg, norm=norm)
+
+        seg_list = []
+        for t in range(len(seg)):
+            current_seg = self.get_seg_images_ready_for_display(seg[t], colormap=colormap_seg, norm=norm)
+            seg_list.append(current_seg)
+        
+        seg = np.stack(seg_list, axis=0)
+
+        self.writer.add_images(os.path.join('Seg registered', 'Ground truth').replace('\\', '/'), target, epoch, dataformats='HWC')
+        self.writer.add_images(os.path.join('Seg registered', 'Registered').replace('\\', '/'), seg, epoch, dataformats='NHWC')
+
+
     def log_sequence_seg_images(self, colormap_seg, norm, epoch):
         x = self.eval_images['seg_sequence'][0, -1]['input'] # T, H, W
         gt = self.eval_images['seg_sequence'][0, -1]['gt'] # H, W
         seg = self.eval_images['seg_sequence'][0, -1]['pred'] # T, H, W
-
-        assert len(seg) == len(x)
 
         gt = self.get_seg_images_ready_for_display(gt, colormap=colormap_seg, norm=norm)
 
@@ -715,6 +737,18 @@ class Visualizer(object):
         self.writer.add_images(os.path.join('Best segmentations', 'input').replace('\\', '/'), input_list, epoch, dataformats='NHWC')
         self.writer.add_images(os.path.join('Best segmentations', 'ground_truth').replace('\\', '/'), gt_list, epoch, dataformats='NHWC')
         self.writer.add_images(os.path.join('Best segmentations', 'prediction').replace('\\', '/'), pred_list, epoch, dataformats='NHWC')
+
+    def log_seg_registered_long_images(self, colormap, norm, epoch):
+        gt_list = [x['target'] for x in self.eval_images['seg_registered_long'][0]]
+        gt_list = [self.get_seg_images_ready_for_display(x, colormap, norm) for x in gt_list]
+        gt_list = np.stack(gt_list, axis=0)
+
+        pred_list = [x['seg_registered_long'] for x in self.eval_images['seg_registered_long'][0]]
+        pred_list = [self.get_seg_images_ready_for_display(x, colormap, norm) for x in pred_list]
+        pred_list = np.stack(pred_list, axis=0)
+
+        self.writer.add_images(os.path.join('Seg registered long', 'target').replace('\\', '/'), gt_list, epoch, dataformats='NHWC')
+        self.writer.add_images(os.path.join('Seg registered long', 'prediction').replace('\\', '/'), pred_list, epoch, dataformats='NHWC')
     
     def log_worst_seg_images(self, colormap, norm, epoch):
         input_list = [x['input'] for x in self.eval_images['worst_seg'][0]]
@@ -1434,6 +1468,37 @@ class Visualizer(object):
 
             sorted_indices = self.eval_images['best_seg'][1, :].argsort()
             self.eval_images['best_seg'] = self.eval_images['best_seg'][:, sorted_indices]
+
+    
+    def set_up_image_seg_registered(self, seg_dice, seg_registered, target):
+        seg_dice = seg_dice.cpu().numpy()
+        seg_registered = seg_registered.cpu().numpy()
+        target = target.cpu().numpy()
+
+        if self.eval_images['seg_registered'][1, 0] <= seg_dice:
+
+            self.eval_images['seg_registered'][0, 0]['target'] = target.astype(np.float32)
+            self.eval_images['seg_registered'][0, 0]['seg_registered'] = seg_registered.astype(np.float32)
+            self.eval_images['seg_registered'][1, 0] = seg_dice
+
+            sorted_indices = self.eval_images['seg_registered'][1, :].argsort()
+            self.eval_images['seg_registered'] = self.eval_images['seg_registered'][:, sorted_indices]
+    
+
+    def set_up_image_seg_registered_long(self, seg_dice, seg_registered_long, target):
+        seg_dice = seg_dice.cpu().numpy()
+        seg_registered_long = seg_registered_long.cpu().numpy()
+        target = target.cpu().numpy()
+
+        if self.eval_images['seg_registered_long'][1, 0] <= seg_dice:
+
+            self.eval_images['seg_registered_long'][0, 0]['target'] = target.astype(np.float32)
+            self.eval_images['seg_registered_long'][0, 0]['seg_registered_long'] = seg_registered_long.astype(np.float32)
+            self.eval_images['seg_registered_long'][1, 0] = seg_dice
+
+            sorted_indices = self.eval_images['seg_registered_long'][1, :].argsort()
+            self.eval_images['seg_registered_long'] = self.eval_images['seg_registered_long'][:, sorted_indices]
+
     
     def set_up_image_seg_worst(self, seg_dice, gt, pred, x):
         seg_dice = seg_dice.cpu().numpy()

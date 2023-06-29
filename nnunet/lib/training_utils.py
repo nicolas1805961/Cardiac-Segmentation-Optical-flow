@@ -450,6 +450,13 @@ def read_config(filename, middle, video):
     assert len(config['transformer_depth']) == len(config['num_heads']), "transformer_depth and num_heads must have the same size"
     return config
 
+def read_config_video(filename):
+    yaml = YAML()
+    with open(filename) as file:
+        config = yaml.load(file)
+
+    return config
+
 def write_model_parameters(model):
     with open('model.txt', 'a') as out_file:
         model_dict = model.state_dict()
@@ -873,26 +880,25 @@ def build_flow_model(config, conv_layer_2d, conv_layer_1d, norm_2d, norm_1d, ima
     return model
 
 
-def build_flow_model_4(config, conv_layer_2d, conv_layer_1d, norm_2d, norm_1d, image_size, log_function):
+def build_flow_model_4(config, conv_layer_2d, norm_2d, image_size, log_function):
 
     model = OpticalFlowModel4(deep_supervision=config['deep_supervision'],
+             one_to_all=(config['one_to_all'] or config['all_to_all']),
              out_encoder_dims=config['out_encoder_dims'],
+             inference_mode=config['inference_mode'],
+             bidirectional=config['bidirectional'],
              device=config['device'],
              in_dims=config['in_encoder_dims'],
              nb_layers=config['nb_layers'],
              image_size=image_size,
-             blackout=config['blackout'],
-             num_bottleneck_layers=config['num_bottleneck_layers'],
              conv_layer_2d=conv_layer_2d,
-             conv_layer_1d=conv_layer_1d,
              conv_depth=config['conv_depth'],
              bottleneck_heads=config['bottleneck_heads'],
              drop_path_rate=config['drop_path_rate'],
              log_function=log_function,
              nb_tokens=config['nb_tokens'],
              dot_multiplier=config['dot_multiplier'],
-             lookback=config['lookback'],
-             norm_1d=norm_1d,
+             temporal_kernel_size=config['temporal_kernel_size'],
              norm_2d=norm_2d)
         
     model = model.to(config['device'])

@@ -14,14 +14,12 @@ import matplotlib
 class ImageFlowLoss(nn.Module):
     def __init__(self, writer, w_xy, w_z):
         super(ImageFlowLoss, self).__init__()
-        self.mse_loss = nn.MSELoss()
         self.epsilon = torch.Tensor([0.01]).float().to('cuda')
         self.writer = writer
         self.w_xy = w_xy
         self.w_z = w_z
 
-    def forward(self, registered, target, flow, iter_nb=None):
-        mse = self.mse_loss(registered, target)
+    def forward(self, flow, iter_nb=None):
         if flow.dim() == 4:
             B, C, H, W = flow.shape
             flow = flow[None]
@@ -46,8 +44,8 @@ class ImageFlowLoss(nn.Module):
         huber_z = torch.sqrt(self.epsilon + torch.sum(gradient[:, :, 2].pow(2)))
         if iter_nb is not None:
             #self.writer.add_scalar('Iteration/lambda', w, iter_nb)
-            self.writer.add_scalars('Iteration/flow_loss_components', {'similarity': mse, 'regularization_xy': self.w_xy * huber_xy, 'regularization_z': self.w_z * huber_z}, iter_nb)
-        return mse + self.w_xy * huber_xy + self.w_z * huber_z
+            self.writer.add_scalars('Iteration/flow_loss_components', {'regularization_xy': self.w_xy * huber_xy, 'regularization_z': self.w_z * huber_z}, iter_nb)
+        return self.w_xy * huber_xy + self.w_z * huber_z
 
 #class Approx_Huber_Loss(nn.Module):
 #    def __init__(self):

@@ -8,19 +8,26 @@ convolutional_patch_embedding: True
 #strong_network_lr: 0.0001
 #strong_network_decay: 0.0001
 
-lookback: 2
+seg_registered_target_loss_weight: 1.0
+seg_registered_pred_loss_weight: 1.0
+pred_registered_pred_loss_weight: 0.0
+pred_registered_target_loss_weight: 0.0
+
+bidirectional: False
+blackout_percent: 0.0
+all_to_all: True
+one_to_all: False
+inference_mode: one_step # sliding_window, one_step, overlap
+temporal_kernel_size: 8
 load_only_batchnorm: False
-blackout: False
 consistency_loss_weight: 0.0 #0.01
-regularization_weight_xy: 0.001
-regularization_weight_z: 0.001
+regularization_weight_xy: 0.0 #0.01
+regularization_weight_z: 0.0 #0.01
 dot_multiplier: 2
 nb_tokens: 8
-segmentation_loss_weight: 0.1 # 0.1
-segmentation_flow_loss_weight: 0.0 # 0.01
-image_flow_loss_weight: 1.0 # 1.0
-long_image_flow_loss_weight: 0.0 # 1.0
-step: 1
+segmentation_loss_weight: 1.0 # 1.0
+image_flow_loss_weight: 0.0 # 0.0
+long_image_flow_loss_weight: 0.0 # 0.0
 force_one_label: True
 feature_extractor: False
 video_length: 2
@@ -29,72 +36,38 @@ cropper_weights_folder_path: 'binary'
 video_weights_folder_path: 'pretrained'
 crop_size: 128
 nb_layers: 1
-slots: True
-area_size: [16, 16, 16]
-use_patches: True
-deformable_points: 4
-merge_temporal_tokens: False
-nb_zones: 8
 
 unlabeled: False
 log_images: True
-filter_skip_co_segmentation: False
 patch_size: [224, 224]
-transformer_bottleneck: True
 device: 'cuda:0'
 deep_supervision: False
-add_extra_bottleneck_blocks: True
-classification_weight: 0.1 #1.45
-classification: False
-asymmetric_unet: False
-epoch_log: 10 #10
+epoch_log: 1 #10
 scheduler: 'cosine'
 optimizer: 'adam'
 initial_lr: 0.0001 #0.0001
 weight_decay: 0.0001 #0.0001
 warmup_percent: 0.1
-smoothing: 0.0
-max_num_epochs: 1 #400
+max_num_epochs: 200 #400
 #window_size: 7
 #image_size: 224
 norm: 'batchnorm' # 'instancenorm', 'batchnorm'
 bottleneck_heads: 8 # 16
 activation: 'gelu'
 conv_layer: 'other'
-num_bottleneck_layers: 1
 dropout: 0
 conv_depth: [2, 2, 2]
 transformer_depth: [] #[2, 2, 2], [2]
 num_heads: [] #[3, 6, 12], [8] [12]
 spatial_cross_attention_num_heads: [8, 8, 8] #[2, 4, 6, 8, 12] [12, 8, 6, 4, 2] [bottom, ..., top] [3, 6, 12] [4, 4, 8, 8, 16]
-method: 'equal'
-batch_size: 1 #16
-bottleneck: 'swin' # ['vit', 'swin', 'factorized', 'vit_3d', 'swin_3d']
-rpe_mode: 'bias' # ['contextual', 'bias', 'None']
-rpe_contextual_tensors: 'qkv'
+batch_size: 3 #16
 drop_path_rate: 0.0
-autoencoder_dim: 64
 in_encoder_dims: [1, 128, 256] #[1, 24, 96, 192, 384] [1, 96, 384] [1, 24, 96] [1, 32, 128] [1, 32, 128, 256, 512] [1, 48, 192] [1, 96, 192]
 out_encoder_dims: [64, 128, 256] #[24, 48, 96, 192, 384] [96, 192, 384] [24, 48, 96] [32, 64, 128] [32, 64, 128, 256, 512] [48, 96, 192] [96, 192, 384]
-spatial_transformer_loss: 'focal_and_dice'
 loss: 'ce_and_dice' # ['ce_and_dice', 'focal_and_dice', 'topk_and_dice', 'ce']
-unlabeled_loss: 'focal_and_dice' # ['dice', 'dice_and_boundary', 'dice_and_perimeter', 'generalized_dice', 'cross_entropy', 'generalized_dice_and_boundary', 'cross_entropy', 'topk_and_dice', 'topk_and_generalized_dice', 'focal_and_dice', 'focal_and_generalized_dice']
-semi_supervised: False
-topk_percent: 0.1
-unlabeled_loss_weight_start: 0.0
-unlabeled_loss_weight_end: 1.0
-swin_abs_pos: False
-blur: False
-blur_kernel: [1, 2, 1]
-use_spatial_transformer: False
-localization_weight: 1
-mlp_intermediary_dim: 256
-use_conv_mlp: True
-proj: 'linear' # 'linear', 'conv'
-concat_spatial_cross_attention: True
 
 do_adv: False
-adversarial_weight: 0.01
+adversarial_weight: 0.0
 discriminator_depth: [2, 2, 2]
 discriminator_in_dims: [4, 128, 256]
 discriminator_out_dims: [64, 128, 256]

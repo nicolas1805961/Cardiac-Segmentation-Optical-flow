@@ -24,7 +24,7 @@ from nnunet.training.network_training.nnUNetTrainerCascadeFullRes import nnUNetT
 from nnunet.training.network_training.nnUNetTrainerV2_CascadeFullRes import nnUNetTrainerV2CascadeFullRes
 from nnunet.utilities.task_name_id_conversion import convert_id_to_task_name
 
-from nnunet.lib.training_utils import read_config
+from nnunet.lib.training_utils import read_config, read_config_video
 from pathlib import Path
 
 import warnings
@@ -144,8 +144,8 @@ def main():
     #     force_separate_z = True
     # else:
     #     raise ValueError("force_separate_z must be None, True or False. Given: %s" % force_separate_z)
-    if network_trainer in ['nnMTLTrainerV2Video', 'nnMTLTrainerV2Flow', 'nnMTLTrainerV2Flow3', 'nnMTLTrainerV2Flow2', 'nnMTLTrainerV2Flow4']:
-        config = read_config(os.path.join(Path.cwd(), 'video.yaml'), middle=False, video=True)
+    if network_trainer in ['nnMTLTrainerV2Video', 'nnMTLTrainerV2Flow', 'nnMTLTrainerV2Flow3', 'nnMTLTrainerV2Flow2', 'nnMTLTrainerV2Flow4', 'nnMTLTrainerV2Flow5']:
+        config = read_config_video(os.path.join(Path.cwd(), 'video.yaml'))
     else:
         config = read_config(os.path.join(Path.cwd(), 'adversarial_acdc.yaml'), middle=False, video=False)
 

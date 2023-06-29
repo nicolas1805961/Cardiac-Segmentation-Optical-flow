@@ -1748,8 +1748,8 @@ class DataLoaderVideoUnlabeled(SlimDataLoaderBase):
         return {'data': data, 'seg': seg, 'properties': case_properties, "keys": keys, "labeled_binary": labeled_binary}
 
 
-class DataLoaderFlow3(SlimDataLoaderBase):
-    def __init__(self, data, patch_size, final_patch_size, batch_size, unlabeled_dataset, video_length, step, force_one_label, processor, is_val, crop_size, oversample_foreground_percent=0.0,
+class DataLoaderFlowTrain5(SlimDataLoaderBase):
+    def __init__(self, data, patch_size, final_patch_size, batch_size, unlabeled_dataset, video_length, processor, crop_size, is_val, oversample_foreground_percent=0.0,
                  memmap_mode="r", pseudo_3d_slices=1, pad_mode="edge",
                  pad_kwargs_data=None, pad_sides=None):
         """
@@ -1776,13 +1776,13 @@ class DataLoaderFlow3(SlimDataLoaderBase):
         :param random: sample randomly; CAREFUL! non-random sampling requires batch_size=1, otherwise you will iterate batch_size times over the dataset
         :param pseudo_3d_slices: 7 = 3 below and 3 above the center slice
         """
-        super(DataLoaderFlow3, self).__init__(data, batch_size, None)
+        super(DataLoaderFlowTrain5, self).__init__(data, batch_size, None)
         if pad_kwargs_data is None:
             pad_kwargs_data = OrderedDict()
         self.pad_kwargs_data = pad_kwargs_data
         self.pad_mode = pad_mode
-        self.crop_size = crop_size
         self.is_val = is_val
+        self.crop_size = crop_size
         self.pseudo_3d_slices = pseudo_3d_slices
         self.oversample_foreground_percent = oversample_foreground_percent
         self.final_patch_size = final_patch_size
@@ -1792,9 +1792,7 @@ class DataLoaderFlow3(SlimDataLoaderBase):
         self.need_to_pad = np.array(patch_size) - np.array(final_patch_size)
         self.memmap_mode = memmap_mode
         self.video_length = video_length
-        self.step = step
         self.percent = None
-        self.force_one_label = force_one_label
         if pad_sides is not None:
             if not isinstance(pad_sides, np.ndarray):
                 pad_sides = np.array(pad_sides)
@@ -1930,11 +1928,12 @@ class DataLoaderFlow3(SlimDataLoaderBase):
                                     ])
 
         pixel_transform = Compose([
+                                #RandInvertd(keys=['image'], prob=0.5),
+                                T.RandAdjustContrastd(keys=['image'], prob=0.2, gamma=(0.7, 1.5), allow_missing_keys=True),
                                 T.RandGaussianNoised(keys=['image'], prob=0.2, std=0.04, allow_missing_keys=True),
                                 T.RandScaleIntensityd(keys=['image'], prob=0.2, factors=0.2, allow_missing_keys=True),
-                                T.RandAdjustContrastd(keys=['image'], prob=0.2, gamma=(0.7, 1.5), allow_missing_keys=True),
-                                T.RandGaussianSmoothd(keys=['image'], prob=0.2, sigma_x=(0.25, 0.75), sigma_y=(0.25, 0.75), allow_missing_keys=True),
-                                T.RandGaussianSharpend(keys=['image'], prob=0.2, sigma1_x=(0.2, 0.3), sigma1_y=(0.2, 0.3), sigma2_x=0.2, sigma2_y=0.2, alpha=(20.0, 20.0), allow_missing_keys=True)
+                                T.RandGaussianSmoothd(keys=['image'], prob=0.2, sigma_x=(0.25, 0.5), sigma_y=(0.25, 0.5), allow_missing_keys=True),
+                                T.RandGaussianSharpend(keys=['image'], prob=0.2, sigma1_x=(0.1, 0.2), sigma1_y=(0.1, 0.2), sigma2_x=(0.2, 0.4), sigma2_y=(0.2, 0.4), alpha=(2.0, 3.0), allow_missing_keys=True)
                                 ])
 
         return pixel_transform, spatial_transform
@@ -1949,15 +1948,13 @@ class DataLoaderFlow3(SlimDataLoaderBase):
             un_filtered = [x for x in self.un_list_of_keys if x[:10] in patient_id]
             filtered = l_filtered + un_filtered
             list_of_frames.append(filtered)
-
-        unlabeled = torch.full(size=(self.video_length, self.batch_size, 1, *self.final_patch_size), fill_value=torch.nan, device='cuda:0')
-        seg = torch.full(size=(self.batch_size, 1, *self.final_patch_size), fill_value=torch.nan, device='cuda:0')
-
-        cropped_unlabeled = torch.full(size=(self.video_length, self.batch_size, 1, self.crop_size, self.crop_size), fill_value=torch.nan, device='cuda:0')
-        cropped_seg = torch.full(size=(self.batch_size, 1, self.crop_size, self.crop_size), fill_value=torch.nan, device='cuda:0')
+        
+        target_list = []
+        unlabeled_list = []
+        padding_need_list = []
+        target_mask_list = []
 
         case_properties = []
-        padding_need_list = []
         for j, frames in enumerate(list_of_frames):
             labeled_frame = frames[0]
             if 'properties' in self._data[labeled_frame].keys():
@@ -1971,32 +1968,45 @@ class DataLoaderFlow3(SlimDataLoaderBase):
 
             frames = sorted(frames, key=lambda x: int(x[16:18]))
             frames = np.array(frames)
-            labeled_idx = np.where(~np.char.endswith(frames, '_u'))[0]
+            global_labeled_idx = np.where(~np.char.endswith(frames, '_u'))[0]
+            assert len(global_labeled_idx) == 2
 
-            values = np.arange(len(frames))
-            values = np.pad(values, (10000, 10000), mode='wrap')
-            #print(values[:50])
-            #labeled_indices = np.nonzero(np.isin(values, labeled_idx))
-            #print(labeled_indices)
+            unlabeled = torch.full(size=(self.video_length, 1, *self.final_patch_size), fill_value=torch.nan, device='cuda:0')
+            seg = torch.full(size=(self.video_length, 1, *self.final_patch_size), fill_value=torch.nan, device='cuda:0')
+            cropped_unlabeled = torch.full(size=(self.video_length, 1, self.crop_size, self.crop_size), fill_value=torch.nan, device='cuda:0')
+            cropped_seg = torch.full(size=(self.video_length, 1, self.crop_size, self.crop_size), fill_value=torch.nan, device='cuda:0')
+            target_mask = torch.zeros(size=(self.video_length - 2,), dtype=bool, device='cuda:0')
 
-            if self.step > 1:
-                #start = np.random.choice(labeled_indices)
-                values = values[::self.step]
+            possible_indices = np.arange(0, len(frames))
+            possible_indices = set(global_labeled_idx).symmetric_difference(possible_indices)
+            possible_indices = np.array(list(possible_indices))
 
-            windows = sliding_window_view(values, self.video_length)
-            #mask = np.isin(windows[:, -1], labeled_idx)
-            if self.is_val:
-                mask = np.isin(windows[:, -1], labeled_idx)
-            else:
-                mask = np.isin(windows, labeled_idx)
-                mask = np.any(mask, axis=1)
-            windows = windows[mask]
-            window_idx = np.random.choice(len(windows))
-            frame_indices = windows[window_idx]
+            random_indices = np.random.choice(possible_indices, size=self.video_length - 2)
+            frame_indices = np.concatenate([global_labeled_idx.reshape((-1,)), random_indices])
+            sorted_indices = np.argsort(frame_indices)
+            frame_indices = frame_indices[sorted_indices]
+            target_mask = torch.cat([torch.tensor([True, True], device='cuda:0').reshape((-1,)), target_mask])
+            target_mask = target_mask[sorted_indices]
+
+            before_where = np.argwhere(frame_indices < global_labeled_idx[0]).reshape(-1,)
+            after_where = np.argwhere(frame_indices >= global_labeled_idx[0]).reshape(-1,)
+
+            before_indices = frame_indices[before_where]
+            after_indices = frame_indices[after_where]
+
+            before_mask = target_mask[before_where]
+            after_mask = target_mask[after_where]
+
+            frame_indices = np.concatenate([after_indices, before_indices])
+            target_mask = torch.cat([after_mask, before_mask])
+            assert frame_indices[0] == global_labeled_idx[0]
+
             assert len(frame_indices) == self.video_length
             video = frames[frame_indices]
 
-            for idx, t in enumerate(video):
+            labeled_idx = np.where(~np.char.endswith(video, '_u'))[0]
+
+            for frame_idx, t in enumerate(video):
 
                 if '_u' in t:
                     if not isfile(self.un_data[t]['data_file'][:-4] + ".npy"):
@@ -2032,49 +2042,58 @@ class DataLoaderFlow3(SlimDataLoaderBase):
 
                     image, mask = self.preprocess(image, mask)
 
-                    seg[j] = mask
-                    labeled_idx = idx
+                    if target_mask[frame_idx] == True:
+                        seg[frame_idx] = mask
+                        assert frame_idx in labeled_idx
                 else:
                     image = slice_data.copy()
                     image = image + 1e-8
 
                     image, _ = self.preprocess(image, None)
 
-                unlabeled[idx, j] = image
+                unlabeled[frame_idx] = image
 
             with torch.no_grad():
-                mean_centroid, _ = self.processor.preprocess_no_registration(data=unlabeled[:, j]) # T, C(1), H, W
+                mean_centroid, _ = self.processor.preprocess_no_registration(data=unlabeled) # T, C(1), H, W
 
-                cropped_unlabeled[:, j], padding_need = self.processor.crop_and_pad(data=unlabeled[:, j], mean_centroid=mean_centroid)
+                cropped_unlabeled, padding_need = self.processor.crop_and_pad(data=unlabeled, mean_centroid=mean_centroid)
                 padding_need_list.append(padding_need)
 
-                current_cropped_seg, _ = self.processor.crop_and_pad(data=seg[j][None], mean_centroid=mean_centroid)
-                cropped_seg[j] = current_cropped_seg[0]
+                cropped_seg, _ = self.processor.crop_and_pad(data=seg, mean_centroid=mean_centroid)
 
-            cropped_unlabeled[:, j] = (cropped_unlabeled[:, j] - cropped_unlabeled[:, j].min()) / (cropped_unlabeled[:, j].max() - cropped_unlabeled[:, j].min() + 1e-8)
-            cropped_unlabeled[:, j] = cropped_unlabeled[:, j] + 1e-8
+            cropped_unlabeled = (cropped_unlabeled - cropped_unlabeled.min()) / (cropped_unlabeled.max() - cropped_unlabeled.min() + 1e-8)
+            cropped_unlabeled = cropped_unlabeled + 1e-8
 
-            assert torch.any(cropped_unlabeled[0] != cropped_unlabeled[1])
-            temp_before_augment = torch.clone(cropped_unlabeled).to('cpu')
-            
+            assert torch.count_nonzero(torch.any(~torch.isnan(cropped_seg.reshape(self.video_length, -1)), dim=-1)) == 2
+            assert target_mask[0] == True
+
             if not self.is_val:
+                temp_before_augment = torch.clone(cropped_unlabeled).to('cpu')
+                
                 seed = random.randint(0, 2**32-1)
                 #cropped_labeled[j], cropped_seg[j] = self.augment(image=cropped_labeled[j], mask=cropped_seg[j], seed=seed)
 
                 for t in range(len(cropped_unlabeled)):
-                    cropped_unlabeled[t, j], temp_seg = self.augment(image=cropped_unlabeled[t, j], mask=cropped_seg[j], seed=seed)
+                    cropped_unlabeled[t], cropped_seg[t] = self.augment(image=cropped_unlabeled[t], mask=cropped_seg[t], seed=seed)
 
-                cropped_seg[j] = temp_seg
-
-                #matplotlib.use('QtAgg')
-                #fig, ax = plt.subplots(2, len(cropped_unlabeled))
-                #for t in range(len(cropped_unlabeled)):
-                #    ax[0, t].imshow(cropped_unlabeled[t, j, 0].cpu(), cmap='gray')
-                #    ax[1, t].imshow(temp_before_augment[t, j, 0].cpu(), cmap='gray')
-                #plt.show()
+            #matplotlib.use('QtAgg')
+            #fig, ax = plt.subplots(3, len(cropped_unlabeled))
+            #for t in range(len(cropped_unlabeled)):
+            #    ax[0, t].imshow(temp_before_augment[t, 0].cpu(), cmap='gray')
+            #    ax[1, t].imshow(cropped_unlabeled[t, 0].cpu(), cmap='gray')
+            #    ax[2, t].imshow(cropped_seg[t, 0].cpu(), cmap='gray')
+            #plt.show()
                     
+            cropped_unlabeled = NormalizeIntensity(nonzero=True)(cropped_unlabeled)
 
-            cropped_unlabeled[:, j] = NormalizeIntensity(nonzero=True)(cropped_unlabeled[:, j])
+            unlabeled_list.append(cropped_unlabeled)
+            target_list.append(cropped_seg)
+            target_mask_list.append(target_mask)
+
+        unlabeled = torch.stack(unlabeled_list, dim=1) # T, B, 1, H, W
+        target = torch.stack(target_list, dim=1) # T, B, 1, H, W
+        target_mask = torch.stack(target_mask_list, dim=1) # T, B
+        padding_need = torch.stack(padding_need_list, dim=0) # B, 4
 
         keys = selected_keys
 
@@ -2086,20 +2105,16 @@ class DataLoaderFlow3(SlimDataLoaderBase):
         #ax[1].imshow(seg[3, 0], cmap='gray')
         #plt.show()
 
-
-        assert torch.all(torch.isin(cropped_seg, torch.tensor([0, 1, 2, 3], device=cropped_seg.device)))
-        padding_need = torch.stack(padding_need_list, dim=0) # B, 4
-
-        return {'unlabeled':cropped_unlabeled, 
-                'target': cropped_seg,
+        return {'unlabeled':unlabeled, 
+                'target': target,
                 'padding_need': padding_need,
                 'properties': case_properties, 
                 "keys": keys,
-                'labeled_idx': labeled_idx}
+                'target_mask': target_mask}
 
 
 class DataLoaderFlowTrain(SlimDataLoaderBase):
-    def __init__(self, data, patch_size, final_patch_size, batch_size, unlabeled_dataset, video_length, step, force_one_label, processor, crop_size, oversample_foreground_percent=0.0,
+    def __init__(self, data, patch_size, final_patch_size, batch_size, unlabeled_dataset, video_length, random_step, one_to_all, processor, crop_size, oversample_foreground_percent=0.0,
                  memmap_mode="r", pseudo_3d_slices=1, pad_mode="edge",
                  pad_kwargs_data=None, pad_sides=None):
         """
@@ -2141,9 +2156,9 @@ class DataLoaderFlowTrain(SlimDataLoaderBase):
         self.need_to_pad = np.array(patch_size) - np.array(final_patch_size)
         self.memmap_mode = memmap_mode
         self.video_length = video_length
-        self.step = step
+        self.random_step = random_step
         self.percent = None
-        self.force_one_label = force_one_label
+        self.one_to_all = one_to_all
         if pad_sides is not None:
             if not isinstance(pad_sides, np.ndarray):
                 pad_sides = np.array(pad_sides)
@@ -2333,13 +2348,17 @@ class DataLoaderFlowTrain(SlimDataLoaderBase):
             #labeled_indices = np.nonzero(np.isin(values, labeled_idx))
             #print(labeled_indices)
 
-            if self.step > 1:
-                #start = np.random.choice(labeled_indices)
-                values = values[::self.step]
+            if self.random_step:
+                step = np.random.randint(1, 3)
+                values = values[::step]
 
             windows = sliding_window_view(values, self.video_length)
-            mask = np.isin(windows, global_labeled_idx)
-            mask = np.any(mask, axis=1)
+            #print(np.isin(windows[:, 0], global_labeled_idx))
+            if self.one_to_all:
+                mask = np.isin(windows[:, 0], global_labeled_idx)
+            else:
+                mask = np.isin(windows, global_labeled_idx)
+                mask = np.any(mask, axis=1)
             windows = windows[mask]
             window_idx = np.random.choice(len(windows))
             frame_indices = windows[window_idx]
@@ -2412,24 +2431,27 @@ class DataLoaderFlowTrain(SlimDataLoaderBase):
             assert torch.count_nonzero(torch.any(~torch.isnan(cropped_seg.reshape(self.video_length, -1)), dim=-1)) == 1
 
             assert torch.any(cropped_unlabeled[0] != cropped_unlabeled[1])
+
             temp_before_augment = torch.clone(cropped_unlabeled).to('cpu')
             
             seed = random.randint(0, 2**32-1)
             #cropped_labeled[j], cropped_seg[j] = self.augment(image=cropped_labeled[j], mask=cropped_seg[j], seed=seed)
 
             for t in range(len(cropped_unlabeled)):
-                cropped_unlabeled[t], temp_seg = self.augment(image=cropped_unlabeled[t], mask=cropped_seg[t], seed=seed)
-
-            cropped_seg[t] = temp_seg
+                cropped_unlabeled[t], cropped_seg[t] = self.augment(image=cropped_unlabeled[t], mask=cropped_seg[t], seed=seed)
 
             #matplotlib.use('QtAgg')
-            #fig, ax = plt.subplots(2, len(cropped_unlabeled))
+            #fig, ax = plt.subplots(3, len(cropped_unlabeled))
             #for t in range(len(cropped_unlabeled)):
-            #    ax[0, t].imshow(cropped_unlabeled[t, j, 0].cpu(), cmap='gray')
-            #    ax[1, t].imshow(temp_before_augment[t, j, 0].cpu(), cmap='gray')
+            #    ax[0, t].imshow(temp_before_augment[t, 0].cpu(), cmap='gray')
+            #    ax[1, t].imshow(cropped_unlabeled[t, 0].cpu(), cmap='gray')
+            #    ax[2, t].imshow(cropped_seg[t, 0].cpu(), cmap='gray')
             #plt.show()
                     
             cropped_unlabeled = NormalizeIntensity(nonzero=True)(cropped_unlabeled)
+
+            if self.one_to_all:
+                assert target_mask[0] == True
 
             unlabeled_list.append(cropped_unlabeled)
             target_list.append(cropped_seg)
@@ -2458,7 +2480,8 @@ class DataLoaderFlowTrain(SlimDataLoaderBase):
                 'target_mask': target_mask}
     
 
-class DataLoaderFlowValidation(SlimDataLoaderBase):
+
+class DataLoaderFlowValidationOneStep(SlimDataLoaderBase):
     def __init__(self, data, patch_size, final_patch_size, batch_size, unlabeled_dataset, video_length, step, force_one_label, processor, crop_size, oversample_foreground_percent=0.0,
                  memmap_mode="r", pseudo_3d_slices=1, pad_mode="edge",
                  pad_kwargs_data=None, pad_sides=None):
@@ -2486,7 +2509,7 @@ class DataLoaderFlowValidation(SlimDataLoaderBase):
         :param random: sample randomly; CAREFUL! non-random sampling requires batch_size=1, otherwise you will iterate batch_size times over the dataset
         :param pseudo_3d_slices: 7 = 3 below and 3 above the center slice
         """
-        super(DataLoaderFlowValidation, self).__init__(data, batch_size, None)
+        super(DataLoaderFlowValidationOneStep, self).__init__(data, batch_size, None)
         if pad_kwargs_data is None:
             pad_kwargs_data = OrderedDict()
         self.pad_kwargs_data = pad_kwargs_data
@@ -2670,7 +2693,6 @@ class DataLoaderFlowValidation(SlimDataLoaderBase):
 
         case_properties = []
         for j, frames in enumerate(list_of_frames):
-            print(len(frames))
             labeled_frame = frames[0]
             if 'properties' in self._data[labeled_frame].keys():
                 properties = self._data[labeled_frame]['properties']
@@ -2775,22 +2797,9 @@ class DataLoaderFlowValidation(SlimDataLoaderBase):
         padding_mask = torch.stack(padding_mask_list, dim=1) # T_max, B
         padding_need = torch.stack(padding_need_list, dim=0) # B, 4
 
-        values = np.arange(max_length)
-        
-        if self.step > 1:
-            #start = np.random.choice(labeled_indices)
-            values = values[::self.step]
-
-        windows = [values[i : i + self.video_length] for i in range(0, len(values), self.video_length - 1)]
-        padding_mask = torch.cat([padding_mask, torch.zeros(size=(self.video_length - len(windows[-1]), self.batch_size), dtype=bool, device='cuda:0')], dim=0)
-        windows[-1] = np.concatenate([windows[-1], np.arange(self.video_length - len(windows[-1]))])
-        unlabeled = [unlabeled[x] for x in windows]
-        target = [target[x] for x in windows]
-        target_mask = [target_mask[x] for x in windows]
-
-        unlabeled = torch.stack(unlabeled, dim=0) # P, T, B, 1, H, W
-        target = torch.stack(target, dim=0) # P, T, B, 1, H, W
-        target_mask = torch.stack(target_mask, dim=0) # P, T, B
+        unlabeled = unlabeled[None]
+        target = target[None]
+        target_mask = target_mask[None]
 
         #print(seg.shape)
         #print(np.unique(seg))

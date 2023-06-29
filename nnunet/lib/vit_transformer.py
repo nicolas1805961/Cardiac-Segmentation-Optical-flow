@@ -17,6 +17,7 @@ from torch.nn.functional import grid_sample
 from torch.nn.functional import pad
 import matplotlib.patches as patches
 from torchvision.ops import roi_align
+import numpy as np
 
 from einops import rearrange
 from einops.layers.torch import Rearrange
@@ -1326,13 +1327,12 @@ class TransformerFlowEncoderConv(nn.Module):
         return spatial_features_1, spatial_features_2, spatial_features_seg
 
 
-
-class TransformerFlowEncoderIterative(nn.Module):
-    def __init__(self, dim, nhead, num_layers, nb_tokens, lookback):
+class TransformerFlowEncoderIterativeStep(nn.Module):
+    def __init__(self, dim, nhead, num_layers, nb_tokens, temporal_kernel_size):
         super().__init__()
 
         self.nb_tokens = nb_tokens
-        self.lookback = lookback
+        self.temporal_kernel_size = temporal_kernel_size
 
         spatial_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
         self.spatial_layers = _get_clones(spatial_layer, num_layers)
@@ -1382,9 +1382,8 @@ class TransformerFlowEncoderIterative(nn.Module):
 
         #pos = torch.cat([pos_2d, token_pos], dim=1)
 
-        past_pos_1d = pos_1d[:-1]
         for spatial_layer in self.spatial_layers:
-            past_features = torch.zeros_like(spatial_features)[:-1] # T - 1, B, H*W, C
+            past_features = torch.zeros_like(spatial_features) # T, B, H*W, C
             for i in range(len(spatial_features)):
 
                 #matplotlib.use('QtAgg')
@@ -1404,54 +1403,57 @@ class TransformerFlowEncoderIterative(nn.Module):
                 #ax[1].imshow(spatial_features[i, 0, 0].detach().cpu())
                 #plt.show()
 
-                start = max(0, i - self.lookback)
-                stop = i
-
                 current_spatial_feature = spatial_features[i]
                 current_pos_1d = pos_1d[i]
                 if i == 0:
-                    previous_spatial_feature = torch.zeros_like(current_spatial_feature).unsqueeze(0).repeat(self.lookback, 1, 1, 1)
-                    previous_pos_1d = torch.zeros_like(current_pos_1d).unsqueeze(0).repeat(self.lookback, 1, 1, 1)
+                    previous_spatial_feature = torch.zeros_like(current_spatial_feature).unsqueeze(0).repeat(self.temporal_kernel_size, 1, 1, 1)
+                    previous_pos_1d = torch.zeros_like(current_pos_1d).unsqueeze(0).repeat(self.temporal_kernel_size, 1, 1, 1)
                 else:
-                    previous_spatial_feature = past_features[start:stop]
-                    previous_spatial_feature = torch.nn.functional.pad(previous_spatial_feature, pad=(0, 0, 0, 0, 0, 0, max(0, self.lookback - len(previous_spatial_feature)), 0))
-                    previous_pos_1d = past_pos_1d[start:stop]
-                    previous_pos_1d = torch.nn.functional.pad(previous_pos_1d, pad=(0, 0, 0, 0, 0, 0, max(0, self.lookback - len(previous_pos_1d)), 0))
+                    if i > 2:
+                        step = int(ceil((i - 2) / (self.temporal_kernel_size - 2)))
+                        middle_indices = torch.arange(step, i-1, step)
+                        previous_spatial_feature = torch.cat([past_features[0][None], past_features[middle_indices], past_features[i - 1][None]])
+                        previous_pos_1d = torch.cat([pos_1d[0][None], pos_1d[middle_indices], pos_1d[i - 1][None]])
+                    else:
+                        previous_spatial_feature = torch.cat([past_features[0][None], past_features[i - 1][None]])
+                        previous_pos_1d = torch.cat([pos_1d[0][None], pos_1d[i - 1][None]])
+                    previous_spatial_feature = torch.nn.functional.pad(previous_spatial_feature, pad=(0, 0, 0, 0, 0, 0, max(0, self.temporal_kernel_size - len(previous_spatial_feature)), 0))
+                    previous_pos_1d = torch.nn.functional.pad(previous_pos_1d, pad=(0, 0, 0, 0, 0, 0, max(0, self.temporal_kernel_size - len(previous_pos_1d)), 0))
 
                 previous_pos_1d = previous_pos_1d.permute(0, 2, 1, 3).contiguous()
-                previous_pos_1d = previous_pos_1d.view(self.lookback * H * W, B, C)
+                previous_pos_1d = previous_pos_1d.view(self.temporal_kernel_size * H * W, B, C)
                 previous_pos_1d = previous_pos_1d.permute(1, 0, 2).contiguous()
 
                 ca_query_pos = pos_2d + current_pos_1d
 
-                key_pos_2d = pos_2d[:, None, :, :].repeat(1, self.lookback, 1, 1)
+                key_pos_2d = pos_2d[:, None, :, :].repeat(1, self.temporal_kernel_size, 1, 1)
                 key_pos_2d = key_pos_2d.permute(1, 2, 0, 3).contiguous()
-                key_pos_2d = key_pos_2d.view(self.lookback * H * W, B, C)
+                key_pos_2d = key_pos_2d.view(self.temporal_kernel_size * H * W, B, C)
                 key_pos_2d = key_pos_2d.permute(1, 0, 2).contiguous()
                 key_pos = key_pos_2d + previous_pos_1d
 
                 previous_spatial_feature = previous_spatial_feature.permute(0, 2, 1, 3).contiguous()
-                previous_spatial_feature = previous_spatial_feature.view(self.lookback * H * W, B, C)
+                previous_spatial_feature = previous_spatial_feature.view(self.temporal_kernel_size * H * W, B, C)
                 previous_spatial_feature = previous_spatial_feature.permute(1, 0, 2).contiguous()
 
                 current_spatial_feature = spatial_layer(current_spatial_feature, previous_spatial_feature, sa_query_pos=pos_2d, ca_query_pos=ca_query_pos, key_pos=key_pos)
-                if i == len(spatial_features) - 1:
-                    spatial_features = torch.cat([past_features, current_spatial_feature.unsqueeze(0)], dim=0)
-                else:
-                    past_features[i] = current_spatial_feature
+                past_features[i] = current_spatial_feature
+            spatial_features = past_features
         return spatial_features
-            
+    
 
-class TransformerFlowEncoderIterativeMiddle(nn.Module):
-    def __init__(self, dim, nhead, num_layers, nb_tokens, lookback):
+class TransformerFlowEncoderStep(nn.Module):
+    def __init__(self, dim, nhead, num_layers, nb_tokens, temporal_kernel_size):
         super().__init__()
 
         self.nb_tokens = nb_tokens
-        self.lookback = lookback
-        assert lookback % 2 == 0
+        self.temporal_kernel_size = temporal_kernel_size
 
         spatial_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
         self.spatial_layers = _get_clones(spatial_layer, num_layers)
+
+        #temporal_layer = TransformerEncoderLayer(d_model=dim, nhead=nhead)
+        #self.temporal_layers = _get_clones(temporal_layer, num_layers)
 
         #seg_layer = TransformerEncoderLayer(d_model=dim, nhead=nhead)
         #self.seg_layers = _get_clones(seg_layer, num_layers)
@@ -1494,9 +1496,9 @@ class TransformerFlowEncoderIterativeMiddle(nn.Module):
         #temporal_features_2 = temporal_tokens[:, 1]
 
         #pos = torch.cat([pos_2d, token_pos], dim=1)
-        past_pos_1d = pos_1d[:-1]
+
         for spatial_layer in self.spatial_layers:
-            past_features = torch.zeros_like(spatial_features)[:-1] # T - 1, B, H*W, C
+            out_list = []
             for i in range(len(spatial_features)):
 
                 #matplotlib.use('QtAgg')
@@ -1516,54 +1518,622 @@ class TransformerFlowEncoderIterativeMiddle(nn.Module):
                 #ax[1].imshow(spatial_features[i, 0, 0].detach().cpu())
                 #plt.show()
 
-                start = max(0, i - (self.lookback // 2))
-                stop = min(len(spatial_features), i + (self.lookback // 2) + 1)
-
                 current_spatial_feature = spatial_features[i]
                 current_pos_1d = pos_1d[i]
                 if i == 0:
-                    previous_spatial_feature = torch.zeros_like(current_spatial_feature).unsqueeze(0).repeat(self.lookback // 2, 1, 1, 1)
-                    previous_pos_1d = torch.zeros_like(current_pos_1d).unsqueeze(0).repeat(self.lookback // 2, 1, 1, 1)
+                    previous_spatial_feature = torch.zeros_like(current_spatial_feature).unsqueeze(0).repeat(self.temporal_kernel_size, 1, 1, 1)
+                    previous_pos_1d = torch.zeros_like(current_pos_1d).unsqueeze(0).repeat(self.temporal_kernel_size, 1, 1, 1)
                 else:
-                    previous_spatial_feature = past_features[start:i]
-                    previous_spatial_feature = torch.nn.functional.pad(previous_spatial_feature, pad=(0, 0, 0, 0, 0, 0, max(0, (self.lookback // 2) - len(previous_spatial_feature)), 0))
-                    previous_pos_1d = past_pos_1d[start:i]
-                    previous_pos_1d = torch.nn.functional.pad(previous_pos_1d, pad=(0, 0, 0, 0, 0, 0, max(0, (self.lookback // 2) - len(previous_pos_1d)), 0))
-                
-                if i == len(spatial_features) - 1:
-                    next_spatial_feature = torch.zeros_like(current_spatial_feature).unsqueeze(0).repeat(self.lookback // 2, 1, 1, 1)
-                    next_pos_1d = torch.zeros_like(current_pos_1d).unsqueeze(0).repeat(self.lookback // 2, 1, 1, 1)
-                else:
-                    next_spatial_feature = spatial_features[i+1:stop]
-                    next_spatial_feature = torch.nn.functional.pad(next_spatial_feature, pad=(0, 0, 0, 0, 0, 0, 0, max(0, (self.lookback // 2) - len(next_spatial_feature))))
-                    next_pos_1d = pos_1d[i+1:stop]
-                    next_pos_1d = torch.nn.functional.pad(next_pos_1d, pad=(0, 0, 0, 0, 0, 0, 0, max(0, (self.lookback // 2) - len(next_pos_1d))))
+                    if i > 2:
+                        step = int(ceil((i - 2) / (self.temporal_kernel_size - 2)))
+                        middle_indices = torch.arange(step, i-1, step)
+                        previous_spatial_feature = torch.cat([spatial_features[0][None], spatial_features[middle_indices], spatial_features[i - 1][None]])
+                        previous_pos_1d = torch.cat([pos_1d[0][None], pos_1d[middle_indices], pos_1d[i - 1][None]])
+                    else:
+                        previous_spatial_feature = torch.cat([spatial_features[0][None], spatial_features[i - 1][None]])
+                        previous_pos_1d = torch.cat([pos_1d[0][None], pos_1d[i - 1][None]])
+                    previous_spatial_feature = torch.nn.functional.pad(previous_spatial_feature, pad=(0, 0, 0, 0, 0, 0, max(0, self.temporal_kernel_size - len(previous_spatial_feature)), 0))
+                    previous_pos_1d = torch.nn.functional.pad(previous_pos_1d, pad=(0, 0, 0, 0, 0, 0, max(0, self.temporal_kernel_size - len(previous_pos_1d)), 0))
 
-                key_pos_1d = torch.cat([previous_pos_1d, next_pos_1d], dim=0)
-                key_spatial_feature = torch.cat([previous_spatial_feature, next_spatial_feature], dim=0)
+                previous_pos_1d = previous_pos_1d.permute(0, 2, 1, 3).contiguous()
+                previous_pos_1d = previous_pos_1d.view(self.temporal_kernel_size * H * W, B, C)
+                previous_pos_1d = previous_pos_1d.permute(1, 0, 2).contiguous()
+
+                ca_query_pos = pos_2d + current_pos_1d
+
+                key_pos_2d = pos_2d[:, None, :, :].repeat(1, self.temporal_kernel_size, 1, 1)
+                key_pos_2d = key_pos_2d.permute(1, 2, 0, 3).contiguous()
+                key_pos_2d = key_pos_2d.view(self.temporal_kernel_size * H * W, B, C)
+                key_pos_2d = key_pos_2d.permute(1, 0, 2).contiguous()
+                key_pos = key_pos_2d + previous_pos_1d
+
+                previous_spatial_feature = previous_spatial_feature.permute(0, 2, 1, 3).contiguous()
+                previous_spatial_feature = previous_spatial_feature.view(self.temporal_kernel_size * H * W, B, C)
+                previous_spatial_feature = previous_spatial_feature.permute(1, 0, 2).contiguous()
+
+                current_spatial_feature = spatial_layer(current_spatial_feature, previous_spatial_feature, sa_query_pos=pos_2d, ca_query_pos=ca_query_pos, key_pos=key_pos)
+                out_list.append(current_spatial_feature)
+            spatial_features = torch.stack(out_list, dim=0)
+        return spatial_features
+    
+
+
+class TransformerFlowEncoderWindowFirst(nn.Module):
+    def __init__(self, dim, nhead, num_layers, nb_tokens, temporal_kernel_size):
+        super().__init__()
+
+        self.nb_tokens = nb_tokens
+        self.temporal_kernel_size = temporal_kernel_size
+        assert temporal_kernel_size % 2 == 0
+
+        self.half_window_size = (temporal_kernel_size - 1) // 2
+
+        spatial_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
+        self.spatial_layers = _get_clones(spatial_layer, num_layers)
+
+        #temporal_layer = TransformerEncoderLayer(d_model=dim, nhead=nhead)
+        #self.temporal_layers = _get_clones(temporal_layer, num_layers)
+
+        #seg_layer = TransformerEncoderLayer(d_model=dim, nhead=nhead)
+        #self.seg_layers = _get_clones(seg_layer, num_layers)
+
+        #temporal_layer = TransformerEncoderLayer(d_model=dim, nhead=nhead)
+        #self.temporal_layers = _get_clones(temporal_layer, num_layers)
+
+        self.pos_obj_2d = PositionEmbeddingSine2d(num_pos_feats=dim // 2, normalize=True)
+        #self.pos_obj_1d = PositionEmbeddingSine1d(num_pos_feats=dim, normalize=True)
+
+        #self.token_pos = nn.Parameter(torch.randn(self.nb_tokens, dim))
+        #self.temporal_tokens = nn.Parameter(torch.randn(self.nb_tokens, dim))
+    
+    
+    def forward(self, spatial_features, pos_1d):
+        '''spatial_features_1: T, B, C, H, W
+            pos_1d: B, C, T'''
+        
+        shape = spatial_features.shape
+        T, B, C, H, W = shape
+
+        pos_1d = pos_1d.permute(2, 0, 1)[:, :, None, :].repeat(1, 1, H * W, 1)
+
+        spatial_features = spatial_features.permute(0, 1, 3, 4, 2).contiguous() # T, B, H, W, C
+        spatial_features = spatial_features.view(T, B, H * W, C)
+
+        pos_2d = self.pos_obj_2d(shape_util=(B, H, W), device=spatial_features.device)
+        pos_2d = pos_2d.permute(0, 2, 3, 1).contiguous()
+        pos_2d = pos_2d.view(B, H * W, C)
+
+        #pos_1d = self.pos_obj_1d(shape_util=(B, T), device=labeled_spatial_features.device) # B, C, T
+        #pos_1d = pos_1d.permute(0, 2, 1).contiguous() # B, T, C
+        #pos_1d = pos_1d.repeat(1, 2*self.nb_tokens, 1) # B, 2*T*nb_tokens, C
+        #pos_1d = self.pos_1d[None, :, :].repeat(B, 1, 1)
+        #token_pos = self.token_pos[None, :, :].repeat(T * B, 1, 1)
+
+        #temporal_tokens = self.temporal_tokens[:, None, :, :, :].repeat(1, B, 1, 1, 1) # (T-1), B, 2, nb_tokens, C
+        #temporal_tokens = temporal_tokens.view(T * B, 2, self.nb_tokens, C)
+        #temporal_features_1 = temporal_tokens[:, 0]
+        #temporal_features_2 = temporal_tokens[:, 1]
+
+        #pos = torch.cat([pos_2d, token_pos], dim=1)
+        for spatial_layer in self.spatial_layers:
+            out_list = []
+            for i in range(len(spatial_features)):
+
+                #matplotlib.use('QtAgg')
+                #fig, ax = plt.subplots(2, len(spatial_features))
+                #past_features = past_features.permute(0, 1, 3, 2).contiguous().view(T - 1, B, C, H, W)
+                #spatial_features = spatial_features.permute(0, 1, 3, 2).contiguous().view(T, B, C, H, W)
+                #for j in range(len(spatial_features)):
+                #    ax[0, j].imshow(spatial_features[j, 0, 0].detach().cpu())
+                #    if j < len(spatial_features) - 1:
+                #        ax[1, j].imshow(past_features[j, 0, 0].detach().cpu())
+                #plt.show()
+                #past_features = past_features.permute(0, 1, 3, 4, 2).contiguous().view(T-1, B, H * W, C)
+                #spatial_features = spatial_features.permute(0, 1, 3, 4, 2).contiguous().view(T, B, H * W, C)
+
+                #fig, ax = plt.subplots(2, 1)
+                #ax[0].imshow(past_features[i, 0, 0].detach().cpu())
+                #ax[1].imshow(spatial_features[i, 0, 0].detach().cpu())
+                #plt.show()
+
+                start = max(0, i - self.half_window_size)
+                stop = min(len(spatial_features), i + self.half_window_size + 1)
+
+                current_spatial_feature = spatial_features[i]
+                current_pos_1d = pos_1d[i]
+                key_spatial_feature = spatial_features[start:stop]
+                key_pos_1d = pos_1d[start:stop]
+                key_spatial_feature = torch.nn.functional.pad(key_spatial_feature, pad=(0, 0, 0, 0, 0, 0, max(0, self.half_window_size - i), max(0, self.half_window_size - (len(spatial_features) - i - 1))))
+                key_pos_1d = torch.nn.functional.pad(key_pos_1d, pad=(0, 0, 0, 0, 0, 0, max(0, self.half_window_size - i), max(0, self.half_window_size - (len(spatial_features) - i - 1))))
+                key_spatial_feature = torch.cat([spatial_features[0][None], key_spatial_feature], dim=0)
+                key_pos_1d = torch.cat([pos_1d[0][None], key_pos_1d], dim=0)
+
+                assert len(key_spatial_feature) == self.temporal_kernel_size
 
                 key_pos_1d = key_pos_1d.permute(0, 2, 1, 3).contiguous()
-                key_pos_1d = key_pos_1d.view(self.lookback * H * W, B, C)
+                key_pos_1d = key_pos_1d.view(self.temporal_kernel_size * H * W, B, C)
                 key_pos_1d = key_pos_1d.permute(1, 0, 2).contiguous()
 
                 ca_query_pos = pos_2d + current_pos_1d
 
-                key_pos_2d = pos_2d[:, None, :, :].repeat(1, self.lookback, 1, 1)
+                key_pos_2d = pos_2d[:, None, :, :].repeat(1, self.temporal_kernel_size, 1, 1)
                 key_pos_2d = key_pos_2d.permute(1, 2, 0, 3).contiguous()
-                key_pos_2d = key_pos_2d.view(self.lookback * H * W, B, C)
+                key_pos_2d = key_pos_2d.view(self.temporal_kernel_size * H * W, B, C)
                 key_pos_2d = key_pos_2d.permute(1, 0, 2).contiguous()
 
                 key_pos = key_pos_2d + key_pos_1d
 
                 key_spatial_feature = key_spatial_feature.permute(0, 2, 1, 3).contiguous()
-                key_spatial_feature = key_spatial_feature.view(self.lookback * H * W, B, C)
+                key_spatial_feature = key_spatial_feature.view(self.temporal_kernel_size * H * W, B, C)
                 key_spatial_feature = key_spatial_feature.permute(1, 0, 2).contiguous()
 
                 current_spatial_feature = spatial_layer(current_spatial_feature, key_spatial_feature, sa_query_pos=pos_2d, ca_query_pos=ca_query_pos, key_pos=key_pos)
-                if i == len(spatial_features) - 1:
-                    spatial_features = torch.cat([past_features, current_spatial_feature.unsqueeze(0)], dim=0)
+                out_list.append(current_spatial_feature)
+            spatial_features = torch.stack(out_list, dim=0)
+        return spatial_features
+    
+
+class TransformerFlowEncoderDoubleWindow(nn.Module):
+    def __init__(self, dim, nhead, num_layers, nb_tokens, temporal_kernel_size):
+        super().__init__()
+
+        self.nb_tokens = nb_tokens
+        self.temporal_kernel_size = temporal_kernel_size
+        self.window_2_size = int(((2/3) * temporal_kernel_size) // 2 * 2 + 1)
+        self.window_1_size = temporal_kernel_size - self.window_2_size
+
+        self.half_window_size_2 = (self.window_2_size - 1) // 2
+
+        spatial_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
+        self.spatial_layers = _get_clones(spatial_layer, num_layers)
+
+        #temporal_layer = TransformerEncoderLayer(d_model=dim, nhead=nhead)
+        #self.temporal_layers = _get_clones(temporal_layer, num_layers)
+
+        #seg_layer = TransformerEncoderLayer(d_model=dim, nhead=nhead)
+        #self.seg_layers = _get_clones(seg_layer, num_layers)
+
+        #temporal_layer = TransformerEncoderLayer(d_model=dim, nhead=nhead)
+        #self.temporal_layers = _get_clones(temporal_layer, num_layers)
+
+        self.pos_obj_2d = PositionEmbeddingSine2d(num_pos_feats=dim // 2, normalize=True)
+        #self.pos_obj_1d = PositionEmbeddingSine1d(num_pos_feats=dim, normalize=True)
+
+        #self.token_pos = nn.Parameter(torch.randn(self.nb_tokens, dim))
+        #self.temporal_tokens = nn.Parameter(torch.randn(self.nb_tokens, dim))
+    
+    
+    def forward(self, spatial_features, pos_1d):
+        '''spatial_features_1: T, B, C, H, W
+            pos_1d: B, C, T'''
+        
+        shape = spatial_features.shape
+        T, B, C, H, W = shape
+
+        pos_1d = pos_1d.permute(2, 0, 1)[:, :, None, :].repeat(1, 1, H * W, 1)
+
+        spatial_features = spatial_features.permute(0, 1, 3, 4, 2).contiguous() # T, B, H, W, C
+        spatial_features = spatial_features.view(T, B, H * W, C)
+
+        pos_2d = self.pos_obj_2d(shape_util=(B, H, W), device=spatial_features.device)
+        pos_2d = pos_2d.permute(0, 2, 3, 1).contiguous()
+        pos_2d = pos_2d.view(B, H * W, C)
+
+        #pos_1d = self.pos_obj_1d(shape_util=(B, T), device=labeled_spatial_features.device) # B, C, T
+        #pos_1d = pos_1d.permute(0, 2, 1).contiguous() # B, T, C
+        #pos_1d = pos_1d.repeat(1, 2*self.nb_tokens, 1) # B, 2*T*nb_tokens, C
+        #pos_1d = self.pos_1d[None, :, :].repeat(B, 1, 1)
+        #token_pos = self.token_pos[None, :, :].repeat(T * B, 1, 1)
+
+        #temporal_tokens = self.temporal_tokens[:, None, :, :, :].repeat(1, B, 1, 1, 1) # (T-1), B, 2, nb_tokens, C
+        #temporal_tokens = temporal_tokens.view(T * B, 2, self.nb_tokens, C)
+        #temporal_features_1 = temporal_tokens[:, 0]
+        #temporal_features_2 = temporal_tokens[:, 1]
+
+        #pos = torch.cat([pos_2d, token_pos], dim=1)
+        for spatial_layer in self.spatial_layers:
+            out_list = []
+            for i in range(len(spatial_features)):
+
+                #matplotlib.use('QtAgg')
+                #fig, ax = plt.subplots(2, len(spatial_features))
+                #past_features = past_features.permute(0, 1, 3, 2).contiguous().view(T - 1, B, C, H, W)
+                #spatial_features = spatial_features.permute(0, 1, 3, 2).contiguous().view(T, B, C, H, W)
+                #for j in range(len(spatial_features)):
+                #    ax[0, j].imshow(spatial_features[j, 0, 0].detach().cpu())
+                #    if j < len(spatial_features) - 1:
+                #        ax[1, j].imshow(past_features[j, 0, 0].detach().cpu())
+                #plt.show()
+                #past_features = past_features.permute(0, 1, 3, 4, 2).contiguous().view(T-1, B, H * W, C)
+                #spatial_features = spatial_features.permute(0, 1, 3, 4, 2).contiguous().view(T, B, H * W, C)
+
+                #fig, ax = plt.subplots(2, 1)
+                #ax[0].imshow(past_features[i, 0, 0].detach().cpu())
+                #ax[1].imshow(spatial_features[i, 0, 0].detach().cpu())
+                #plt.show()
+
+                start = max(0, i - self.half_window_size_2)
+                stop = min(len(spatial_features), i + self.half_window_size_2 + 1)
+
+                current_spatial_feature = spatial_features[i]
+                current_pos_1d = pos_1d[i]
+                key_spatial_feature = spatial_features[start:stop]
+                key_pos_1d = pos_1d[start:stop]
+                key_spatial_feature = torch.nn.functional.pad(key_spatial_feature, pad=(0, 0, 0, 0, 0, 0, max(0, self.half_window_size_2 - i), max(0, self.half_window_size_2 - (len(spatial_features) - i - 1))))
+                key_pos_1d = torch.nn.functional.pad(key_pos_1d, pad=(0, 0, 0, 0, 0, 0, max(0, self.half_window_size_2 - i), max(0, self.half_window_size_2 - (len(spatial_features) - i - 1))))
+                key_spatial_feature = torch.cat([spatial_features[:self.window_1_size], key_spatial_feature], dim=0)
+                key_pos_1d = torch.cat([pos_1d[:self.window_1_size], key_pos_1d], dim=0)
+
+                assert len(key_spatial_feature) == self.temporal_kernel_size
+
+                key_pos_1d = key_pos_1d.permute(0, 2, 1, 3).contiguous()
+                key_pos_1d = key_pos_1d.view(self.temporal_kernel_size * H * W, B, C)
+                key_pos_1d = key_pos_1d.permute(1, 0, 2).contiguous()
+
+                ca_query_pos = pos_2d + current_pos_1d
+
+                key_pos_2d = pos_2d[:, None, :, :].repeat(1, self.temporal_kernel_size, 1, 1)
+                key_pos_2d = key_pos_2d.permute(1, 2, 0, 3).contiguous()
+                key_pos_2d = key_pos_2d.view(self.temporal_kernel_size * H * W, B, C)
+                key_pos_2d = key_pos_2d.permute(1, 0, 2).contiguous()
+
+                key_pos = key_pos_2d + key_pos_1d
+
+                key_spatial_feature = key_spatial_feature.permute(0, 2, 1, 3).contiguous()
+                key_spatial_feature = key_spatial_feature.view(self.temporal_kernel_size * H * W, B, C)
+                key_spatial_feature = key_spatial_feature.permute(1, 0, 2).contiguous()
+
+                current_spatial_feature = spatial_layer(current_spatial_feature, key_spatial_feature, sa_query_pos=pos_2d, ca_query_pos=ca_query_pos, key_pos=key_pos)
+                out_list.append(current_spatial_feature)
+            spatial_features = torch.stack(out_list, dim=0)
+        return spatial_features
+
+
+class TransformerFlowEncoderIterative(nn.Module):
+    def __init__(self, dim, nhead, num_layers, nb_tokens, temporal_kernel_size):
+        super().__init__()
+
+        self.nb_tokens = nb_tokens
+        self.temporal_kernel_size = temporal_kernel_size
+        assert temporal_kernel_size % 2 == 1
+
+        self.half_window_size = temporal_kernel_size // 2
+
+        spatial_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
+        self.spatial_layers = _get_clones(spatial_layer, num_layers)
+
+        #temporal_layer = TransformerEncoderLayer(d_model=dim, nhead=nhead)
+        #self.temporal_layers = _get_clones(temporal_layer, num_layers)
+
+        #seg_layer = TransformerEncoderLayer(d_model=dim, nhead=nhead)
+        #self.seg_layers = _get_clones(seg_layer, num_layers)
+
+        #temporal_layer = TransformerEncoderLayer(d_model=dim, nhead=nhead)
+        #self.temporal_layers = _get_clones(temporal_layer, num_layers)
+
+        self.pos_obj_2d = PositionEmbeddingSine2d(num_pos_feats=dim // 2, normalize=True)
+        #self.pos_obj_1d = PositionEmbeddingSine1d(num_pos_feats=dim, normalize=True)
+
+        #self.token_pos = nn.Parameter(torch.randn(self.nb_tokens, dim))
+        #self.temporal_tokens = nn.Parameter(torch.randn(self.nb_tokens, dim))
+    
+    
+    def forward(self, spatial_features, pos_1d):
+        '''spatial_features_1: T, B, C, H, W
+            pos_1d: B, C, T'''
+        
+        shape = spatial_features.shape
+        T, B, C, H, W = shape
+
+        pos_1d = pos_1d.permute(2, 0, 1)[:, :, None, :].repeat(1, 1, H * W, 1)
+
+        spatial_features = spatial_features.permute(0, 1, 3, 4, 2).contiguous() # T, B, H, W, C
+        spatial_features = spatial_features.view(T, B, H * W, C)
+
+        pos_2d = self.pos_obj_2d(shape_util=(B, H, W), device=spatial_features.device)
+        pos_2d = pos_2d.permute(0, 2, 3, 1).contiguous()
+        pos_2d = pos_2d.view(B, H * W, C)
+
+        #pos_1d = self.pos_obj_1d(shape_util=(B, T), device=labeled_spatial_features.device) # B, C, T
+        #pos_1d = pos_1d.permute(0, 2, 1).contiguous() # B, T, C
+        #pos_1d = pos_1d.repeat(1, 2*self.nb_tokens, 1) # B, 2*T*nb_tokens, C
+        #pos_1d = self.pos_1d[None, :, :].repeat(B, 1, 1)
+        #token_pos = self.token_pos[None, :, :].repeat(T * B, 1, 1)
+
+        #temporal_tokens = self.temporal_tokens[:, None, :, :, :].repeat(1, B, 1, 1, 1) # (T-1), B, 2, nb_tokens, C
+        #temporal_tokens = temporal_tokens.view(T * B, 2, self.nb_tokens, C)
+        #temporal_features_1 = temporal_tokens[:, 0]
+        #temporal_features_2 = temporal_tokens[:, 1]
+
+        #pos = torch.cat([pos_2d, token_pos], dim=1)
+
+        for spatial_layer in self.spatial_layers:
+            past_features = torch.zeros_like(spatial_features) # T, B, H*W, C
+            for i in range(len(spatial_features)):
+
+                #matplotlib.use('QtAgg')
+                #fig, ax = plt.subplots(2, len(spatial_features))
+                #past_features = past_features.permute(0, 1, 3, 2).contiguous().view(T - 1, B, C, H, W)
+                #spatial_features = spatial_features.permute(0, 1, 3, 2).contiguous().view(T, B, C, H, W)
+                #for j in range(len(spatial_features)):
+                #    ax[0, j].imshow(spatial_features[j, 0, 0].detach().cpu())
+                #    if j < len(spatial_features) - 1:
+                #        ax[1, j].imshow(past_features[j, 0, 0].detach().cpu())
+                #plt.show()
+                #past_features = past_features.permute(0, 1, 3, 4, 2).contiguous().view(T-1, B, H * W, C)
+                #spatial_features = spatial_features.permute(0, 1, 3, 4, 2).contiguous().view(T, B, H * W, C)
+
+                #fig, ax = plt.subplots(2, 1)
+                #ax[0].imshow(past_features[i, 0, 0].detach().cpu())
+                #ax[1].imshow(spatial_features[i, 0, 0].detach().cpu())
+                #plt.show()
+
+                start = max(0, i - self.temporal_kernel_size)
+                stop = i
+
+                current_spatial_feature = spatial_features[i]
+                current_pos_1d = pos_1d[i]
+                if i == 0:
+                    previous_spatial_feature = torch.zeros_like(current_spatial_feature).unsqueeze(0).repeat(self.temporal_kernel_size, 1, 1, 1)
+                    previous_pos_1d = torch.zeros_like(current_pos_1d).unsqueeze(0).repeat(self.temporal_kernel_size, 1, 1, 1)
                 else:
-                    past_features[i] = current_spatial_feature
+                    previous_spatial_feature = past_features[start:stop]
+                    previous_spatial_feature = torch.nn.functional.pad(previous_spatial_feature, pad=(0, 0, 0, 0, 0, 0, max(0, self.temporal_kernel_size - len(previous_spatial_feature)), 0))
+                    previous_pos_1d = pos_1d[start:stop]
+                    previous_pos_1d = torch.nn.functional.pad(previous_pos_1d, pad=(0, 0, 0, 0, 0, 0, max(0, self.temporal_kernel_size - len(previous_pos_1d)), 0))
+
+                previous_pos_1d = previous_pos_1d.permute(0, 2, 1, 3).contiguous()
+                previous_pos_1d = previous_pos_1d.view(self.temporal_kernel_size * H * W, B, C)
+                previous_pos_1d = previous_pos_1d.permute(1, 0, 2).contiguous()
+
+                ca_query_pos = pos_2d + current_pos_1d
+
+                key_pos_2d = pos_2d[:, None, :, :].repeat(1, self.temporal_kernel_size, 1, 1)
+                key_pos_2d = key_pos_2d.permute(1, 2, 0, 3).contiguous()
+                key_pos_2d = key_pos_2d.view(self.temporal_kernel_size * H * W, B, C)
+                key_pos_2d = key_pos_2d.permute(1, 0, 2).contiguous()
+                key_pos = key_pos_2d + previous_pos_1d
+
+                previous_spatial_feature = previous_spatial_feature.permute(0, 2, 1, 3).contiguous()
+                previous_spatial_feature = previous_spatial_feature.view(self.temporal_kernel_size * H * W, B, C)
+                previous_spatial_feature = previous_spatial_feature.permute(1, 0, 2).contiguous()
+
+                current_spatial_feature = spatial_layer(current_spatial_feature, previous_spatial_feature, sa_query_pos=pos_2d, ca_query_pos=ca_query_pos, key_pos=key_pos)
+                past_features[i] = current_spatial_feature
+            spatial_features = past_features
+        return spatial_features
+            
+
+class TransformerFlowEncoderIterativeMiddle(nn.Module):
+    def __init__(self, dim, nhead, num_layers, nb_tokens, temporal_kernel_size):
+        super().__init__()
+
+        self.nb_tokens = nb_tokens
+        self.temporal_kernel_size = temporal_kernel_size
+        assert temporal_kernel_size % 2 == 1
+
+        self.half_window_size = temporal_kernel_size // 2
+
+        spatial_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
+        self.spatial_layers = _get_clones(spatial_layer, num_layers)
+
+        #seg_layer = TransformerEncoderLayer(d_model=dim, nhead=nhead)
+        #self.seg_layers = _get_clones(seg_layer, num_layers)
+
+        #temporal_layer = TransformerEncoderLayer(d_model=dim, nhead=nhead)
+        #self.temporal_layers = _get_clones(temporal_layer, num_layers)
+
+        self.pos_obj_2d = PositionEmbeddingSine2d(num_pos_feats=dim // 2, normalize=True)
+        #self.pos_obj_1d = PositionEmbeddingSine1d(num_pos_feats=dim, normalize=True)
+
+        #self.token_pos = nn.Parameter(torch.randn(self.nb_tokens, dim))
+        #self.temporal_tokens = nn.Parameter(torch.randn(self.nb_tokens, dim))
+    
+    
+    def forward(self, spatial_features, pos_1d):
+        '''spatial_features_1: T, B, C, H, W
+            pos_1d: B, C, T'''
+        
+        shape = spatial_features.shape
+        T, B, C, H, W = shape
+
+        pos_1d = pos_1d.permute(2, 0, 1)[:, :, None, :].repeat(1, 1, H * W, 1)
+
+        spatial_features = spatial_features.permute(0, 1, 3, 4, 2).contiguous() # T, B, H, W, C
+        spatial_features = spatial_features.view(T, B, H * W, C)
+
+        pos_2d = self.pos_obj_2d(shape_util=(B, H, W), device=spatial_features.device)
+        pos_2d = pos_2d.permute(0, 2, 3, 1).contiguous()
+        pos_2d = pos_2d.view(B, H * W, C)
+
+        #pos_1d = self.pos_obj_1d(shape_util=(B, T), device=labeled_spatial_features.device) # B, C, T
+        #pos_1d = pos_1d.permute(0, 2, 1).contiguous() # B, T, C
+        #pos_1d = pos_1d.repeat(1, 2*self.nb_tokens, 1) # B, 2*T*nb_tokens, C
+        #pos_1d = self.pos_1d[None, :, :].repeat(B, 1, 1)
+        #token_pos = self.token_pos[None, :, :].repeat(T * B, 1, 1)
+
+        #temporal_tokens = self.temporal_tokens[:, None, :, :, :].repeat(1, B, 1, 1, 1) # (T-1), B, 2, nb_tokens, C
+        #temporal_tokens = temporal_tokens.view(T * B, 2, self.nb_tokens, C)
+        #temporal_features_1 = temporal_tokens[:, 0]
+        #temporal_features_2 = temporal_tokens[:, 1]
+
+        #pos = torch.cat([pos_2d, token_pos], dim=1)
+        for spatial_layer in self.spatial_layers:
+            past_features = torch.zeros_like(spatial_features) # T, B, H*W, C
+            for i in range(len(spatial_features)):
+
+                #matplotlib.use('QtAgg')
+                #fig, ax = plt.subplots(2, len(spatial_features))
+                #past_features = past_features.permute(0, 1, 3, 2).contiguous().view(T - 1, B, C, H, W)
+                #spatial_features = spatial_features.permute(0, 1, 3, 2).contiguous().view(T, B, C, H, W)
+                #for j in range(len(spatial_features)):
+                #    ax[0, j].imshow(spatial_features[j, 0, 0].detach().cpu())
+                #    if j < len(spatial_features) - 1:
+                #        ax[1, j].imshow(past_features[j, 0, 0].detach().cpu())
+                #plt.show()
+                #past_features = past_features.permute(0, 1, 3, 4, 2).contiguous().view(T-1, B, H * W, C)
+                #spatial_features = spatial_features.permute(0, 1, 3, 4, 2).contiguous().view(T, B, H * W, C)
+
+                #fig, ax = plt.subplots(2, 1)
+                #ax[0].imshow(past_features[i, 0, 0].detach().cpu())
+                #ax[1].imshow(spatial_features[i, 0, 0].detach().cpu())
+                #plt.show()
+
+                start = max(0, i - self.half_window_size)
+                stop = min(len(spatial_features), i + self.half_window_size + 1)
+
+                current_spatial_feature = spatial_features[i]
+                current_pos_1d = pos_1d[i]
+                if i == 0:
+                    previous_spatial_feature = torch.zeros_like(current_spatial_feature).unsqueeze(0).repeat(self.half_window_size, 1, 1, 1)
+                    previous_pos_1d = torch.zeros_like(current_pos_1d).unsqueeze(0).repeat(self.half_window_size, 1, 1, 1)
+                else:
+                    previous_spatial_feature = past_features[start:i]
+                    previous_spatial_feature = torch.nn.functional.pad(previous_spatial_feature, pad=(0, 0, 0, 0, 0, 0, max(0, self.half_window_size - len(previous_spatial_feature)), 0))
+                    previous_pos_1d = pos_1d[start:i]
+                    previous_pos_1d = torch.nn.functional.pad(previous_pos_1d, pad=(0, 0, 0, 0, 0, 0, max(0, self.half_window_size - len(previous_pos_1d)), 0))
+                
+                if i == len(spatial_features) - 1:
+                    next_spatial_feature = torch.zeros_like(current_spatial_feature).unsqueeze(0).repeat(self.half_window_size, 1, 1, 1)
+                    next_pos_1d = torch.zeros_like(current_pos_1d).unsqueeze(0).repeat(self.half_window_size, 1, 1, 1)
+                else:
+                    next_spatial_feature = spatial_features[i:stop]
+                    next_spatial_feature = torch.nn.functional.pad(next_spatial_feature, pad=(0, 0, 0, 0, 0, 0, 0, max(0, self.half_window_size - len(next_spatial_feature))))
+                    next_pos_1d = pos_1d[i:stop]
+                    next_pos_1d = torch.nn.functional.pad(next_pos_1d, pad=(0, 0, 0, 0, 0, 0, 0, max(0, self.half_window_size - len(next_pos_1d))))
+
+                key_pos_1d = torch.cat([previous_pos_1d, next_pos_1d], dim=0)
+                key_spatial_feature = torch.cat([previous_spatial_feature, next_spatial_feature], dim=0)
+
+                key_pos_1d = key_pos_1d.permute(0, 2, 1, 3).contiguous()
+                key_pos_1d = key_pos_1d.view(self.temporal_kernel_size * H * W, B, C)
+                key_pos_1d = key_pos_1d.permute(1, 0, 2).contiguous()
+
+                ca_query_pos = pos_2d + current_pos_1d
+
+                key_pos_2d = pos_2d[:, None, :, :].repeat(1, self.temporal_kernel_size, 1, 1)
+                key_pos_2d = key_pos_2d.permute(1, 2, 0, 3).contiguous()
+                key_pos_2d = key_pos_2d.view(self.temporal_kernel_size * H * W, B, C)
+                key_pos_2d = key_pos_2d.permute(1, 0, 2).contiguous()
+
+                key_pos = key_pos_2d + key_pos_1d
+
+                key_spatial_feature = key_spatial_feature.permute(0, 2, 1, 3).contiguous()
+                key_spatial_feature = key_spatial_feature.view(self.temporal_kernel_size * H * W, B, C)
+                key_spatial_feature = key_spatial_feature.permute(1, 0, 2).contiguous()
+
+                current_spatial_feature = spatial_layer(current_spatial_feature, key_spatial_feature, sa_query_pos=pos_2d, ca_query_pos=ca_query_pos, key_pos=key_pos)
+                past_features[i] = current_spatial_feature
+            spatial_features = past_features
+        return spatial_features
+
+
+
+class TransformerFlowEncoderWindow(nn.Module):
+    def __init__(self, dim, nhead, num_layers, nb_tokens, temporal_kernel_size):
+        super().__init__()
+
+        self.nb_tokens = nb_tokens
+        self.temporal_kernel_size = temporal_kernel_size
+        assert temporal_kernel_size % 2 == 1
+
+        self.half_window_size = temporal_kernel_size // 2
+
+        spatial_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
+        self.spatial_layers = _get_clones(spatial_layer, num_layers)
+
+        #seg_layer = TransformerEncoderLayer(d_model=dim, nhead=nhead)
+        #self.seg_layers = _get_clones(seg_layer, num_layers)
+
+        #temporal_layer = TransformerEncoderLayer(d_model=dim, nhead=nhead)
+        #self.temporal_layers = _get_clones(temporal_layer, num_layers)
+
+        self.pos_obj_2d = PositionEmbeddingSine2d(num_pos_feats=dim // 2, normalize=True)
+        #self.pos_obj_1d = PositionEmbeddingSine1d(num_pos_feats=dim, normalize=True)
+
+        #self.token_pos = nn.Parameter(torch.randn(self.nb_tokens, dim))
+        #self.temporal_tokens = nn.Parameter(torch.randn(self.nb_tokens, dim))
+    
+    
+    def forward(self, spatial_features, pos_1d):
+        '''spatial_features_1: T, B, C, H, W
+            pos_1d: B, C, T'''
+        
+        shape = spatial_features.shape
+        T, B, C, H, W = shape
+
+        pos_1d = pos_1d.permute(2, 0, 1)[:, :, None, :].repeat(1, 1, H * W, 1)
+
+        spatial_features = spatial_features.permute(0, 1, 3, 4, 2).contiguous() # T, B, H, W, C
+        spatial_features = spatial_features.view(T, B, H * W, C)
+
+        pos_2d = self.pos_obj_2d(shape_util=(B, H, W), device=spatial_features.device)
+        pos_2d = pos_2d.permute(0, 2, 3, 1).contiguous()
+        pos_2d = pos_2d.view(B, H * W, C)
+
+        #pos_1d = self.pos_obj_1d(shape_util=(B, T), device=labeled_spatial_features.device) # B, C, T
+        #pos_1d = pos_1d.permute(0, 2, 1).contiguous() # B, T, C
+        #pos_1d = pos_1d.repeat(1, 2*self.nb_tokens, 1) # B, 2*T*nb_tokens, C
+        #pos_1d = self.pos_1d[None, :, :].repeat(B, 1, 1)
+        #token_pos = self.token_pos[None, :, :].repeat(T * B, 1, 1)
+
+        #temporal_tokens = self.temporal_tokens[:, None, :, :, :].repeat(1, B, 1, 1, 1) # (T-1), B, 2, nb_tokens, C
+        #temporal_tokens = temporal_tokens.view(T * B, 2, self.nb_tokens, C)
+        #temporal_features_1 = temporal_tokens[:, 0]
+        #temporal_features_2 = temporal_tokens[:, 1]
+
+        #pos = torch.cat([pos_2d, token_pos], dim=1)
+        for spatial_layer in self.spatial_layers:
+            out_list = []
+            for i in range(len(spatial_features)):
+
+                #matplotlib.use('QtAgg')
+                #fig, ax = plt.subplots(2, len(spatial_features))
+                #past_features = past_features.permute(0, 1, 3, 2).contiguous().view(T - 1, B, C, H, W)
+                #spatial_features = spatial_features.permute(0, 1, 3, 2).contiguous().view(T, B, C, H, W)
+                #for j in range(len(spatial_features)):
+                #    ax[0, j].imshow(spatial_features[j, 0, 0].detach().cpu())
+                #    if j < len(spatial_features) - 1:
+                #        ax[1, j].imshow(past_features[j, 0, 0].detach().cpu())
+                #plt.show()
+                #past_features = past_features.permute(0, 1, 3, 4, 2).contiguous().view(T-1, B, H * W, C)
+                #spatial_features = spatial_features.permute(0, 1, 3, 4, 2).contiguous().view(T, B, H * W, C)
+
+                #fig, ax = plt.subplots(2, 1)
+                #ax[0].imshow(past_features[i, 0, 0].detach().cpu())
+                #ax[1].imshow(spatial_features[i, 0, 0].detach().cpu())
+                #plt.show()
+
+                start = max(0, i - self.half_window_size)
+                stop = min(len(spatial_features), i + self.half_window_size + 1)
+
+                current_spatial_feature = spatial_features[i]
+                current_pos_1d = pos_1d[i]
+                key_spatial_feature = spatial_features[start:stop]
+                key_pos_1d = pos_1d[start:stop]
+                key_spatial_feature = torch.nn.functional.pad(key_spatial_feature, pad=(0, 0, 0, 0, 0, 0, max(0, self.half_window_size - i), max(0, self.half_window_size - (len(spatial_features) - i - 1))))
+                key_pos_1d = torch.nn.functional.pad(key_pos_1d, pad=(0, 0, 0, 0, 0, 0, max(0, self.half_window_size - i), max(0, self.half_window_size - (len(spatial_features) - i - 1))))
+
+                key_pos_1d = key_pos_1d.permute(0, 2, 1, 3).contiguous()
+                key_pos_1d = key_pos_1d.view(self.temporal_kernel_size * H * W, B, C)
+                key_pos_1d = key_pos_1d.permute(1, 0, 2).contiguous()
+
+                ca_query_pos = pos_2d + current_pos_1d
+
+                key_pos_2d = pos_2d[:, None, :, :].repeat(1, self.temporal_kernel_size, 1, 1)
+                key_pos_2d = key_pos_2d.permute(1, 2, 0, 3).contiguous()
+                key_pos_2d = key_pos_2d.view(self.temporal_kernel_size * H * W, B, C)
+                key_pos_2d = key_pos_2d.permute(1, 0, 2).contiguous()
+
+                key_pos = key_pos_2d + key_pos_1d
+
+                key_spatial_feature = key_spatial_feature.permute(0, 2, 1, 3).contiguous()
+                key_spatial_feature = key_spatial_feature.view(self.temporal_kernel_size * H * W, B, C)
+                key_spatial_feature = key_spatial_feature.permute(1, 0, 2).contiguous()
+
+                current_spatial_feature = spatial_layer(current_spatial_feature, key_spatial_feature, sa_query_pos=pos_2d, ca_query_pos=ca_query_pos, key_pos=key_pos)
+                out_list.append(current_spatial_feature)
+            spatial_features = torch.stack(out_list, dim=0)
         return spatial_features
     
 

@@ -32,4 +32,5 @@ export RESULTS_FOLDER="out/nnUNet_trained_models"
 #python run/run_training.py 2d nnMTLTrainerV2 Task027_ACDC 0 -p custom_experiment_planner --deterministic
 #python run/run_training.py 2d nnMTLTrainerV2Video Task027_ACDC 0 -p custom_experiment_planner --deterministic
 #python run/run_training.py 2d nnMTLTrainerV2Flow Task031_ACDC 0 -p custom_experiment_planner --deterministic
-python run/run_training.py 2d nnMTLTrainerV2Flow4 Task031_ACDC 0 -p custom_experiment_planner --deterministic
+#python run/run_training.py 2d nnMTLTrainerV2Flow4 Task031_ACDC 0 -p custom_experiment_planner --deterministic
+python run/run_training.py 2d nnMTLTrainerV2Flow5 Task031_ACDC 0 -p custom_experiment_planner --deterministic
