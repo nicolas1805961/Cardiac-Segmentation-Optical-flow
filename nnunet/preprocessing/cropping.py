@@ -19,6 +19,8 @@ from batchgenerators.utilities.file_and_folder_operations import *
 from multiprocessing import Pool
 from collections import OrderedDict
 import sys
+import matplotlib
+import matplotlib.pyplot as plt
 
 
 def create_nonzero_mask(data):
@@ -29,6 +31,17 @@ def create_nonzero_mask(data):
         this_mask = data[c] != 0
         nonzero_mask = nonzero_mask | this_mask
     nonzero_mask = binary_fill_holes(nonzero_mask)
+
+    #matplotlib.use('QtAgg')
+    #fig, ax = plt.subplots(2, 3)
+    #ax[0, 0].imshow(data[0, 0], cmap='gray')
+    #ax[0, 1].imshow(data[0, 1], cmap='gray')
+    #ax[0, 2].imshow(data[0, 2], cmap='gray')
+    #ax[1, 0].imshow(nonzero_mask[0], cmap='gray')
+    #ax[1, 1].imshow(nonzero_mask[1], cmap='gray')
+    #ax[1, 2].imshow(nonzero_mask[2], cmap='gray')
+    #plt.show()
+    
     return nonzero_mask
 
 
@@ -161,46 +174,116 @@ class ImageCropper(object):
         return ImageCropper.crop(data, properties, seg)
 
     def load_crop_save(self, case, case_identifier, overwrite_existing=False, info_dict=None):
-        try:
-            print(case_identifier)
-            #print(self.output_folder)
-            #print("%s.npz" % case_identifier)
-            #print(os.path.join(self.output_folder, "%s.npz" % case_identifier))
-            if overwrite_existing \
-                    or (not os.path.isfile(os.path.join(self.output_folder, "%s.npz" % case_identifier))
-                        or not os.path.isfile(os.path.join(self.output_folder, "%s.pkl" % case_identifier))):
-                
-                data, seg, properties = self.crop_from_list_of_files(case[:-1], case[-1], info_dict)
+        # case = [[img_path, label_path], ...]
+        # case_identifier = [case_identifier, ...]
+        # info_dict = [dict, ...]
 
-                all_data = np.vstack((data, seg))
-                np.savez_compressed(os.path.join(self.output_folder, "%s.npz" % case_identifier), data=all_data)
-                with open(os.path.join(self.output_folder, "%s.pkl" % case_identifier), 'wb') as f:
-                    pickle.dump(properties, f)
-        except Exception as e:
-            print("Exception in", case_identifier, ":")
-            print(e)
-            raise e
+        data_list = []
+        property_list = []
+        seg_list = []
+
+        for i in range(len(case)):
+            current_case_identifier = case_identifier[i]
+            current_case = case[i]
+            current_info_dict = info_dict[i]
+            print(current_case_identifier)
+                
+            data, seg, properties = self.crop_from_list_of_files(current_case[:-1], current_case[-1], current_info_dict)
+            data_list.append(data)
+            property_list.append(properties)
+            seg_list.append(seg)
+
+        array_bbox_list = []
+        for i in range(len(data_list)):
+            crop_bbox = property_list[i]['crop_bbox']
+            array_bbox = np.stack([np.array(crop_bbox[i]) for i in range(len(crop_bbox))])
+            array_bbox_list.append(array_bbox)
+        array_bbox_list = np.stack(array_bbox_list)
+        max_after = np.max(array_bbox_list[:, :, 1], axis=0)[None]
+        min_before = np.min(array_bbox_list[:, :, 0], axis=0)[None]
+        pad_after = max_after - array_bbox_list[:, :, 1]
+        pad_before = array_bbox_list[:, :, 0] - min_before
+
+        new_crop_bbox = np.stack([min_before[0], max_after[0]], axis=-1)
+        new_crop_bbox = [list(x) for x in new_crop_bbox]
+
+        for i in range(len(data_list)):
+            current_case_identifier = case_identifier[i]
+
+            current_padding = np.stack([pad_before[i], pad_after[i]], axis=-1)
+            current_padding = np.concatenate([np.zeros(shape=(1, 2)).astype(int), current_padding])
+
+            current_data = data_list[i]
+            current_seg = seg_list[i]
+            current_data = np.pad(current_data, current_padding)
+            current_seg = np.pad(current_seg, current_padding)
+
+            current_property = property_list[i]
+            current_property['size_after_cropping'] = current_data[0].shape
+            current_property['crop_bbox'] = new_crop_bbox
+
+            if overwrite_existing \
+                    or (not os.path.isfile(os.path.join(self.output_folder, "%s.npz" % current_case_identifier))
+                        or not os.path.isfile(os.path.join(self.output_folder, "%s.pkl" % current_case_identifier))):
+
+                all_data = np.vstack((current_data, current_seg))
+                np.savez_compressed(os.path.join(self.output_folder, "%s.npz" % current_case_identifier), data=all_data)
+                with open(os.path.join(self.output_folder, "%s.pkl" % current_case_identifier), 'wb') as f:
+                    pickle.dump(current_property, f)
+
+
     
-    def load_crop_save_unlabeled(self, case, case_identifier, overwrite_existing=False):
-        try:
-            print(case_identifier)
-            #print(self.output_folder)
-            #print("%s.npz" % case_identifier)
-            #print(os.path.join(self.output_folder, "%s.npz" % case_identifier))
-            if overwrite_existing \
-                    or (not os.path.isfile(os.path.join(self.output_folder, "%s.npz" % case_identifier))
-                        or not os.path.isfile(os.path.join(self.output_folder, "%s.pkl" % case_identifier))):
-                
-                data, seg, properties = self.crop_from_list_of_files(case, None)
+    def load_crop_save_unlabeled(self, case, case_identifier, overwrite_existing=False, info_dict=None):
+        # case = [[img_path, label_path], ...]
+        # case_identifier = [case_identifier, ...]
+        # info_dict = [dict, ...]
 
-                all_data = data
-                np.savez_compressed(os.path.join(self.output_folder, "%s.npz" % case_identifier), data=all_data)
-                with open(os.path.join(self.output_folder, "%s.pkl" % case_identifier), 'wb') as f:
-                    pickle.dump(properties, f)
-        except Exception as e:
-            print("Exception in", case_identifier, ":")
-            print(e)
-            raise e
+        data_list = []
+        property_list = []
+
+        for i in range(len(case)):
+            current_case_identifier = case_identifier[i]
+            current_case = case[i]
+            current_info_dict = info_dict[i]
+            print(current_case_identifier)
+                
+            data, seg, properties = self.crop_from_list_of_files(current_case[:-1], current_case[-1], current_info_dict)
+            data_list.append(data)
+            property_list.append(properties)
+
+        array_bbox_list = []
+        for i in range(len(data_list)):
+            crop_bbox = property_list[i]['crop_bbox']
+            array_bbox = np.stack([np.array(crop_bbox[i]) for i in range(len(crop_bbox))])
+            array_bbox_list.append(array_bbox)
+        array_bbox_list = np.stack(array_bbox_list)
+        max_after = np.max(array_bbox_list[:, :, 1], axis=0)[None]
+        min_before = np.min(array_bbox_list[:, :, 0], axis=0)[None]
+        pad_after = max_after - array_bbox_list[:, :, 1]
+        pad_before = array_bbox_list[:, :, 0] - min_before
+
+        new_crop_bbox = np.stack([min_before[0], max_after[0]], axis=-1)
+        new_crop_bbox = [list(x) for x in new_crop_bbox]
+
+        for i in range(len(data_list)):
+            current_case_identifier = case_identifier[i]
+
+            current_padding = np.stack([pad_before[i], pad_after[i]], axis=-1)
+            current_padding = np.concatenate([np.zeros(shape=(1, 2)).astype(int), current_padding])
+            current_data = np.pad(data_list[i], current_padding)
+
+            current_property = property_list[i]
+            current_property['size_after_cropping'] = current_data[0].shape
+            current_property['crop_bbox'] = new_crop_bbox
+
+            if overwrite_existing \
+                    or (not os.path.isfile(os.path.join(self.output_folder, "%s.npz" % current_case_identifier))
+                        or not os.path.isfile(os.path.join(self.output_folder, "%s.pkl" % current_case_identifier))):
+
+                all_data = current_data
+                np.savez_compressed(os.path.join(self.output_folder, "%s.npz" % current_case_identifier), data=all_data)
+                with open(os.path.join(self.output_folder, "%s.pkl" % current_case_identifier), 'wb') as f:
+                    pickle.dump(current_property, f)
 
     def get_list_of_cropped_files(self):
         return subfiles(self.output_folder, join=True, suffix=".npz")
@@ -209,6 +292,8 @@ class ImageCropper(object):
         return [i.split(os.sep)[-1][:-4] for i in self.get_list_of_cropped_files()]
 
     def run_cropping(self, list_of_files, overwrite_existing=False, output_folder=None, info_list=None):
+        # list_of_files = patient_list -> patient_volume_list -> [img, label]
+        # info_list = patient_list -> dict
         """
         also copied ground truth nifti segmentation into the preprocessed folder so that we can use them for evaluation
         on the cluster
@@ -222,17 +307,22 @@ class ImageCropper(object):
 
         output_folder_gt = os.path.join(self.output_folder, "gt_segmentations")
         maybe_mkdir_p(output_folder_gt)
-        for j, case in enumerate(list_of_files):
-            if case[-1] is not None:
-                shutil.copy(case[-1], output_folder_gt)
-
         list_of_args = []
-        for j, case in enumerate(list_of_files):
-            case_identifier = get_case_identifier(case)
-            if info_list is not None:
-                list_of_args.append((case, case_identifier, overwrite_existing, info_list[j]))
-            else:
-                list_of_args.append((case, case_identifier, overwrite_existing))
+        for p, patient_info in zip(list_of_files, info_list):
+            case_identifier_list = []
+            for case in p:
+                case_identifier = get_case_identifier(case)
+                case_identifier_list.append(case_identifier)
+                if case[-1] is not None:
+                    shutil.copy(case[-1], output_folder_gt)
+            list_of_args.append((p, case_identifier_list, overwrite_existing, patient_info))
+
+        #for j, case in enumerate(list_of_files):
+        #    case_identifier = get_case_identifier(case)
+        #    if info_list is not None:
+        #        list_of_args.append((case, case_identifier, overwrite_existing, info_list[j]))
+        #    else:
+        #        list_of_args.append((case, case_identifier, overwrite_existing))
 
         p = Pool(self.num_threads)
         p.starmap(self.load_crop_save, list_of_args)
@@ -252,9 +342,19 @@ class ImageCropper(object):
             self.output_folder = output_folder
 
         list_of_args = []
-        for j, case in enumerate(list_of_files):
-            case_identifier = get_case_identifier(case)
-            list_of_args.append((case, case_identifier, overwrite_existing))
+        for p in list_of_files:
+            case_identifier_list = []
+            for case in p:
+                case_identifier = get_case_identifier(case)
+                case_identifier_list.append(case_identifier)
+            list_of_args.append((p, case_identifier_list, overwrite_existing, info_list))
+
+        #for j, case in enumerate(list_of_files):
+        #    case_identifier = get_case_identifier(case)
+        #    if info_list is not None:
+        #        list_of_args.append((case, case_identifier, overwrite_existing, info_list[j]))
+        #    else:
+        #        list_of_args.append((case, case_identifier, overwrite_existing))
 
         p = Pool(self.num_threads)
         p.starmap(self.load_crop_save_unlabeled, list_of_args)

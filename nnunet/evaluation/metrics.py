@@ -14,6 +14,8 @@
 
 import numpy as np
 from medpy import metric
+import matplotlib
+import matplotlib.pyplot as plt
 
 
 def assert_shape(test, reference):
@@ -104,6 +106,13 @@ class ConfusionMatrix:
 
 def dice(test=None, reference=None, confusion_matrix=None, nan_for_nonexisting=True, **kwargs):
     """2TP / (2TP + FP + FN)"""
+
+    #matplotlib.use('QtAgg')
+    #fig, ax = plt.subplots(1, 2)
+    #ax[0].imshow(test, cmap='gray')
+    #ax[1].imshow(reference, cmap='gray')
+    #plt.show()
+    #plt.waitforbuttonpress()
 
     if confusion_matrix is None:
         confusion_matrix = ConfusionMatrix(test, reference)

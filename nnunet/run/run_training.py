@@ -45,6 +45,8 @@ def main():
     parser.add_argument("fold", help='0, 1, ..., 5 or \'all\'')
     parser.add_argument("-val", "--validation_only", help="use this if you want to only run the validation",
                         action="store_true")
+    parser.add_argument('-w', '--weight_folder', help='folder where to find the model\'s weights',
+                        default=None, required=False)
     parser.add_argument("-c", "--continue_training", help="use this if you want to continue a training",
                         action="store_true")
     parser.add_argument("-p", help="plans identifier. Only change this if you created a custom experiment planner",
@@ -111,6 +113,7 @@ def main():
     validation_only = args.validation_only
     plans_identifier = args.p
     find_lr = args.find_lr
+    weight_folder = args.weight_folder
     disable_postprocessing_on_folds = args.disable_postprocessing_on_folds
 
     use_compressed_data = args.use_compressed_data
@@ -144,10 +147,29 @@ def main():
     #     force_separate_z = True
     # else:
     #     raise ValueError("force_separate_z must be None, True or False. Given: %s" % force_separate_z)
-    if network_trainer in ['nnMTLTrainerV2Video', 'nnMTLTrainerV2Flow', 'nnMTLTrainerV2Flow3', 'nnMTLTrainerV2Flow2', 'nnMTLTrainerV2Flow4', 'nnMTLTrainerV2Flow5']:
-        config = read_config_video(os.path.join(Path.cwd(), 'video.yaml'))
+    if network_trainer in ['nnMTLTrainerV2Video', 
+                           'nnMTLTrainerV2Flow', 
+                           'nnMTLTrainerV2Flow3', 
+                           'nnMTLTrainerV2Flow2', 
+                           'nnMTLTrainerV2Flow4', 
+                           'nnMTLTrainerV2Flow5', 
+                           'nnMTLTrainerV2FlowLabeled', 
+                           'nnMTLTrainerV2FlowPrediction',
+                           'nnMTLTrainerV2FlowSimple',
+                           'nnMTLTrainerV2StableDiffusion',
+                           'nnMTLTrainerV2ControlNet',
+                           'nnMTLTrainerV2FlowVariableLength',
+                           'nnMTLTrainerV2FlowRecursiveVideo',
+                           'nnMTLTrainerV2FlowRecursive',
+                           'nnMTLTrainerV2FlowLib',
+                           'nnMTLTrainerV2Flow6']:
+        if validation_only:
+            config = read_config_video(os.path.join(weight_folder, 'config.yaml'))
+        else:
+            config = read_config_video(os.path.join(Path.cwd(), 'video.yaml'))
     else:
         config = read_config(os.path.join(Path.cwd(), 'adversarial_acdc.yaml'), middle=False, video=False)
+
 
     plans_file, output_folder_name, dataset_directory, batch_dice, stage, \
         trainer_class = get_default_configuration(network, task, network_trainer, config, plans_identifier)
@@ -171,17 +193,23 @@ def main():
     else:
         assert issubclass(trainer_class,
                           nnUNetTrainer), "network_trainer was found but is not derived from nnUNetTrainer"
+    
+    if not validation_only:
+        config = None
+    else:
+        output_folder_name = weight_folder
+
         
     if '31' in task and network_trainer == 'nnMTLTrainerV2':
         trainer = trainer_class(plans_file, fold, output_folder=output_folder_name, dataset_directory=dataset_directory,
                             batch_dice=batch_dice, stage=stage, unpack_data=decompress_data,
                             deterministic=deterministic,
-                            fp16=run_mixed_precision, binary=True)
+                            fp16=run_mixed_precision, binary=True, config=config)
     else:
         trainer = trainer_class(plans_file, fold, output_folder=output_folder_name, dataset_directory=dataset_directory,
                             batch_dice=batch_dice, stage=stage, unpack_data=decompress_data,
                             deterministic=deterministic,
-                            fp16=run_mixed_precision)
+                            fp16=run_mixed_precision, config=config)
 
     if args.disable_saving:
         trainer.save_final_checkpoint = False # whether or not to save the final checkpoint
@@ -207,10 +235,7 @@ def main():
                 # new training without pretraine weights, do nothing
                 pass
 
-            if config['unlabeled']:
-                trainer.run_training_unlabeled()
-            else:
-                trainer.run_training()
+            trainer.run_training()
         else:
             if valbest:
                 trainer.load_best_checkpoint(train=False)
@@ -219,10 +244,19 @@ def main():
 
         trainer.network.eval()
 
+        if not validation_only:
+            output_folder = os.path.join(trainer.log_dir, 'Validation', task, 'fold_' + str(fold))
+            if not os.path.exists(output_folder):
+                os.makedirs(output_folder)
+        else:
+            output_folder = os.path.join(weight_folder, 'Validation', task, 'fold_' + str(fold))
+            if not os.path.exists(output_folder):
+                os.makedirs(output_folder)
+
         # predict validation
         trainer.validate(save_softmax=args.npz, validation_folder_name=val_folder,
                          run_postprocessing_on_folds=not disable_postprocessing_on_folds,
-                         overwrite=args.val_disable_overwrite)
+                         overwrite=args.val_disable_overwrite, output_folder=output_folder)
 
         if network == '3d_lowres' and not args.disable_next_stage_pred:
             print("predicting segmentations for the next stage of the cascade")

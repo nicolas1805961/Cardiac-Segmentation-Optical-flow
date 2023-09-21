@@ -7,6 +7,13 @@ from nnunet.network_architecture.temporal_model import VideoModel
 #from nnunet.network_architecture.Optical_flow_model_2 import OpticalFlowModel
 from nnunet.network_architecture.Optical_flow_model_3 import OpticalFlowModel
 from nnunet.network_architecture.Optical_flow_model_4 import OpticalFlowModel4
+from nnunet.network_architecture.Optical_flow_model_label import OpticalFlowModelLabeled
+from nnunet.network_architecture.Optical_flow_model_prediction import OpticalFlowModelPrediction
+from nnunet.network_architecture.Optical_flow_model_simple import OpticalFlowModelSimple
+from nnunet.network_architecture.Optical_flow_model_recursive import OpticalFlowModelRecursive
+from nnunet.network_architecture.Optical_flow_model_variable_length import OpticalFlowModelVariableLength
+from nnunet.network_architecture.Optical_flow_model_recursive_video import OpticalFlowModelRecursiveVideo
+from nnunet.network_architecture.Optical_flow_model_lib import OpticalFlowModelLib
 from nnunet.network_architecture.discriminator import Discriminator
 from tqdm import tqdm
 import logging
@@ -455,6 +462,9 @@ def read_config_video(filename):
     with open(filename) as file:
         config = yaml.load(file)
 
+    if config['only_first']:
+        assert not config['split']
+
     return config
 
 def write_model_parameters(model):
@@ -883,10 +893,13 @@ def build_flow_model(config, conv_layer_2d, conv_layer_1d, norm_2d, norm_1d, ima
 def build_flow_model_4(config, conv_layer_2d, norm_2d, image_size, log_function):
 
     model = OpticalFlowModel4(deep_supervision=config['deep_supervision'],
-             one_to_all=(config['one_to_all'] or config['all_to_all']),
+             video_length=config['video_length'],
+             split=config['split'],
+             one_to_all=config['one_to_all'],
+             all_to_all=config['all_to_all'],
              out_encoder_dims=config['out_encoder_dims'],
              inference_mode=config['inference_mode'],
-             bidirectional=config['bidirectional'],
+             padding=config['padding'],
              device=config['device'],
              in_dims=config['in_encoder_dims'],
              nb_layers=config['nb_layers'],
@@ -896,9 +909,192 @@ def build_flow_model_4(config, conv_layer_2d, norm_2d, image_size, log_function)
              bottleneck_heads=config['bottleneck_heads'],
              drop_path_rate=config['drop_path_rate'],
              log_function=log_function,
-             nb_tokens=config['nb_tokens'],
+             only_first=config['only_first'],
              dot_multiplier=config['dot_multiplier'],
              temporal_kernel_size=config['temporal_kernel_size'],
+             norm_2d=norm_2d)
+        
+    model = model.to(config['device'])
+
+    return model
+
+
+def build_flow_model_variable_length(config, image_size, log_function):
+
+    model = OpticalFlowModelVariableLength(deep_supervision=config['deep_supervision'],
+             split=config['split'],
+             one_to_all=config['one_to_all'],
+             all_to_all=config['all_to_all'],
+             out_encoder_dims=config['out_encoder_dims'],
+             inference_mode=config['inference_mode'],
+             padding=config['padding'],
+             in_dims=config['in_encoder_dims'],
+             embedding_dim=config['embedding_dim'],
+             nb_layers=config['nb_layers'],
+             image_size=image_size,
+             conv_depth=config['conv_depth'],
+             bottleneck_heads=config['bottleneck_heads'],
+             drop_path_rate=config['drop_path_rate'],
+             log_function=log_function,
+             only_first=config['only_first'],
+             dot_multiplier=config['dot_multiplier'])
+        
+    model = model.to(config['device'])
+
+    return model
+
+
+
+def build_flow_model_prediction(config, image_size, log_function):
+
+    model = OpticalFlowModelPrediction(deep_supervision=config['deep_supervision'],
+             split=config['split'],
+             one_to_all=config['one_to_all'],
+             all_to_all=config['all_to_all'],
+             out_encoder_dims=config['out_encoder_dims'],
+             inference_mode=config['inference_mode'],
+             nb_iters=config['nb_iters'],
+             padding=config['padding'],
+             in_dims=config['in_encoder_dims'],
+             nb_layers=config['nb_layers'],
+             image_size=image_size,
+             conv_depth=config['conv_depth'],
+             bottleneck_heads=config['bottleneck_heads'],
+             drop_path_rate=config['drop_path_rate'],
+             log_function=log_function,
+             only_first=config['only_first'],
+             dot_multiplier=config['dot_multiplier'])
+        
+    model = model.to(config['device'])
+
+    return model
+
+
+
+def build_flow_model_simple(config, image_size, log_function):
+
+    model = OpticalFlowModelSimple(deep_supervision=config['deep_supervision'],
+             split=config['split'],
+             one_to_all=config['one_to_all'],
+             all_to_all=config['all_to_all'],
+             out_encoder_dims=config['out_encoder_dims'],
+             inference_mode=config['inference_mode'],
+             nb_iters=config['nb_iters'],
+             padding=config['padding'],
+             in_dims=config['in_encoder_dims'],
+             nb_layers=config['nb_layers'],
+             image_size=image_size,
+             conv_depth=config['conv_depth'],
+             bottleneck_heads=config['bottleneck_heads'],
+             drop_path_rate=config['drop_path_rate'],
+             log_function=log_function,
+             only_first=config['only_first'],
+             dot_multiplier=config['dot_multiplier'])
+        
+    model = model.to(config['device'])
+
+    return model
+
+
+
+
+def build_flow_model_recursive(config, image_size, log_function):
+
+    model = OpticalFlowModelRecursive(deep_supervision=config['deep_supervision'],
+             split=config['split'],
+             one_to_all=config['one_to_all'],
+             all_to_all=config['all_to_all'],
+             out_encoder_dims=config['out_encoder_dims'],
+             inference_mode=config['inference_mode'],
+             padding=config['padding'],
+             in_dims=config['in_encoder_dims'],
+             nb_interp_frame=config['nb_interp_frame'],
+             nb_layers=config['nb_layers'],
+             image_size=image_size,
+             conv_depth=config['conv_depth'],
+             bottleneck_heads=config['bottleneck_heads'],
+             drop_path_rate=config['drop_path_rate'],
+             log_function=log_function,
+             only_first=config['only_first'],
+             dot_multiplier=config['dot_multiplier'])
+        
+    model = model.to(config['device'])
+
+    return model
+
+
+
+def build_flow_model_recursive_video(config, image_size, log_function):
+
+    model = OpticalFlowModelRecursiveVideo(deep_supervision=config['deep_supervision'],
+             split=config['split'],
+             one_to_all=config['one_to_all'],
+             all_to_all=config['all_to_all'],
+             out_encoder_dims=config['out_encoder_dims'],
+             inference_mode=config['inference_mode'],
+             padding=config['padding'],
+             in_dims=config['in_encoder_dims'],
+             nb_interp_frame=config['nb_interp_frame'],
+             nb_layers=config['nb_layers'],
+             image_size=image_size,
+             conv_depth=config['conv_depth'],
+             bottleneck_heads=config['bottleneck_heads'],
+             drop_path_rate=config['drop_path_rate'],
+             log_function=log_function,
+             only_first=config['only_first'],
+             dot_multiplier=config['dot_multiplier'])
+        
+    model = model.to(config['device'])
+
+    return model
+
+
+
+def build_flow_model_lib(config, image_size, log_function):
+
+    model = OpticalFlowModelLib(deep_supervision=config['deep_supervision'],
+             split=config['split'],
+             one_to_all=config['one_to_all'],
+             all_to_all=config['all_to_all'],
+             out_encoder_dims=config['out_encoder_dims'],
+             inference_mode=config['inference_mode'],
+             in_dims=config['in_encoder_dims'],
+             nb_interp_frame=config['nb_interp_frame'],
+             nb_layers=config['nb_layers'],
+             image_size=image_size,
+             video_length=config['video_length'],
+             conv_depth=config['conv_depth'],
+             bottleneck_heads=config['bottleneck_heads'],
+             drop_path_rate=config['drop_path_rate'],
+             log_function=log_function,
+             only_first=config['only_first'],
+             dot_multiplier=config['dot_multiplier'])
+        
+    model = model.to(config['device'])
+
+    return model
+
+
+
+def build_flow_model_labeled(config, conv_layer_2d, norm_2d, image_size, log_function):
+
+    model = OpticalFlowModelLabeled(deep_supervision=config['deep_supervision'],
+             only_first=config['only_first'],
+             split=config['split'],
+             one_to_all=config['one_to_all'],
+             all_to_all=config['all_to_all'],
+             out_encoder_dims=config['out_encoder_dims'],
+             inference_mode=config['inference_mode'],
+             padding=config['padding'],
+             in_dims=config['in_encoder_dims'],
+             nb_layers=config['nb_layers'],
+             image_size=image_size,
+             conv_layer_2d=conv_layer_2d,
+             conv_depth=config['conv_depth'],
+             bottleneck_heads=config['bottleneck_heads'],
+             drop_path_rate=config['drop_path_rate'],
+             log_function=log_function,
+             dot_multiplier=config['dot_multiplier'],
              norm_2d=norm_2d)
         
     model = model.to(config['device'])

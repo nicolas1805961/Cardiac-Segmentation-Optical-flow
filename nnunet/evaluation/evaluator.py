@@ -12,7 +12,7 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
-
+from tqdm import tqdm
 import collections
 import inspect
 import json
@@ -25,6 +25,7 @@ import SimpleITK as sitk
 from nnunet.evaluation.metrics import ConfusionMatrix, ALL_METRICS
 from batchgenerators.utilities.file_and_folder_operations import save_json, subfiles, join
 from collections import OrderedDict
+
 
 
 class Evaluator:
@@ -359,7 +360,7 @@ def aggregate_scores(test_ref_pairs,
     all_scores = OrderedDict()
     all_scores["all"] = []
     all_scores["mean"] = OrderedDict()
-
+    
     test = [i[0] for i in test_ref_pairs]
     ref = [i[1] for i in test_ref_pairs]
     p = Pool(num_threads)
@@ -489,3 +490,4 @@ def nnunet_evaluate_folder():
                                                                        "information.")
     args = parser.parse_args()
     return evaluate_folder(args.ref, args.pred, args.l)
+

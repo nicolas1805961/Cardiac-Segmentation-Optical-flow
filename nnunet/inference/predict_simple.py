@@ -23,10 +23,10 @@ import os
 import torch
 import warnings
 
-torch.autograd.set_detect_anomaly(True)
-warnings.filterwarnings("default")
-
-os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
+#torch.autograd.set_detect_anomaly(True)
+#warnings.filterwarnings("default")
+#
+#os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 
 
 def main():

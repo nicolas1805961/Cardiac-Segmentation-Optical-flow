@@ -18,6 +18,7 @@ import pickle
 import shutil
 from collections import OrderedDict
 from multiprocessing import Pool
+import ntpath
 
 import numpy as np
 from batchgenerators.utilities.file_and_folder_operations import join, isdir, maybe_mkdir_p, subfiles, subdirs, isfile
@@ -92,22 +93,59 @@ def get_additional_info(base_folder_splitted, path_list):
     return out
 
 
+#def create_lists_from_splitted_dataset(base_folder_splitted):
+#    lists = []
+#
+#    json_file = join(base_folder_splitted, "dataset.json")
+#    with open(json_file) as jsn:
+#        d = json.load(jsn)
+#        training_files = d['training']
+#    num_modalities = len(d['modality'].keys())
+#    for tr in training_files:
+#        cur_pat = []
+#        for mod in range(num_modalities):
+#            cur_pat.append(join(base_folder_splitted, "imagesTr", tr['image'].split("/")[-1][:-7] +
+#                                "_%04.0d.nii.gz" % mod))
+#        cur_pat.append(join(base_folder_splitted, "labelsTr", tr['label'].split("/")[-1]))
+#        lists.append(cur_pat)
+#    return lists, {int(i): d['modality'][str(i)] for i in d['modality'].keys()}
+
+
 def create_lists_from_splitted_dataset(base_folder_splitted):
     lists = []
+    info_list = []
 
     json_file = join(base_folder_splitted, "dataset.json")
     with open(json_file) as jsn:
         d = json.load(jsn)
         training_files = d['training']
     num_modalities = len(d['modality'].keys())
+
+    patient_name_list = []
     for tr in training_files:
-        cur_pat = []
-        for mod in range(num_modalities):
-            cur_pat.append(join(base_folder_splitted, "imagesTr", tr['image'].split("/")[-1][:-7] +
-                                "_%04.0d.nii.gz" % mod))
-        cur_pat.append(join(base_folder_splitted, "labelsTr", tr['label'].split("/")[-1]))
-        lists.append(cur_pat)
-    return lists, {int(i): d['modality'][str(i)] for i in d['modality'].keys()}
+        patient_name = ntpath.basename(tr['image']).split('_')[0]
+        if patient_name not in patient_name_list:
+            patient_name_list.append(patient_name)
+
+    for patient_name in patient_name_list:
+        patient_list = []
+        patient_info_list = []
+        for tr in training_files:
+            current_patient_name = ntpath.basename(tr['image']).split('_')[0]
+            if current_patient_name == patient_name:
+                cur_pat = []
+                for mod in range(num_modalities):
+                    cur_pat.append(join(base_folder_splitted, "imagesTr", tr['image'].split("/")[-1][:-7] +
+                                        "_%04.0d.nii.gz" % mod))
+                cur_pat.append(join(base_folder_splitted, "labelsTr", tr['label'].split("/")[-1]))
+                patient_list.append(cur_pat)
+                patient_info_list.append(tr)
+        lists.append(patient_list)
+        info_list.append(patient_info_list)
+
+    assert len(lists) == len(info_list)
+    return lists, {int(i): d['modality'][str(i)] for i in d['modality'].keys()}, info_list
+
 
 def create_lists_from_splitted_dataset_unlabeled(base_folder_splitted):
     lists = []
@@ -117,13 +155,30 @@ def create_lists_from_splitted_dataset_unlabeled(base_folder_splitted):
         d = json.load(jsn)
         training_files = d['unlabeled']
     num_modalities = len(d['modality'].keys())
+
+    info_list = []
+    patient_name_list = []
     for tr in training_files:
-        cur_pat = []
-        for mod in range(num_modalities):
-            cur_pat.append(join(base_folder_splitted, "imagesTr", tr['image'].split("/")[-1][:-7] +
-                                "_%04.0d.nii.gz" % mod))
-        lists.append(cur_pat)
-    return lists, {int(i): d['modality'][str(i)] for i in d['modality'].keys()}
+        patient_name = ntpath.basename(tr['image']).split('_')[0]
+        if patient_name not in patient_name_list:
+            patient_name_list.append(patient_name)
+            info_list.append(tr)
+    assert len(info_list) == len(patient_name_list)
+
+    for patient_name in patient_name_list:
+        patient_list = []
+        for tr in training_files:
+            current_patient_name = ntpath.basename(tr['image']).split('_')[0]
+            if current_patient_name == patient_name:
+                cur_pat = []
+                for mod in range(num_modalities):
+                    cur_pat.append(join(base_folder_splitted, "imagesTr", tr['image'].split("/")[-1][:-7] +
+                                        "_%04.0d.nii.gz" % mod))
+                patient_list.append(cur_pat)
+        lists.append(patient_list)
+
+    assert len(lists) == len(info_list)
+    return lists, {int(i): d['modality'][str(i)] for i in d['modality'].keys()}, info_list
 
 
 def create_lists_from_splitted_dataset_folder(folder):
@@ -148,7 +203,7 @@ def get_caseIDs_from_splitted_dataset_folder(folder):
     return files
 
 
-def crop(task_string, override=False, num_threads=default_num_threads, get_info=False):
+def crop(task_string, override=False, num_threads=default_num_threads):
     cropped_out_dir = join(nnUNet_cropped_data, task_string)
     maybe_mkdir_p(cropped_out_dir)
 
@@ -157,12 +212,9 @@ def crop(task_string, override=False, num_threads=default_num_threads, get_info=
         maybe_mkdir_p(cropped_out_dir)
 
     splitted_4d_output_dir_task = join(nnUNet_raw_data, task_string)
-    lists, _ = create_lists_from_splitted_dataset(splitted_4d_output_dir_task)
-
-    if get_info:
-        info_list = get_additional_info(splitted_4d_output_dir_task, [x[0] for x in lists])
-    else:
-        info_list = None
+    lists, _, info_list = create_lists_from_splitted_dataset(splitted_4d_output_dir_task) # [[[img_path, label_path], ...], ...]
+    # patient_list -> patient_volume_list -> [img, label]
+    # patient_list -> patient_volume_list -> dict
 
     imgcrop = ImageCropper(num_threads, cropped_out_dir)
     imgcrop.run_cropping(lists, overwrite_existing=override, info_list=info_list)
@@ -179,10 +231,10 @@ def crop_unlabeled(task_string, override=False, num_threads=default_num_threads)
         maybe_mkdir_p(cropped_out_dir)
 
     splitted_4d_output_dir_task = join(nnUNet_raw_data, task_string)
-    lists, _ = create_lists_from_splitted_dataset_unlabeled(splitted_4d_output_dir_task)
+    lists, _, info_list = create_lists_from_splitted_dataset_unlabeled(splitted_4d_output_dir_task)
 
     imgcrop = ImageCropper(num_threads, cropped_out_dir)
-    imgcrop.run_cropping_unlabeled(lists, overwrite_existing=override)
+    imgcrop.run_cropping_unlabeled(lists, overwrite_existing=override, info_list=info_list)
     shutil.copy(join(nnUNet_raw_data, task_string, "dataset.json"), cropped_out_dir)
 
 

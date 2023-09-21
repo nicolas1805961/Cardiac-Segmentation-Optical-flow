@@ -78,7 +78,7 @@ from nnunet.training.loss_functions.dice_loss import DC_and_CE_loss, DC_and_foca
 from nnunet.training.loss_functions.crossentropy import RobustCrossEntropyLoss, WeightedRobustCrossEntropyLoss
 from nnunet.training.dataloading.dataset_loading import load_dataset, load_unlabeled_dataset
 from nnunet.network_architecture.Optical_flow_model_3 import ModelWrap
-from nnunet.lib.utils import RFR, ConvBlocks, Resblock, LayerNorm, RFR_1d, Resblock1D, ConvBlocks1D, MotionEstimation
+from nnunet.lib.utils import RFR, ConvBlocks2D, Resblock, LayerNorm, RFR_1d, Resblock1D, ConvBlocks1D, MotionEstimation
 from nnunet.lib.loss import SeparabilityLoss, ContrastiveLoss
 from nnunet.training.data_augmentation.cutmix import cutmix, batched_rand_bbox
 import shutil

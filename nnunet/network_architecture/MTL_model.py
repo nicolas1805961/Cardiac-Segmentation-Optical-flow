@@ -17,7 +17,7 @@ import sys
 import torch.nn as nn
 import matplotlib.pyplot as plt
 from ..lib.encoder import Encoder
-from ..lib.utils import ConvBlocks, Filter, ConvBlock, GetSeparability, GetCrossSimilarityMatrix, ReplicateChannels, To_image, From_image, rescale, CCA
+from ..lib.utils import ConvBlocks2D, ConvBlocksLegacy, Filter, ConvBlock, GetSeparability, GetCrossSimilarityMatrix, ReplicateChannels, To_image, From_image, rescale, CCA
 from ..lib import swin_transformer_2
 from ..lib import decoder_alt
 import torchvision.transforms.functional as TF
@@ -38,6 +38,8 @@ from ..lib.position_embedding import PositionEmbeddingSine2d, PositionEmbeddingL
 from torch.nn import init
 import random
 import string
+import io
+from PIL import Image
 
 
 def get_random_string(length):
@@ -202,7 +204,7 @@ class MTLmodel(SegmentationNetwork):
             self.pos = PositionEmbeddingSine2d(num_pos_feats=self.d_model // 2, normalize=True)
             #self.spatial_pos = nn.Parameter(torch.randn(size=(self.bottleneck_size[0]**2, self.d_model)))
             
-            self.extra_bottleneck_block_1 = conv_layer(in_dim=self.d_model, out_dim=self.d_model, nb_blocks=1, dpr=dpr_bottleneck, norm=norm, kernel_size=3)
+            self.extra_bottleneck_block_1 = ConvBlocksLegacy(in_dim=self.d_model, out_dim=self.d_model, nb_blocks=1, dpr=dpr_bottleneck, norm=norm, kernel_size=3)
             if transformer_bottleneck:
                 encoder_layer = TransformerEncoderLayer(d_model=int(self.d_model), nhead=bottleneck_heads, dim_feedforward=4 * int(self.d_model))
                 self.bottleneck = TransformerEncoder(encoder_layer=encoder_layer, num_layers=self.num_bottleneck_layers)
@@ -211,7 +213,7 @@ class MTLmodel(SegmentationNetwork):
                                                 norm(self.d_model),
                                                 nn.GELU())
                 #self.bottleneck = conv_layer(in_dim=self.d_model, out_dim=self.d_model, nb_blocks=1, dpr=dpr_bottleneck, norm=norm, kernel_size=3)
-            self.extra_bottleneck_block_2 = conv_layer(in_dim=self.d_model, out_dim=self.d_model, nb_blocks=1, dpr=dpr_bottleneck, norm=norm, kernel_size=3)
+            self.extra_bottleneck_block_2 = ConvBlocksLegacy(in_dim=self.d_model, out_dim=self.d_model, nb_blocks=1, dpr=dpr_bottleneck, norm=norm, kernel_size=3)
 
             if classification:
                 #self.classification_conv = ConvBlock(in_dim=self.d_model, out_dim=1, kernel_size=1, norm=norm, stride=1)
@@ -450,18 +452,22 @@ class MTLmodel(SegmentationNetwork):
             #seg, vis = self.decoder(x_encoded, encoder_skip_connections)
 
             #matplotlib.use('QtAgg')
-            #print('ooook')
-            #fig, ax = plt.subplots(1, 3, figsize=(16.0, 9.0))
+            #fig, ax = plt.subplots(1, 3, figsize=(16.0, 5.0))
             #ax[0].imshow(x.cpu()[0, 0], cmap='gray')
             #ax[1].imshow(vis[0], cmap='plasma', vmin=vis[0].min(), vmax=vis[0].max())
             #ax[2].imshow(vis[1], cmap='plasma', vmin=vis[1].min(), vmax=vis[1].max())
             #ax[0].set_axis_off()
             #ax[1].set_axis_off()
             #ax[2].set_axis_off()
-            #plt.subplots_adjust(wspace=0.05, hspace=0.05, top=0.95, bottom=0.05, left=0.05, right=0.95)
-            #plt.show()
-            #fig.savefig(os.path.join('visualization_sfb_2', get_random_string(10) + '.png'), transparent=True, dpi=100)
-            ##plt.waitforbuttonpress()
+            #plt.tight_layout()
+#
+            #png1 = io.BytesIO()
+            #fig.savefig(png1, format="png", transparent=True, dpi=600)
+#
+            #png2 = Image.open(png1)
+#
+            #png2.save(os.path.join('visualization_sfb_2', get_random_string(10) + '.tiff'), dpi=(600, 600))
+            #png1.close()
             #plt.close(fig)
             
             if not self.do_ds:

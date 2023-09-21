@@ -77,6 +77,7 @@ class Visualizer(object):
         eval_images['seg_sequence_mask'] = None
         eval_images['seg_registered'] = None
         eval_images['seg_registered_long'] = None
+        eval_images['strain'] = None
 
         for key in eval_images.keys():
             data = []
@@ -113,6 +114,13 @@ class Visualizer(object):
                     payload = {'input': None,
                                 'gt_df': None,
                                 'pred_df': None}
+                    score = -1
+                    data.append(payload)
+                    scores.append(score)
+            elif key == 'strain':
+                for i in range(log_images_nb):
+                    payload = {'gt': None,
+                                'pred': None}
                     score = -1
                     data.append(payload)
                     scores.append(score)
@@ -175,7 +183,6 @@ class Visualizer(object):
                 payload = {'moving': None,
                             'registered_input': None,
                             'registered_seg': None,
-                            'fixed': None,
                             'target': None,
                             'motion_flow': None}
                 score = -1
@@ -203,14 +210,6 @@ class Visualizer(object):
                 for i in range(log_images_nb):
                     payload = {'input': None,
                                 'pred': None}
-                    score = 0
-                    data.append(payload)
-                    scores.append(score)
-            elif key == 'weights':
-                for i in range(log_images_nb):
-                    payload = {'w3': None,
-                                'x1': None,
-                                'x2': None}
                     score = 0
                     data.append(payload)
                     scores.append(score)
@@ -448,35 +447,6 @@ class Visualizer(object):
         self.writer.add_images(os.path.join('Affinity', 'input').replace('\\', '/'), input_list, epoch, dataformats='NHWC')
         self.writer.add_images(os.path.join('Affinity', 'affinity').replace('\\', '/'), aff_list, epoch, dataformats='NHWC')
         self.writer.add_images(os.path.join('Affinity', 'segmentation_affinity').replace('\\', '/'), seg_aff_list, epoch, dataformats='NHWC')
-    
-    def log_weights_images(self, colormap, epoch):
-        x1_list = [x['x1'] for x in self.eval_images['weights'][0]]
-        x1_list = [self.get_images_ready_for_display(x, colormap=None) for x in x1_list]
-        x1_list = np.stack(x1_list, axis=0)
-        x1_list = np.tile(x1_list, reps=(1, 1, 1, 3))
-
-        x2_list = [x['x2'] for x in self.eval_images['weights'][0]]
-        x2_list = [self.get_images_ready_for_display(x, colormap=None) for x in x2_list]
-        x2_list = np.stack(x2_list, axis=0)
-        x2_list = np.tile(x2_list, reps=(1, 1, 1, 3))
-
-        weights_list = [x['weights'] for x in self.eval_images['weights'][0]]
-        weights_list = [self.get_images_ready_for_display(x, colormap) for x in weights_list]
-        weights_list = np.stack(weights_list, axis=0)
-
-        blended_list = []
-        for i in range(len(x1_list)):
-            blended = cv.addWeighted(x1_list[i], 0.5, weights_list[i], 0.5, 0.0)
-            blended_list.append(blended)
-        blended_list = np.stack(blended_list, axis=0)
-        self.writer.add_images(os.path.join('weights', 'x1').replace('\\', '/'), blended_list, epoch, dataformats='NHWC')
-
-        blended_list = []
-        for i in range(len(x2_list)):
-            blended = cv.addWeighted(x2_list[i], 0.5, weights_list[i], 0.5, 0.0)
-            blended_list.append(blended)
-        blended_list = np.stack(blended_list, axis=0)
-        self.writer.add_images(os.path.join('weights', 'x2').replace('\\', '/'), blended_list, epoch, dataformats='NHWC')
 
     def log_heatmap_images(self, colormap, epoch):
         input_list = [x['input'] for x in self.eval_images['heatmap'][0]]
@@ -565,25 +535,19 @@ class Visualizer(object):
 
 
     def log_sequence_seg_images(self, colormap_seg, norm, epoch):
-        x = self.eval_images['seg_sequence'][0, -1]['input'] # T, H, W
         gt = self.eval_images['seg_sequence'][0, -1]['gt'] # H, W
         seg = self.eval_images['seg_sequence'][0, -1]['pred'] # T, H, W
 
         gt = self.get_seg_images_ready_for_display(gt, colormap=colormap_seg, norm=norm)
 
-        x_list = []
         seg_list = []
         for t in range(len(seg)):
-            current_x = self.get_images_ready_for_display(x[t], colormap=None)
             current_seg = self.get_seg_images_ready_for_display(seg[t], colormap=colormap_seg, norm=norm)
-
-            x_list.append(current_x)
             seg_list.append(current_seg)
         
-        x = np.stack(x_list, axis=0)
         seg = np.stack(seg_list, axis=0)
 
-        self.writer.add_images(os.path.join('Seg sequence', 'Input').replace('\\', '/'), x, epoch, dataformats='NHWC')
+        #self.writer.add_images(os.path.join('Seg sequence', 'Input').replace('\\', '/'), x, epoch, dataformats='NHWC')
         self.writer.add_images(os.path.join('Seg sequence', 'Ground truth').replace('\\', '/'), gt, epoch, dataformats='HWC')
         self.writer.add_images(os.path.join('Seg sequence', 'Segmentations').replace('\\', '/'), seg, epoch, dataformats='NHWC')
     
@@ -614,7 +578,6 @@ class Visualizer(object):
 
     def log_motion_images(self, epoch, colormap_seg, norm):
         moving = self.eval_images['motion_flow'][0, -1]['moving'] # T, H, W
-        fixed = self.eval_images['motion_flow'][0, -1]['fixed'] # T, H, W
         registered = self.eval_images['motion_flow'][0, -1]['registered_input'] # T, H, W
         registered_seg = self.eval_images['motion_flow'][0, -1]['registered_seg'] # T, H, W
         motion_flow = self.eval_images['motion_flow'][0, -1]['motion_flow'] # T, 3, H, W
@@ -626,23 +589,19 @@ class Visualizer(object):
         registered_list = []
         registered_seg_list = []
         moving_list = []
-        for i in range(len(fixed)):
-            current_fixed = fixed[i]
+        for i in range(len(moving)):
             current_moving = moving[i]
             current_registered = registered[i]
             current_registered_seg = registered_seg[i]
             
             current_moving = self.get_images_ready_for_display(current_moving, colormap=None)
-            current_fixed = self.get_images_ready_for_display(current_fixed, colormap=None)
             current_registered = self.get_images_ready_for_display(current_registered, colormap=None)
             current_registered_seg = self.get_seg_images_ready_for_display(current_registered_seg, colormap=colormap_seg, norm=norm)
 
             moving_list.append(current_moving)
-            fixed_list.append(current_fixed)
             registered_list.append(current_registered)
             registered_seg_list.append(current_registered_seg)
         
-        fixed = np.stack(fixed_list, axis=0)
         moving = np.stack(moving_list, axis=0)
         registered = np.stack(registered_list, axis=0)
         registered_seg = np.stack(registered_seg_list, axis=0)
@@ -650,11 +609,10 @@ class Visualizer(object):
         motion_flow = motion_flow.transpose(0, 2, 3, 1)
 
         self.writer.add_images(os.path.join('Optical Flow', 'target').replace('\\', '/'), target, epoch, dataformats='HWC')
-        self.writer.add_images(os.path.join('Optical Flow', 'fixed').replace('\\', '/'), fixed, epoch, dataformats='NHWC')
         self.writer.add_images(os.path.join('Optical Flow', 'moving').replace('\\', '/'), moving, epoch, dataformats='NHWC')
         self.writer.add_images(os.path.join('Optical Flow', 'registered').replace('\\', '/'), registered, epoch, dataformats='NHWC')
-        self.writer.add_images(os.path.join('Optical Flow', 'registered seg').replace('\\', '/'), registered_seg, epoch, dataformats='NHWC')
         self.writer.add_images(os.path.join('Optical Flow', 'motion_flow').replace('\\', '/'), motion_flow, epoch, dataformats='NHWC')
+        self.writer.add_images(os.path.join('Optical Flow', 'registered seg').replace('\\', '/'), registered_seg, epoch, dataformats='NHWC')
 
     #def log_motion_images(self, colormap, norm, epoch):
     #    moving = self.eval_images['motion_flow'][0, 0]['moving'] # T, H, W
@@ -737,6 +695,21 @@ class Visualizer(object):
         self.writer.add_images(os.path.join('Best segmentations', 'input').replace('\\', '/'), input_list, epoch, dataformats='NHWC')
         self.writer.add_images(os.path.join('Best segmentations', 'ground_truth').replace('\\', '/'), gt_list, epoch, dataformats='NHWC')
         self.writer.add_images(os.path.join('Best segmentations', 'prediction').replace('\\', '/'), pred_list, epoch, dataformats='NHWC')
+
+    
+    def log_strain_images(self, epoch):
+        gt_list = [x['gt'] for x in self.eval_images['strain'][0]]
+        pred_list = [x['pred'] for x in self.eval_images['strain'][0]]
+
+        figure_list = []
+        for i in range(len(pred_list)):
+            fig = plt.figure()
+            plt.plot(gt_list[i], c='g')
+            plt.plot(pred_list[i], c='r')
+            figure_list.append(fig)
+
+        self.writer.add_figure(os.path.join('Strain', 'plots').replace('\\', '/'), figure_list, epoch)
+
 
     def log_seg_registered_long_images(self, colormap, norm, epoch):
         gt_list = [x['target'] for x in self.eval_images['seg_registered_long'][0]]
@@ -1077,20 +1050,28 @@ class Visualizer(object):
 
     
     def log_weights_images(self, colormap, epoch):
-        x = self.eval_images['weights'][0, 0]['input'] # H, W
-        weights = self.eval_images['weights'][0, 0]['weights'] # H, W
+        x = self.eval_images['weights'][0, 0]['input'] # T, H, W
+        weights = self.eval_images['weights'][0, 0]['weights'] # T, H, W
 
         #matplotlib.use('QtAgg')
         #fig, ax = plt.subplots(1, 1)
         #ax.imshow(dot[0], cmap='plasma')
         #plt.show()
-        
-        weights = cv.resize(weights, x.shape, interpolation=cv.INTER_LINEAR)
-        weights = self.get_images_ready_for_display(weights, colormap=colormap)
-        x = self.get_images_ready_for_display(x, colormap=None)
 
-        self.writer.add_images(os.path.join('Weights', 'Input').replace('\\', '/'), x, epoch, dataformats='HWC')
-        self.writer.add_images(os.path.join('Weights', 'Weights').replace('\\', '/'), weights, epoch, dataformats='HWC')
+        x_list = []
+        weights_list = []
+        for t in range(len(weights)):
+            current_weights = cv.resize(weights[t], x[t].shape, interpolation=cv.INTER_LINEAR)
+            current_weights = self.get_images_ready_for_display(current_weights, colormap=colormap)
+            current_x = self.get_images_ready_for_display(x[t], colormap=None)
+            x_list.append(current_x)
+            weights_list.append(current_weights)
+
+        x = np.stack(x_list, axis=0)
+        weights = np.stack(weights_list, axis=0)
+
+        self.writer.add_images(os.path.join('Weights', 'Input').replace('\\', '/'), x, epoch, dataformats='NHWC')
+        self.writer.add_images(os.path.join('Weights', 'Weights').replace('\\', '/'), weights, epoch, dataformats='NHWC')
     
 
     def log_target_images(self, colormap, epoch):
@@ -1381,11 +1362,10 @@ class Visualizer(object):
         self.writer.add_images(os.path.join('Confidence', 'prediction').replace('\\', '/'), pred_list, epoch, dataformats='NHWC')
 
 
-    def set_up_image_flow(self, seg_dice, moving, registered_input, registered_seg, target, fixed, motion_flow):
+    def set_up_image_flow(self, seg_dice, moving, registered_input, registered_seg, target, motion_flow):
         seg_dice = seg_dice.cpu().numpy()
         moving = moving.cpu().numpy()
         registered_input = registered_input.cpu().numpy()
-        fixed = fixed.cpu().numpy()
         motion_flow = motion_flow.cpu().numpy()
         registered_seg = registered_seg.cpu().numpy()
         target = target.cpu().numpy()
@@ -1394,7 +1374,6 @@ class Visualizer(object):
 
             self.eval_images['motion_flow'][0, 0]['moving'] = moving.astype(np.float32)
             self.eval_images['motion_flow'][0, 0]['registered_input'] = registered_input.astype(np.float32)
-            self.eval_images['motion_flow'][0, 0]['fixed'] = fixed.astype(np.float32)
             self.eval_images['motion_flow'][0, 0]['motion_flow'] = motion_flow.astype(np.float32)
             self.eval_images['motion_flow'][0, 0]['registered_seg'] = registered_seg.astype(np.float32)
             self.eval_images['motion_flow'][0, 0]['target'] = target.astype(np.float32)
@@ -1468,6 +1447,21 @@ class Visualizer(object):
 
             sorted_indices = self.eval_images['best_seg'][1, :].argsort()
             self.eval_images['best_seg'] = self.eval_images['best_seg'][:, sorted_indices]
+
+    
+    def set_up_image_strain(self, seg_dice, gt, pred):
+        seg_dice = seg_dice.cpu().numpy()
+        gt = gt.cpu().numpy()
+        pred = pred.cpu().numpy()
+
+        if self.eval_images['strain'][1, 0] <= seg_dice:
+
+            self.eval_images['strain'][0, 0]['gt'] = gt.astype(np.float32)
+            self.eval_images['strain'][0, 0]['pred'] = pred.astype(np.float32)
+            self.eval_images['strain'][1, 0] = seg_dice
+
+            sorted_indices = self.eval_images['strain'][1, :].argsort()
+            self.eval_images['strain'] = self.eval_images['strain'][:, sorted_indices]
 
     
     def set_up_image_seg_registered(self, seg_dice, seg_registered, target):

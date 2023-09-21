@@ -12,6 +12,9 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
+import uuid
+import random
+import string
 from tqdm import tqdm
 import psutil
 import shutil
@@ -22,6 +25,10 @@ from typing import Tuple, List
 import matplotlib.pyplot as plt
 import SimpleITK as sitk
 from numpy.lib.stride_tricks import sliding_window_view
+from math import ceil
+from glob import glob
+import nibabel as nib
+from skimage.measure import perimeter
 
 
 import matplotlib
@@ -31,6 +38,7 @@ from batchgenerators.utilities.file_and_folder_operations import *
 from torch import nn
 from torch.optim import lr_scheduler
 
+import cv2 as cv
 import nnunet
 from nnunet.configuration import default_num_threads
 from nnunet.evaluation.evaluator import NiftiEvaluator, aggregate_scores
@@ -48,6 +56,174 @@ from nnunet.utilities.nd_softmax import softmax_helper
 from nnunet.utilities.tensor_utilities import sum_tensor
 
 matplotlib.use("agg")
+
+
+def strain_compute_metric(patient_name, all_files, gt_folder_name):
+    results = {'all': []}
+    phase_list = [x for x in all_files if patient_name in x]
+    phase_list = np.array(sorted(phase_list))
+    video = []
+    for phase in phase_list:
+        arr = np.load(phase) # T
+        video.append(arr)
+    video = np.stack(video, axis=0) # D, T
+    for d in range(len(video)):
+        slice_nb = str(d + 1).zfill(2)
+        filename = patient_name + '_slice' + slice_nb + '.npy'
+        gt_path = os.path.join(gt_folder_name, 'strain', 'LV', 'tangential', filename)
+        lv_tangential_strain = video[d]
+        lv_tangential_strain_gt = np.load(gt_path)[0]
+        current_res = {'reference': gt_path, 'test': phase_list[0][:-12]}
+        current_res['lv_tangential'] = (lv_tangential_strain - lv_tangential_strain_gt).tolist()
+        results['all'].append(current_res)
+    return results
+
+
+
+def save_strain_bottleneck(save_path, patient_id, lv_tangential_strain):
+    lv_tangential_strain = lv_tangential_strain.transpose((1, 0)) # D, T
+    for d in range(len(lv_tangential_strain)):
+        current_strain = lv_tangential_strain[d] * 100
+        slice_nb = str(d + 1).zfill(2)
+        filename = patient_id + '_slice' + slice_nb + '.npy'
+        np.save(os.path.join(save_path, filename), current_strain)
+
+
+def move_gt_files(input_file_path, output_dir):
+    success = False
+    attempts = 0
+    e = None
+    while not success and attempts < 10:
+        try:
+            shutil.copy(input_file_path, output_dir)
+            success = True
+        except OSError as e:
+            attempts += 1
+            sleep(1)
+    if not success:
+        print("Could not copy gt nifti file %s into folder %s" % (input_file_path, output_dir))
+        if e is not None:
+            raise e
+
+
+def get_strain(target):
+    rv_perim_list = []
+    endo_perim_list = []
+    epi_perim_list = []
+    for t in range(len(target)):
+        current_arr = target[t]
+        binarized_rv = current_arr == 1
+        binarized_endo = current_arr == 3
+        binarized_epi = np.logical_or(current_arr == 2, binarized_endo)
+        perim_rv = perimeter(binarized_rv)
+        perim_endo = perimeter(binarized_endo)
+        perim_epi = perimeter(binarized_epi)
+        rv_perim_list.append(perim_rv)
+        endo_perim_list.append(perim_endo)
+        epi_perim_list.append(perim_epi)
+    
+    rv_strain = [(rv_perim_list[i] - rv_perim_list[0]) / (rv_perim_list[0] + 1e-8) for i in range(len(rv_perim_list))]
+    endo_strain = [(endo_perim_list[i] - endo_perim_list[0]) / (endo_perim_list[0] + 1e-8) for i in range(len(endo_perim_list))]
+    epi_strain = [(epi_perim_list[i] - epi_perim_list[0]) / (epi_perim_list[0] + 1e-8) for i in range(len(epi_perim_list))]
+
+    rv_strain = np.array(rv_strain)
+    endo_strain = np.array(endo_strain)
+    epi_strain = np.array(epi_strain)
+
+    lv_strain = (endo_strain + epi_strain) / 2
+
+    return rv_strain, lv_strain
+
+
+
+def save_strain_compute_metric(patient_name, all_files, gt_folder_name, search_path):
+    results = {'all': []}
+    phase_list = [x for x in all_files if patient_name in x]
+    phase_list = np.array(sorted(phase_list, key=lambda x: int(os.path.basename(x).split('frame')[-1][:2])))
+    video = []
+    for phase in phase_list:
+        data = nib.load(phase)
+        arr = data.get_fdata() # H, W, D
+        arr = arr.transpose((2, 0, 1)) # D, H, W
+        video.append(arr)
+    video = np.stack(video, axis=1) # D, T, H, W
+    for d in range(len(video)):
+        slice_nb = str(d + 1).zfill(2)
+        filename = patient_name + '_slice' + slice_nb + '.npy'
+        gt_path = os.path.join(gt_folder_name, 'strain', 'LV', 'tangential', filename)
+        rv_tangential_strain, lv_tangential_strain = get_strain(video[d])
+        rv_tangential_strain = rv_tangential_strain * 100
+        lv_tangential_strain = lv_tangential_strain * 100
+        lv_tangential_strain_gt = np.load(gt_path)[0]
+        current_res = {'reference': gt_path, 'test': phase_list[0][:-15]}
+        current_res['lv_tangential'] = (lv_tangential_strain - lv_tangential_strain_gt).tolist()
+        results['all'].append(current_res)
+        np.save(os.path.join(search_path, 'Strain', 'LV', 'Tangential', filename), lv_tangential_strain)
+    return results
+
+
+def compute_contour_metric(patient_name, all_files, gt_folder_name):
+    results = {'all': []}
+    phase_list = [x for x in all_files if patient_name in x]
+    phase_list = np.array(sorted(phase_list, key=lambda x: int(os.path.basename(x).split('frame')[-1][:2])))
+    video = []
+    for phase in phase_list:
+        data = np.load(phase)
+        arr = data['flow'] # H, W, D, C
+        arr = arr.transpose((2, 3, 0, 1)) # D, C, H, W
+        video.append(arr)
+    flow = np.stack(video, axis=1) # D, T, C, H, W
+    slice_error_list = []
+    for d in range(len(flow)):
+        current_slice_flow = flow[d] # T, 2, H, W
+        slice_nb = str(d + 1).zfill(2)
+        filename = patient_name + '_slice' + slice_nb + '.npy'
+        gt_path_lv = os.path.join(gt_folder_name, 'contour', 'LV', filename)
+        gt_path_rv = os.path.join(gt_folder_name, 'contour', 'RV', filename)
+        gt_lv_contour = np.load(gt_path_lv).transpose((2, 1, 0)) # T, P1, 4
+        gt_rv_contour = np.load(gt_path_rv).transpose((2, 1, 0)) # T, P2, 2
+        gt_endo_contour = gt_lv_contour[:, :, :2]
+        gt_epi_contour = gt_lv_contour[:, :, 2:]
+        split_index = np.cumsum([gt_endo_contour.shape[1], gt_epi_contour.shape[1]])
+        contours = np.concatenate([gt_endo_contour, gt_epi_contour, gt_rv_contour], axis=1) # T, P, 2
+
+        current_slice_flow = np.flip(current_slice_flow, axis=0)
+        contours = np.flip(contours, axis=0)
+
+        temporal_error_list = []
+        for t in range(len(current_slice_flow) - 1):
+            current_contours = contours[t] # P, 2
+            next_contours = contours[t + 1] # P, 2
+            gt_delta = next_contours - current_contours
+            current_frame_flow = current_slice_flow[t] # 2, H, W
+            current_frame_flow = current_frame_flow.transpose((1, 2, 0)) # H, W, 2
+            y = np.rint(current_contours[:, 0]).astype(int)
+            x = np.rint(current_contours[:, 1]).astype(int)
+
+            delta_pred = current_frame_flow[y, x, :] # P, 2
+            error = np.abs(gt_delta - delta_pred).mean(-1) # P,
+            temporal_error_list.append(error) 
+
+        temporal_error_list = np.stack(temporal_error_list, axis=0) # T, P
+        temporal_error_list = np.flip(temporal_error_list, axis=0)
+
+        error = np.split(temporal_error_list, indices_or_sections=split_index, axis=1) # [(T, P1) , (T, P2), (T, P3)]
+        error = np.stack([x.mean(-1) for x in error], axis=-1) # T, 3
+
+        slice_error_list.append(error)
+    slice_error_list = np.stack(slice_error_list, axis=0) # D, T, 3
+
+    for i in range(slice_error_list.shape[1]):
+        current_res = slice_error_list[:, i] # D, 3
+        current_res_info = {'patient_name': patient_name, 
+                            'reference': gt_path_lv[:-12], 
+                            'test': phase_list[i + 1],
+                            'ENDO_mae': current_res[:, 0].tolist(),
+                            'EPI_mae': current_res[:, 1].tolist(),
+                            'RV_mae': current_res[:, 2].tolist()}
+        results['all'].append(current_res_info)
+    return results
+
 
 
 class nnUNetTrainer(NetworkTrainer):
@@ -533,7 +709,7 @@ class nnUNetTrainer(NetworkTrainer):
         return ret
 
 
-    def predict_preprocessed_data_return_seg_and_softmax_flow(self, unlabeled, target_mask, padding_mask, target, processor, do_mirroring: bool = True,
+    def predict_preprocessed_data_return_seg_and_softmax_flow(self, unlabeled, target, target_mask, processor, do_mirroring: bool = True,
                                                          mirror_axes: Tuple[int] = None,
                                                          use_sliding_window: bool = True, step_size: float = 0.5,
                                                          use_gaussian: bool = True, pad_border_mode: str = 'constant',
@@ -570,51 +746,7 @@ class nnUNetTrainer(NetworkTrainer):
 
         current_mode = self.network.training
         self.network.eval()
-        ret = self.network.predict_3D_flow(unlabeled=unlabeled, target_mask=target_mask, padding_mask=padding_mask, target=target, processor=processor, do_mirroring=do_mirroring, mirror_axes=mirror_axes,
-                                      use_sliding_window=use_sliding_window, step_size=step_size,
-                                      patch_size=self.patch_size, regions_class_order=self.regions_class_order,
-                                      use_gaussian=use_gaussian, pad_border_mode=pad_border_mode,
-                                      pad_kwargs=pad_kwargs, all_in_gpu=all_in_gpu, verbose=verbose,
-                                      mixed_precision=mixed_precision)
-        self.network.train(current_mode)
-        return ret
-
-    
-    def predict_preprocessed_data_return_seg_and_softmax_middle_unlabeled(self, data: np.ndarray, data2: np.ndarray, do_mirroring: bool = True,
-                                                         mirror_axes: Tuple[int] = None,
-                                                         use_sliding_window: bool = True, step_size: float = 0.5,
-                                                         use_gaussian: bool = True, pad_border_mode: str = 'constant',
-                                                         pad_kwargs: dict = None, all_in_gpu: bool = False,
-                                                         verbose: bool = True, mixed_precision: bool = True) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        :param data:
-        :param do_mirroring:
-        :param mirror_axes:
-        :param use_sliding_window:
-        :param step_size:
-        :param use_gaussian:
-        :param pad_border_mode:
-        :param pad_kwargs:
-        :param all_in_gpu:
-        :param verbose:
-        :return:
-        """
-        if pad_border_mode == 'constant' and pad_kwargs is None:
-            pad_kwargs = {'constant_values': 0}
-
-        if do_mirroring and mirror_axes is None:
-            mirror_axes = self.data_aug_params['mirror_axes']
-
-        if do_mirroring:
-            assert self.data_aug_params["do_mirror"], "Cannot do mirroring as test time augmentation when training " \
-                                                      "was done without mirroring"
-
-        valid = list((SegmentationNetwork, nn.DataParallel))
-        assert isinstance(self.network, tuple(valid))
-
-        current_mode = self.network.training
-        self.network.eval()
-        ret = self.network.predict_3D_middle_unlabeled(data, data2, do_mirroring=do_mirroring, mirror_axes=mirror_axes,
+        ret = self.network.predict_3D_flow(unlabeled=unlabeled, target=target, target_mask=target_mask, processor=processor, do_mirroring=do_mirroring, mirror_axes=mirror_axes,
                                       use_sliding_window=use_sliding_window, step_size=step_size,
                                       patch_size=self.patch_size, regions_class_order=self.regions_class_order,
                                       use_gaussian=use_gaussian, pad_border_mode=pad_border_mode,
@@ -1618,6 +1750,350 @@ class nnUNetTrainer(NetworkTrainer):
                     raise e
 
         self.network.train(current_mode)
+    
+
+    def validate_stable_diffusion(self, images, do_mirroring: bool = True, use_sliding_window: bool = True, step_size: float = 0.5,
+                 save_softmax: bool = True, use_gaussian: bool = True, overwrite: bool = True,
+                 validation_folder_name: str = 'validation_raw', debug: bool = True, all_in_gpu: bool = False,
+                 segmentation_export_kwargs: dict = None, output_folder=None):
+
+        """
+        if debug=True then the temporary files generated for postprocessing determination will be kept
+        """
+        current_mode = self.network.training
+        self.network.eval()
+
+        assert self.was_initialized, "must initialize, ideally with checkpoint (or train first)"
+        if self.dataset_val is None:
+            self.load_dataset()
+            self.do_split()
+
+        # predictions as they come from the network go here
+        if output_folder is not None:
+            self.output_folder = output_folder
+        #output_folder = join(self.output_folder, validation_folder_name)
+        #maybe_mkdir_p(output_folder)
+        # this is for debug purposes
+        my_input_args = {'do_mirroring': do_mirroring,
+                         'use_sliding_window': use_sliding_window,
+                         'step_size': step_size,
+                         'save_softmax': save_softmax,
+                         'use_gaussian': use_gaussian,
+                         'overwrite': overwrite,
+                         'validation_folder_name': validation_folder_name,
+                         'debug': debug,
+                         'all_in_gpu': all_in_gpu,
+                         'segmentation_export_kwargs': segmentation_export_kwargs,
+                         }
+        save_json(my_input_args, join(self.output_folder, "validation_args.json"))
+
+        newpath_predictions = join(self.output_folder, 'Predictions', validation_folder_name)
+        if not os.path.exists(newpath_predictions):
+            os.makedirs(newpath_predictions)
+
+        for i in range(len(images)):
+            current_image = images[i]
+            filename = uuid.uuid4().hex[:20].upper()
+            prediction_path = join(newpath_predictions, filename + ".png")
+            cv.imwrite(prediction_path, current_image)
+
+        self.network.train(current_mode)
+
+    
+
+
+    def validate_flow_one_step_simple(self, processor, log_function, step, do_mirroring: bool = True, use_sliding_window: bool = True, step_size: float = 0.5,
+                 save_softmax: bool = True, use_gaussian: bool = True, overwrite: bool = True,
+                 validation_folder_name: str = 'validation_raw', debug: bool = True, all_in_gpu: bool = False,
+                 segmentation_export_kwargs: dict = None, run_postprocessing_on_folds: bool = True, output_folder=None, save_flow=True):
+
+        """
+        if debug=True then the temporary files generated for postprocessing determination will be kept
+        """
+        current_mode = self.network.training
+        self.network.eval()
+
+        assert self.was_initialized, "must initialize, ideally with checkpoint (or train first)"
+        if self.dataset_val is None:
+            self.load_dataset()
+            self.do_split()
+
+        if segmentation_export_kwargs is None:
+            if 'segmentation_export_params' in self.plans.keys():
+                force_separate_z = self.plans['segmentation_export_params']['force_separate_z']
+                interpolation_order = self.plans['segmentation_export_params']['interpolation_order']
+                interpolation_order_z = self.plans['segmentation_export_params']['interpolation_order_z']
+            else:
+                force_separate_z = None
+                interpolation_order = 1
+                interpolation_order_z = 0
+        else:
+            force_separate_z = segmentation_export_kwargs['force_separate_z']
+            interpolation_order = segmentation_export_kwargs['interpolation_order']
+            interpolation_order_z = segmentation_export_kwargs['interpolation_order_z']
+
+        # predictions as they come from the network go here
+        if output_folder is not None:
+            self.output_folder = output_folder
+        #output_folder = join(self.output_folder, validation_folder_name)
+        #maybe_mkdir_p(output_folder)
+        # this is for debug purposes
+        my_input_args = {'do_mirroring': do_mirroring,
+                         'use_sliding_window': use_sliding_window,
+                         'step_size': step_size,
+                         'save_softmax': save_softmax,
+                         'use_gaussian': use_gaussian,
+                         'overwrite': overwrite,
+                         'validation_folder_name': validation_folder_name,
+                         'debug': debug,
+                         'all_in_gpu': all_in_gpu,
+                         'segmentation_export_kwargs': segmentation_export_kwargs,
+                         }
+        save_json(my_input_args, join(self.output_folder, "validation_args.json"))
+
+        if do_mirroring:
+            if not self.data_aug_params['do_mirror']:
+                raise RuntimeError("We did not train with mirroring so you cannot do inference with mirroring enabled")
+            mirror_axes = self.data_aug_params['mirror_axes']
+        else:
+            mirror_axes = ()
+
+        pred_gt_tuples = []
+        pred_gt_tuples_register = []
+
+        export_pool = Pool(default_num_threads)
+        results = []
+
+        newpath_flow = join(self.output_folder, 'Flow', validation_folder_name)
+        if not os.path.exists(newpath_flow):
+            os.makedirs(newpath_flow)
+
+        newpath_registered = join(self.output_folder, 'Registered', validation_folder_name)
+        if not os.path.exists(newpath_registered):
+            os.makedirs(newpath_registered)
+        
+        newpath_seg = join(self.output_folder, 'Segmentation', validation_folder_name)
+        if not os.path.exists(newpath_seg):
+            os.makedirs(newpath_seg)
+        
+        to_validate_registered_list = []
+
+        list_of_keys = list(self.dataset_val.keys())
+        un_list_of_keys = list(self.dataset_un_val.keys())
+        patient_id_list = np.unique([x[:10] for x in list_of_keys])
+        metadata_list = []
+        metadata_list_registered = []
+        for patient_id in tqdm(patient_id_list):
+            all_keys = list_of_keys + un_list_of_keys
+            phase_list = [x for x in all_keys if patient_id in x]
+            phase_list = np.array(sorted(phase_list, key=lambda x: int(x[16:18])))
+            phase_list = np.array(phase_list)
+            global_labeled_idx = np.where(~np.char.endswith(phase_list, '_u'))[0]
+
+            frame_indices = np.arange(len(phase_list))
+
+            before_where = np.argwhere(frame_indices < global_labeled_idx[0]).reshape(-1,)
+            after_where = np.argwhere(frame_indices >= global_labeled_idx[0]).reshape(-1,)
+            assert after_where[0] == global_labeled_idx[0]
+
+            before_str = phase_list[before_where]
+            after_str = phase_list[after_where]
+
+            all_where = np.concatenate([after_where, before_where])
+            phase_list = np.concatenate([after_str, before_str])
+
+            if '_u' in phase_list[0]:
+                properties = load_pickle(self.unlabeled_dataset[phase_list[0]]['properties_file'])
+            else:
+                properties = load_pickle(self.dataset[phase_list[0]]['properties_file'])
+
+            unlabeled = np.full(shape=((len(phase_list), 1) + properties['size_after_resampling']), fill_value=np.nan)
+            target = np.full(shape=((len(phase_list), 1) + properties['size_after_resampling']), fill_value=np.nan)
+            target_mask = np.zeros(shape=(len(phase_list),), dtype=bool)
+
+            if overwrite or (not isfile(join(output_folder, phase_list[0] + ".nii.gz"))) or (save_softmax and not isfile(join(output_folder, phase_list[0] + ".npz"))):
+                for idx, frame in enumerate(phase_list):
+                    #if frame == k:
+                    #    labeled_idx = idx
+                    if '_u' in frame:
+                        current_data = np.load(self.dataset_un_val[frame]['data_file'])['data']
+                        current_data = current_data + 1e-8
+                        unlabeled[idx] = current_data
+                    else:
+                        current_data = np.load(self.dataset_val[frame]['data_file'])['data']
+                        #current_data[-1][current_data[-1] == -1] = 0
+                        target[idx] = current_data[1]
+                        target[idx][target[idx] == -1] = 0
+                        unlabeled[idx] = current_data[0] + 1e-8
+                        target_mask[idx] = True
+                    #self.print_to_log_file(k, data.shape)
+                
+                #if self.step > 1:
+                #    values = values[::self.step]
+                assert target_mask[0] == True
+                ret = self.predict_preprocessed_data_return_seg_and_softmax_flow(unlabeled=unlabeled,
+                                                                                target=target,
+                                                                                target_mask=target_mask,
+                                                                                processor=processor,
+                                                                                do_mirroring=do_mirroring,
+                                                                                mirror_axes=mirror_axes,
+                                                                                use_sliding_window=use_sliding_window,
+                                                                                step_size=step_size,
+                                                                                use_gaussian=use_gaussian,
+                                                                                all_in_gpu=all_in_gpu,
+                                                                                mixed_precision=self.fp16,
+                                                                                verbose=False)
+                flow_pred = ret[0] # T, C, depth, H, W
+                registered_pred = ret[1] # T, C, depth, H, W
+
+                assert len(flow_pred) == len(registered_pred)
+
+                sorted_where = np.argsort(all_where)
+                flow_pred = flow_pred[sorted_where]
+                registered_pred = registered_pred[sorted_where]
+                target_mask = target_mask[sorted_where]
+                phase_list = phase_list[sorted_where]
+
+                softmax_pred = np.zeros_like(registered_pred)
+
+                #matplotlib.use('QtAgg')
+                #fig, ax = plt.subplots(1, 7)
+                #plot_idx = 0
+                #for a in range(8, 15):
+                #    current_img = softmax_pred[a, :, 0]
+                #    current_img = current_img.argmax(0)
+                #    ax[plot_idx].imshow(current_img, cmap='gray')
+                #    plot_idx += 1
+                #plt.show()
+                #plt.waitforbuttonpress()
+                #plt.close(fig)
+
+                #stop_indices = [len(x) for x in windows]
+                #videos = [phase_list[x] for x in windows]
+
+                #matplotlib.use('QtAgg')
+                #print(labeled_idx)
+                #print(video_padding)
+                #fig, ax = plt.subplots(1, self.video_length)
+                #for i in range(self.video_length):
+                #    ax[i].imshow(data[i, 0, 5], cmap='gray')
+                #plt.show()
+
+                assert len(flow_pred) == len(phase_list)
+
+                and_mask = target_mask
+                gt_indices = np.where(and_mask)[0]
+                assert len(gt_indices) == 2
+
+                for t in range(len(phase_list)):
+                    if '_u' in phase_list[t]:
+                        properties = load_pickle(self.unlabeled_dataset[phase_list[t]]['properties_file'])
+                    else:
+                        properties = load_pickle(self.dataset[phase_list[t]]['properties_file'])
+                    fname = properties['list_of_data_files'][0].split(os.sep)[-1][:-12]
+
+                    current_softmax_pred = softmax_pred[t]
+                    current_softmax_pred = current_softmax_pred.transpose([0] + [i + 1 for i in self.transpose_backward])
+
+                    if save_softmax:
+                        softmax_fname = join(output_folder, fname + ".npz")
+                    else:
+                        softmax_fname = None
+
+                    splitted = fname.split('frame')
+                    to_nb = int(splitted[-1].split('_')[0].split('.')[0])
+                    flow_name = splitted[0] + 'frame' + '01'.zfill(2) + '_to_' + str(to_nb).zfill(2)
+                    flow_path = join(newpath_flow, flow_name + ".nii.gz")
+                    current_flow = flow_pred[t]
+                    current_flow = current_flow.transpose([0] + [i + 1 for i in self.transpose_backward])
+
+                    registered_path = join(newpath_registered, fname + ".nii.gz")
+                    current_registered = registered_pred[t]
+                    current_registered = current_registered.transpose([0] + [i + 1 for i in self.transpose_backward])
+
+                    """There is a problem with python process communication that prevents us from communicating objects
+                    larger than 2 GB between processes (basically when the length of the pickle string that will be sent is
+                    communicated by the multiprocessing.Pipe object then the placeholder (I think) does not allow for long
+                    enough strings (lol). This could be fixed by changing i to l (for long) but that would require manually
+                    patching system python code. We circumvent that problem here by saving softmax_pred to a npy file that will
+                    then be read (and finally deleted) by the Process. save_segmentation_nifti_from_softmax can take either
+                    filename or np.ndarray and will handle this automatically"""
+                    if np.prod(current_softmax_pred.shape) > (2e9 / 4 * 0.85):  # *0.85 just to be save
+                        np.save(join(newpath_seg, fname + ".npy"), current_softmax_pred)
+                        current_softmax_pred = join(newpath_seg, fname + ".npy")
+
+                    results.append(export_pool.starmap_async(save_segmentation_nifti_from_softmax,
+                                                            ((current_softmax_pred, join(newpath_seg, fname + ".nii.gz"),
+                                                            properties, interpolation_order, self.regions_class_order,
+                                                            None, None,
+                                                            softmax_fname, None, force_separate_z,
+                                                            interpolation_order_z, False, current_flow, flow_path,
+                                                            current_registered, registered_path),
+                                                            )
+                                                            )
+                                )
+                    
+                    
+                    if t == gt_indices[1]:
+                        to_validate_registered_list.append(fname + ".nii.gz")
+                        metadata_list_registered.append(self.create_metadata_dict(properties))
+                        pred_gt_tuples_register.append([registered_path,
+                                                join(self.gt_niftis_folder, fname + ".nii.gz")])
+
+        _ = [i.get() for i in results]
+        self.print_to_log_file("finished prediction")
+
+        # evaluate raw predictions
+        self.print_to_log_file("evaluation of raw predictions")
+        task = self.dataset_directory.split(os.sep)[-1]
+        job_name = self.experiment_name
+        _ = aggregate_scores(pred_gt_tuples_register, labels=list(range(self.num_classes)),
+                             json_output_file=join(newpath_registered, "summary.json"),
+                             json_name=job_name + " val tiled %s" % (str(use_sliding_window)),
+                             json_author="Fabian",
+                             json_task=task, num_threads=default_num_threads,
+                             advanced=True,
+                             metadata_list=metadata_list_registered)
+
+        if run_postprocessing_on_folds:
+            # in the old nnunet we would stop here. Now we add a postprocessing. This postprocessing can remove everything
+            # except the largest connected component for each class. To see if this improves results, we do this for all
+            # classes and then rerun the evaluation. Those classes for which this resulted in an improved dice score will
+            # have this applied during inference as well
+            
+            base_registered = join(self.output_folder, 'Registered')
+            determine_postprocessing(base_registered, self.gt_niftis_folder, validation_folder_name,
+                                     final_subf_name=validation_folder_name + "_postprocessed", debug=debug, log_function=log_function,
+                                     metadata_list=metadata_list_registered, to_validate_list=to_validate_registered_list)
+            # after this the final predictions for the vlaidation set can be found in validation_folder_name_base + "_postprocessed"
+            # They are always in that folder, even if no postprocessing as applied!
+
+        # detemining postprocesing on a per-fold basis may be OK for this fold but what if another fold finds another
+        # postprocesing to be better? In this case we need to consolidate. At the time the consolidation is going to be
+        # done we won't know what self.gt_niftis_folder was, so now we copy all the niftis into a separate folder to
+        # be used later
+        gt_nifti_folder = join(self.output_folder_base, "gt_niftis")
+        maybe_mkdir_p(gt_nifti_folder)
+        for f in subfiles(self.gt_niftis_folder, suffix=".nii.gz"):
+            success = False
+            attempts = 0
+            e = None
+            while not success and attempts < 10:
+                try:
+                    shutil.copy(f, gt_nifti_folder)
+                    success = True
+                except OSError as e:
+                    attempts += 1
+                    sleep(1)
+            if not success:
+                print("Could not copy gt nifti file %s into folder %s" % (f, gt_nifti_folder))
+                if e is not None:
+                    raise e
+
+        self.network.train(current_mode)
+
+
+
 
     
     def validate_flow_one_step(self, processor, log_function, step, do_mirroring: bool = True, use_sliding_window: bool = True, step_size: float = 0.5,
@@ -1653,8 +2129,8 @@ class nnUNetTrainer(NetworkTrainer):
         # predictions as they come from the network go here
         if output_folder is not None:
             self.output_folder = output_folder
-        output_folder = join(self.output_folder, validation_folder_name)
-        maybe_mkdir_p(output_folder)
+        #output_folder = join(self.output_folder, validation_folder_name)
+        #maybe_mkdir_p(output_folder)
         # this is for debug purposes
         my_input_args = {'do_mirroring': do_mirroring,
                          'use_sliding_window': use_sliding_window,
@@ -1667,7 +2143,7 @@ class nnUNetTrainer(NetworkTrainer):
                          'all_in_gpu': all_in_gpu,
                          'segmentation_export_kwargs': segmentation_export_kwargs,
                          }
-        save_json(my_input_args, join(output_folder, "validation_args.json"))
+        save_json(my_input_args, join(self.output_folder, "validation_args.json"))
 
         if do_mirroring:
             if not self.data_aug_params['do_mirror']:
@@ -1682,14 +2158,19 @@ class nnUNetTrainer(NetworkTrainer):
         export_pool = Pool(default_num_threads)
         results = []
 
-        if save_flow:
-            newpath_flow = join(output_folder, 'flow')
-            if not os.path.exists(newpath_flow):
-                os.makedirs(newpath_flow)
+        newpath_flow = join(self.output_folder, 'Flow', validation_folder_name)
+        if not os.path.exists(newpath_flow):
+            os.makedirs(newpath_flow)
 
-            newpath_registered = join(output_folder, 'registered')
-            if not os.path.exists(newpath_registered):
-                os.makedirs(newpath_registered)
+        newpath_registered = join(self.output_folder, 'Registered', validation_folder_name)
+        if not os.path.exists(newpath_registered):
+            os.makedirs(newpath_registered)
+
+        newpath_seg = join(self.output_folder, 'Segmentation', validation_folder_name)
+        if not os.path.exists(newpath_seg):
+            os.makedirs(newpath_seg)
+        
+        to_validate_registered_list = []
 
         list_of_keys = list(self.dataset_val.keys())
         un_list_of_keys = list(self.dataset_un_val.keys())
@@ -1703,6 +2184,18 @@ class nnUNetTrainer(NetworkTrainer):
             phase_list = np.array(phase_list)
             global_labeled_idx = np.where(~np.char.endswith(phase_list, '_u'))[0]
 
+            frame_indices = np.arange(len(phase_list))
+
+            before_where = np.argwhere(frame_indices < global_labeled_idx[0]).reshape(-1,)
+            after_where = np.argwhere(frame_indices >= global_labeled_idx[0]).reshape(-1,)
+            assert after_where[0] == global_labeled_idx[0]
+
+            before_str = phase_list[before_where]
+            after_str = phase_list[after_where]
+
+            all_where = np.concatenate([after_where, before_where])
+            phase_list = np.concatenate([after_str, before_str])
+
             if '_u' in phase_list[0]:
                 properties = load_pickle(self.unlabeled_dataset[phase_list[0]]['properties_file'])
             else:
@@ -1711,7 +2204,6 @@ class nnUNetTrainer(NetworkTrainer):
             unlabeled = np.full(shape=((len(phase_list), 1) + properties['size_after_resampling']), fill_value=np.nan)
             target = np.full(shape=((len(phase_list), 1) + properties['size_after_resampling']), fill_value=np.nan)
             target_mask = np.zeros(shape=(len(phase_list),), dtype=bool)
-            padding_mask = np.ones(shape=(len(phase_list),), dtype=bool)
 
             if overwrite or (not isfile(join(output_folder, phase_list[0] + ".nii.gz"))) or (save_softmax and not isfile(join(output_folder, phase_list[0] + ".npz"))):
                 for idx, frame in enumerate(phase_list):
@@ -1730,14 +2222,12 @@ class nnUNetTrainer(NetworkTrainer):
                         target_mask[idx] = True
                     #self.print_to_log_file(k, data.shape)
                 
-                values = np.arange(len(phase_list))
                 #if self.step > 1:
                 #    values = values[::self.step]
-
-                ret = self.predict_preprocessed_data_return_seg_and_softmax_flow(unlabeled=unlabeled[None],
-                                                                                target_mask=target_mask,
-                                                                                padding_mask=padding_mask,
+                assert target_mask[0] == True
+                ret = self.predict_preprocessed_data_return_seg_and_softmax_flow(unlabeled=unlabeled,
                                                                                 target=target,
+                                                                                target_mask=target_mask,
                                                                                 processor=processor,
                                                                                 do_mirroring=do_mirroring,
                                                                                 mirror_axes=mirror_axes,
@@ -1750,7 +2240,17 @@ class nnUNetTrainer(NetworkTrainer):
                 predicted_segmentation = ret[0] # T, depth, H, W
                 softmax_pred = ret[1] # T, C, depth, H, W
                 flow_pred = ret[2] # T, C, depth, H, W
-                registered_pred = ret[3] # T_other, C, depth, H, W
+                registered_pred = ret[3] # T, C, depth, H, W
+
+                assert len(softmax_pred) == len(flow_pred) == len(registered_pred)
+
+                sorted_where = np.argsort(all_where)
+                predicted_segmentation = predicted_segmentation[sorted_where]
+                softmax_pred = softmax_pred[sorted_where]
+                flow_pred = flow_pred[sorted_where]
+                registered_pred = registered_pred[sorted_where]
+                target_mask = target_mask[sorted_where]
+                phase_list = phase_list[sorted_where]
 
                 #matplotlib.use('QtAgg')
                 #fig, ax = plt.subplots(1, 7)
@@ -1777,7 +2277,7 @@ class nnUNetTrainer(NetworkTrainer):
 
                 assert len(softmax_pred) == len(flow_pred) == len(phase_list)
 
-                and_mask = target_mask[padding_mask]
+                and_mask = target_mask
                 gt_indices = np.where(and_mask)[0]
                 assert len(gt_indices) == 2
 
@@ -1796,23 +2296,16 @@ class nnUNetTrainer(NetworkTrainer):
                     else:
                         softmax_fname = None
 
-                    if save_flow and t > 0:
-                        splitted = fname.split('frame')
-                        from_nb = int(splitted[-1].split('_')[0].split('.')[0]) - 1
-                        to_nb = from_nb + 1
-                        flow_name = splitted[0] + 'frame' + str(from_nb).zfill(2) + '_to_' + str(to_nb).zfill(2)
-                        flow_path = join(output_folder, 'flow', flow_name + ".nii.gz")
-                        current_flow = flow_pred[t]
-                        current_flow = current_flow.transpose([0] + [i + 1 for i in self.transpose_backward])
-                    else:
-                        flow_path = current_flow = None
+                    splitted = fname.split('frame')
+                    to_nb = int(splitted[-1].split('_')[0].split('.')[0])
+                    flow_name = splitted[0] + 'frame' + '01'.zfill(2) + '_to_' + str(to_nb).zfill(2)
+                    flow_path = join(newpath_flow, flow_name + ".nii.gz")
+                    current_flow = flow_pred[t]
+                    current_flow = current_flow.transpose([0] + [i + 1 for i in self.transpose_backward])
 
-                    if t > gt_indices[0] and t <= gt_indices[1]:
-                        registered_path = join(output_folder, 'registered', fname + ".nii.gz")
-                        current_registered = registered_pred[t - gt_indices[0] - 1]
-                        current_registered = current_registered.transpose([0] + [i + 1 for i in self.transpose_backward])
-                    else:
-                        registered_path = current_registered = None
+                    registered_path = join(newpath_registered, fname + ".nii.gz")
+                    current_registered = registered_pred[t]
+                    current_registered = current_registered.transpose([0] + [i + 1 for i in self.transpose_backward])
 
                     """There is a problem with python process communication that prevents us from communicating objects
                     larger than 2 GB between processes (basically when the length of the pickle string that will be sent is
@@ -1822,11 +2315,11 @@ class nnUNetTrainer(NetworkTrainer):
                     then be read (and finally deleted) by the Process. save_segmentation_nifti_from_softmax can take either
                     filename or np.ndarray and will handle this automatically"""
                     if np.prod(current_softmax_pred.shape) > (2e9 / 4 * 0.85):  # *0.85 just to be save
-                        np.save(join(output_folder, fname + ".npy"), current_softmax_pred)
-                        current_softmax_pred = join(output_folder, fname + ".npy")
+                        np.save(join(newpath_seg, fname + ".npy"), current_softmax_pred)
+                        current_softmax_pred = join(newpath_seg, fname + ".npy")
 
                     results.append(export_pool.starmap_async(save_segmentation_nifti_from_softmax,
-                                                            ((current_softmax_pred, join(output_folder, fname + ".nii.gz"),
+                                                            ((current_softmax_pred, join(newpath_seg, fname + ".nii.gz"),
                                                             properties, interpolation_order, self.regions_class_order,
                                                             None, None,
                                                             softmax_fname, None, force_separate_z,
@@ -1839,9 +2332,10 @@ class nnUNetTrainer(NetworkTrainer):
                     
                     if t in gt_indices:
                         metadata_list.append(self.create_metadata_dict(properties))
-                        pred_gt_tuples.append([join(output_folder, fname + ".nii.gz"),
+                        pred_gt_tuples.append([join(newpath_seg, fname + ".nii.gz"),
                                                 join(self.gt_niftis_folder, fname + ".nii.gz")])
                     if t == gt_indices[1]:
+                        to_validate_registered_list.append(fname + ".nii.gz")
                         metadata_list_registered.append(self.create_metadata_dict(properties))
                         pred_gt_tuples_register.append([registered_path,
                                                 join(self.gt_niftis_folder, fname + ".nii.gz")])
@@ -1854,14 +2348,14 @@ class nnUNetTrainer(NetworkTrainer):
         task = self.dataset_directory.split(os.sep)[-1]
         job_name = self.experiment_name
         _ = aggregate_scores(pred_gt_tuples_register, labels=list(range(self.num_classes)),
-                             json_output_file=join(output_folder, 'registered', "summary.json"),
+                             json_output_file=join(newpath_registered, "summary.json"),
                              json_name=job_name + " val tiled %s" % (str(use_sliding_window)),
                              json_author="Fabian",
                              json_task=task, num_threads=default_num_threads,
                              advanced=True,
                              metadata_list=metadata_list_registered)
         _ = aggregate_scores(pred_gt_tuples, labels=list(range(self.num_classes)),
-                             json_output_file=join(output_folder, "summary.json"),
+                             json_output_file=join(newpath_seg, "summary.json"),
                              json_name=job_name + " val tiled %s" % (str(use_sliding_window)),
                              json_author="Fabian",
                              json_task=task, num_threads=default_num_threads,
@@ -1874,9 +2368,1907 @@ class nnUNetTrainer(NetworkTrainer):
             # classes and then rerun the evaluation. Those classes for which this resulted in an improved dice score will
             # have this applied during inference as well
             self.print_to_log_file("determining postprocessing")
-            determine_postprocessing(self.output_folder, self.gt_niftis_folder, validation_folder_name,
+            base_segmentation = join(self.output_folder, 'Segmentation')
+            determine_postprocessing(base_segmentation, self.gt_niftis_folder, validation_folder_name,
                                      final_subf_name=validation_folder_name + "_postprocessed", debug=debug, log_function=log_function,
-                                     metadata_list=metadata_list)
+                                     metadata_list=metadata_list, to_validate_list=None)
+            
+            base_registered = join(self.output_folder, 'Registered')
+            determine_postprocessing(base_registered, self.gt_niftis_folder, validation_folder_name,
+                                     final_subf_name=validation_folder_name + "_postprocessed", debug=debug, log_function=log_function,
+                                     metadata_list=metadata_list_registered, to_validate_list=to_validate_registered_list)
+            # after this the final predictions for the vlaidation set can be found in validation_folder_name_base + "_postprocessed"
+            # They are always in that folder, even if no postprocessing as applied!
+
+        # detemining postprocesing on a per-fold basis may be OK for this fold but what if another fold finds another
+        # postprocesing to be better? In this case we need to consolidate. At the time the consolidation is going to be
+        # done we won't know what self.gt_niftis_folder was, so now we copy all the niftis into a separate folder to
+        # be used later
+        gt_nifti_folder = join(self.output_folder_base, "gt_niftis")
+        maybe_mkdir_p(gt_nifti_folder)
+        for f in subfiles(self.gt_niftis_folder, suffix=".nii.gz"):
+            success = False
+            attempts = 0
+            e = None
+            while not success and attempts < 10:
+                try:
+                    shutil.copy(f, gt_nifti_folder)
+                    success = True
+                except OSError as e:
+                    attempts += 1
+                    sleep(1)
+            if not success:
+                print("Could not copy gt nifti file %s into folder %s" % (f, gt_nifti_folder))
+                if e is not None:
+                    raise e
+
+        self.network.train(current_mode)
+
+    
+    #def save_strain_compute_metric(self, search_path):
+    #    newpath_strain_lv_tangential = join(search_path, 'Strain', 'LV', 'Tangential')
+    #    if not os.path.exists(newpath_strain_lv_tangential):
+    #        os.makedirs(newpath_strain_lv_tangential)
+#
+    #    results = {"all": [], "mean_lv_tangential": None}
+    #    gt_folder_name = os.path.dirname(self.gt_niftis_folder)
+    #    all_files = glob(os.path.join(search_path, '*.gz'))
+    #    patient_names = list(set([os.path.basename(x).split('_')[0] for x in all_files]))
+    #    for patient_name in patient_names:
+    #        phase_list = [x for x in all_files if patient_name in x]
+    #        phase_list = np.array(sorted(phase_list, key=lambda x: int(os.path.basename(x).split('frame')[-1][:2])))
+    #        video = []
+    #        for phase in phase_list:
+    #            data = nib.load(phase)
+    #            arr = data.get_fdata() # H, W, D
+    #            arr = arr.transpose((2, 0, 1)) # D, H, W
+    #            video.append(arr)
+    #        video = np.stack(video, axis=1) # D, T, H, W
+    #        for d in range(len(video)):
+    #            slice_nb = str(d + 1).zfill(2)
+    #            filename = patient_name + '_slice' + slice_nb + '.npy'
+    #            gt_path = os.path.join(gt_folder_name, 'strain', 'LV', 'tangential', filename)
+    #            rv_tangential_strain, lv_tangential_strain = self.get_strain(video[d])
+    #            rv_tangential_strain = rv_tangential_strain * 100
+    #            lv_tangential_strain = lv_tangential_strain * 100
+    #            lv_tangential_strain_gt = np.load(gt_path)[0]
+    #            current_res = {'reference': gt_path, 'test': phase_list[0][:-15]}
+    #            current_res['lv_tangential'] = (lv_tangential_strain - lv_tangential_strain_gt).tolist()
+    #            results['all'].append(current_res)
+    #            np.save(os.path.join(search_path, 'Strain', 'LV', 'Tangential', filename), lv_tangential_strain)
+#
+    #    results['mean_lv_tangential'] = np.concatenate([np.array(x['lv_tangential']) for x in results['all']]).mean()
+    #    save_json(results, os.path.join(search_path, 'strain_summary.json'))
+    
+
+
+    #def save_strain_compute_metric_bottleneck(self, save_path, patient_id, strain_results, lv_tangential_strain):
+    #    lv_tangential_strain = lv_tangential_strain.transpose((1, 0)) # D, T
+    #    gt_folder_name = os.path.dirname(self.gt_niftis_folder)
+    #    for d in range(len(lv_tangential_strain)):
+    #        current_strain = lv_tangential_strain[d] * 100
+    #        slice_nb = str(d + 1).zfill(2)
+    #        filename = patient_id + '_slice' + slice_nb + '.npy'
+    #        gt_path = os.path.join(gt_folder_name, 'strain', 'LV', 'tangential', filename)
+    #        lv_tangential_strain_gt = np.load(gt_path)[0]
+    #        current_res = {'reference': gt_path, 'test': filename}
+#
+    #        #a, b = self.get_strain(target[:, 0, d, :, :])
+    #        current_res['lv_tangential'] = (current_strain - lv_tangential_strain_gt).tolist()
+    #        strain_results['all'].append(current_res)
+    #        np.save(os.path.join(save_path, filename), current_strain)
+    #    return strain_results
+
+    
+    def compute_contour_metric_threads(self, search_path):
+        p = Pool(default_num_threads)
+
+        results = {"all": [], "mean": None}
+        all_files = glob(os.path.join(search_path, '*.npz'))
+        patient_names = list(set([os.path.basename(x).split('_')[0] for x in all_files]))
+        gt_folder_name = os.path.dirname(self.gt_niftis_folder)
+
+        all_res = p.starmap(compute_contour_metric, zip(patient_names, [all_files]*len(patient_names), [gt_folder_name]*len(patient_names)))
+        p.close()
+        p.join()
+
+        for i in range(len(all_res)):
+            results['all'].extend(all_res[i]['all'])
+
+        current_res_info = {'ENDO_mae': np.concatenate([np.array(x['ENDO_mae']) for x in results['all']]).mean(),
+                            'EPI_mae': np.concatenate([np.array(x['EPI_mae']) for x in results['all']]).mean(),
+                            'RV_mae': np.concatenate([np.array(x['RV_mae']) for x in results['all']]).mean()}
+        results['mean'] = current_res_info
+        save_json(results, os.path.join(search_path, 'summary.json'))
+
+
+
+
+    def save_strain_compute_metric_threads(self, search_path):
+        p = Pool(default_num_threads)
+
+        newpath_strain_lv_tangential = join(search_path, 'Strain', 'LV', 'Tangential')
+        if not os.path.exists(newpath_strain_lv_tangential):
+            os.makedirs(newpath_strain_lv_tangential)
+
+        results = {"all": [], "mean_lv_tangential": None}
+        gt_folder_name = os.path.dirname(self.gt_niftis_folder)
+        all_files = glob(os.path.join(search_path, '*.gz'))
+        patient_names = list(set([os.path.basename(x).split('_')[0] for x in all_files]))
+
+        all_res = p.starmap(save_strain_compute_metric, zip(patient_names, [all_files]*len(patient_names), [gt_folder_name]*len(patient_names), [search_path]*len(patient_names)))
+        p.close()
+        p.join()
+
+        for i in range(len(all_res)):
+            results['all'].extend(all_res[i]['all'])
+
+        results['mean_lv_tangential'] = np.concatenate([np.array(x['lv_tangential']) for x in results['all']]).mean()
+        save_json(results, os.path.join(search_path, 'strain_summary.json'))
+
+
+
+    def strain_compute_metric_bottleneck_threads(self, search_path):
+        p = Pool(default_num_threads)
+
+        results = {"all": [], "mean_lv_tangential": None}
+        gt_folder_name = os.path.dirname(self.gt_niftis_folder)
+        all_files = glob(os.path.join(search_path, '*.npy'))
+        patient_names = list(set([os.path.basename(x).split('_')[0] for x in all_files]))
+
+        all_res = p.starmap(strain_compute_metric, zip(patient_names, [all_files]*len(patient_names), [gt_folder_name]*len(patient_names)))
+        p.close()
+        p.join()
+
+        for i in range(len(all_res)):
+            results['all'].extend(all_res[i]['all'])
+
+        results['mean_lv_tangential'] = np.concatenate([np.array(x['lv_tangential']) for x in results['all']]).mean()
+        save_json(results, os.path.join(search_path, 'strain_summary.json'))
+
+
+    def move_gt_files_threads(self):
+        p = Pool(default_num_threads)
+
+        gt_nifti_folder = join(self.output_folder_base, "gt_niftis")
+        maybe_mkdir_p(gt_nifti_folder)
+        path_list = subfiles(self.gt_niftis_folder, suffix=".nii.gz")
+
+        p.starmap(move_gt_files, zip(path_list, [gt_nifti_folder]*len(path_list)))
+        p.close()
+        p.join()
+
+
+    #def compute_contour_metric(self, search_path):
+    #    results = {"all": [], "mean": None}
+    #    all_files = glob(os.path.join(search_path, '*.npz'))
+    #    patient_names = list(set([os.path.basename(x).split('_')[0] for x in all_files]))
+    #    gt_folder_name = os.path.dirname(self.gt_niftis_folder)
+    #    for patient_name in patient_names:
+    #        phase_list = [x for x in all_files if patient_name in x]
+    #        phase_list = np.array(sorted(phase_list, key=lambda x: int(os.path.basename(x).split('frame')[-1][:2])))
+    #        video = []
+    #        for phase in phase_list:
+    #            data = np.load(phase)
+    #            arr = data['flow'] # H, W, D, C
+    #            arr = arr.transpose((2, 3, 0, 1)) # D, C, H, W
+    #            video.append(arr)
+    #        flow = np.stack(video, axis=1) # D, T, C, H, W
+    #        slice_error_list = []
+    #        for d in range(len(flow)):
+    #            current_slice_flow = flow[d] # T, 2, H, W
+    #            slice_nb = str(d + 1).zfill(2)
+    #            filename = patient_name + '_slice' + slice_nb + '.npy'
+    #            gt_path_lv = os.path.join(gt_folder_name, 'contour', 'LV', filename)
+    #            gt_path_rv = os.path.join(gt_folder_name, 'contour', 'RV', filename)
+    #            gt_lv_contour = np.load(gt_path_lv).transpose((2, 1, 0)) # T, P1, 4
+    #            gt_rv_contour = np.load(gt_path_rv).transpose((2, 1, 0)) # T, P2, 2
+    #            gt_endo_contour = gt_lv_contour[:, :, :2]
+    #            gt_epi_contour = gt_lv_contour[:, :, 2:]
+    #            split_index = np.cumsum([gt_endo_contour.shape[1], gt_epi_contour.shape[1]])
+    #            contours = np.concatenate([gt_endo_contour, gt_epi_contour, gt_rv_contour], axis=1) # T, P, 2
+#
+    #            current_slice_flow = np.flip(current_slice_flow, axis=0)
+    #            contours = np.flip(contours, axis=0)
+#
+    #            temporal_error_list = []
+    #            for t in range(len(current_slice_flow) - 1):
+    #                current_contours = contours[t] # P, 2
+    #                next_contours = contours[t + 1] # P, 2
+    #                gt_delta = next_contours - current_contours
+    #                current_frame_flow = current_slice_flow[t] # 2, H, W
+    #                current_frame_flow = current_frame_flow.transpose((1, 2, 0)) # H, W, 2
+    #                y = np.rint(current_contours[:, 0]).astype(int)
+    #                x = np.rint(current_contours[:, 1]).astype(int)
+#
+    #                delta_pred = current_frame_flow[y, x, :] # P, 2
+    #                error = np.abs(gt_delta - delta_pred).mean(-1) # P,
+    #                temporal_error_list.append(error) 
+#
+    #            temporal_error_list = np.stack(temporal_error_list, axis=0) # T, P
+    #            temporal_error_list = np.flip(temporal_error_list, axis=0)
+#
+    #            error = np.split(temporal_error_list, indices_or_sections=split_index, axis=1) # [(T, P1) , (T, P2), (T, P3)]
+    #            error = np.stack([x.mean(-1) for x in error], axis=-1) # T, 3
+#
+    #            slice_error_list.append(error)
+    #        slice_error_list = np.stack(slice_error_list, axis=0) # D, T, 3
+#
+    #        for i in range(slice_error_list.shape[1]):
+    #            current_res = slice_error_list[:, i] # D, 3
+    #            current_res_info = {'patient_name': patient_name, 
+    #                                'reference': gt_path_lv[:-12], 
+    #                                'test': phase_list[i + 1],
+    #                                'ENDO_mae': current_res[:, 0].tolist(),
+    #                                'EPI_mae': current_res[:, 1].tolist(),
+    #                                'RV_mae': current_res[:, 2].tolist()}
+    #            results['all'].append(current_res_info)
+#
+    #    current_res_info = {'ENDO_mae': np.concatenate([np.array(x['ENDO_mae']) for x in results['all']]).mean(),
+    #                        'EPI_mae': np.concatenate([np.array(x['EPI_mae']) for x in results['all']]).mean(),
+    #                        'RV_mae': np.concatenate([np.array(x['RV_mae']) for x in results['all']]).mean()}
+    #    results['mean'] = current_res_info
+    #    save_json(results, os.path.join(search_path, 'summary.json'))
+
+
+    def validate_flow_one_step_lib(self, processor, log_function, step, do_mirroring: bool = True, use_sliding_window: bool = True, step_size: float = 0.5,
+                 save_softmax: bool = True, use_gaussian: bool = True, overwrite: bool = True,
+                 validation_folder_name: str = 'validation_raw', debug: bool = True, all_in_gpu: bool = False,
+                 segmentation_export_kwargs: dict = None, run_postprocessing_on_folds: bool = True, output_folder=None, save_flow=True):
+
+        """
+        if debug=True then the temporary files generated for postprocessing determination will be kept
+        """
+        current_mode = self.network.training
+        self.network.eval()
+
+        assert self.was_initialized, "must initialize, ideally with checkpoint (or train first)"
+        if self.dataset_val is None:
+            self.load_dataset()
+            self.do_split()
+
+        if segmentation_export_kwargs is None:
+            if 'segmentation_export_params' in self.plans.keys():
+                force_separate_z = self.plans['segmentation_export_params']['force_separate_z']
+                interpolation_order = self.plans['segmentation_export_params']['interpolation_order']
+                interpolation_order_z = self.plans['segmentation_export_params']['interpolation_order_z']
+            else:
+                force_separate_z = None
+                interpolation_order = 1
+                interpolation_order_z = 0
+        else:
+            force_separate_z = segmentation_export_kwargs['force_separate_z']
+            interpolation_order = segmentation_export_kwargs['interpolation_order']
+            interpolation_order_z = segmentation_export_kwargs['interpolation_order_z']
+
+        # predictions as they come from the network go here
+        if output_folder is not None:
+            self.output_folder = output_folder
+        #output_folder = join(self.output_folder, validation_folder_name)
+        #maybe_mkdir_p(output_folder)
+        # this is for debug purposes
+        my_input_args = {'do_mirroring': do_mirroring,
+                         'use_sliding_window': use_sliding_window,
+                         'step_size': step_size,
+                         'save_softmax': save_softmax,
+                         'use_gaussian': use_gaussian,
+                         'overwrite': overwrite,
+                         'validation_folder_name': validation_folder_name,
+                         'debug': debug,
+                         'all_in_gpu': all_in_gpu,
+                         'segmentation_export_kwargs': segmentation_export_kwargs,
+                         }
+        save_json(my_input_args, join(self.output_folder, "validation_args.json"))
+
+        if do_mirroring:
+            if not self.data_aug_params['do_mirror']:
+                raise RuntimeError("We did not train with mirroring so you cannot do inference with mirroring enabled")
+            mirror_axes = self.data_aug_params['mirror_axes']
+        else:
+            mirror_axes = ()
+
+        pred_gt_tuples = []
+        pred_gt_tuples_register = []
+
+        export_pool = Pool(default_num_threads)
+        results = []
+        results_strain_list = []
+
+        newpath_flow = join(self.output_folder, 'Flow', validation_folder_name)
+        if not os.path.exists(newpath_flow):
+            os.makedirs(newpath_flow)
+
+        newpath_registered = join(self.output_folder, 'Registered', validation_folder_name)
+        if not os.path.exists(newpath_registered):
+            os.makedirs(newpath_registered)
+
+        newpath_seg = join(self.output_folder, 'Segmentation', validation_folder_name)
+        if not os.path.exists(newpath_seg):
+            os.makedirs(newpath_seg)
+
+        newpath_strain = join(self.output_folder, 'Strain')
+        newpath_strain_lv_tangential = join(newpath_strain, 'LV', 'Tangential')
+        if not os.path.exists(newpath_strain_lv_tangential):
+            os.makedirs(newpath_strain_lv_tangential)
+
+        #newpath_strain_radial = join(self.output_folder, 'Strain', 'Radial')
+        #if not os.path.exists(newpath_strain_radial):
+        #    os.makedirs(newpath_strain_radial)
+        
+        to_validate_registered_list = []
+
+        list_of_keys = list(self.dataset_val.keys())
+        patient_id_list = np.unique([x[:10] for x in list_of_keys])
+        metadata_list = []
+        metadata_list_registered = []
+        #strain_results = {"all": [], "mean_lv_tangential": None}
+        for patient_id in tqdm(patient_id_list):
+            phase_list = [x for x in list_of_keys if patient_id in x]
+            phase_list = np.array(sorted(phase_list, key=lambda x: int(x[16:18])))
+            phase_list = np.array(phase_list)
+            #print(phase_list[0])
+            #print(self.dataset)
+            #print(self.dataset[phase_list[0]])
+            properties = load_pickle(self.dataset[phase_list[0]]['properties_file'])
+
+            #ed_indices = np.array(properties['ed_number']) - 1
+            #es_indices = np.array(properties['es_number']) - 1
+
+            unlabeled = np.full(shape=((len(phase_list), 1) + properties['size_after_resampling']), fill_value=np.nan)
+            target = np.full(shape=((len(phase_list), 1) + properties['size_after_resampling']), fill_value=np.nan)
+
+            if overwrite or (not isfile(join(output_folder, phase_list[0] + ".nii.gz"))) or (save_softmax and not isfile(join(output_folder, phase_list[0] + ".npz"))):
+                for idx, frame in enumerate(phase_list):
+                    current_data = np.load(self.dataset_val[frame]['data_file'])['data']
+                    target[idx] = current_data[1]
+                    target[idx][target[idx] == -1] = 0
+                    unlabeled[idx] = current_data[0] + 1e-8
+
+                #all_where_list = []
+                #print(ed_indices)
+                #print(unlabeled.shape[2])
+                #print(phase_list)
+                #assert len(ed_indices) == unlabeled.shape[2]
+                #for d in range(unlabeled.shape[2]):
+                #    frame_indices = np.arange(len(phase_list))
+#
+                #    before_where = np.argwhere(frame_indices < ed_indices[d]).reshape(-1,)
+                #    after_where = np.argwhere(frame_indices >= ed_indices[d]).reshape(-1,)
+#
+                #    all_where = np.concatenate([after_where, before_where])
+                #    all_where_list.append(all_where)
+#
+                #    frame_indices = frame_indices[all_where]
+                #    unlabeled[:, :, d] = unlabeled[frame_indices, :, d]
+
+
+                #matplotlib.use('QtAgg')
+                #print(ed_indices)
+                #print(es_indices)
+                #fig, ax = plt.subplots(1, int(len(unlabeled) / 4))
+                #for i in range(0, len(unlabeled), 4):
+                #    ax[int(i / 4)].imshow(unlabeled[i, 0, 1], cmap='gray')
+                #plt.show()
+                
+                
+                ret = self.predict_preprocessed_data_return_seg_and_softmax_flow(unlabeled=unlabeled,
+                                                                                target=target,
+                                                                                target_mask=None,
+                                                                                processor=processor,
+                                                                                do_mirroring=do_mirroring,
+                                                                                mirror_axes=mirror_axes,
+                                                                                use_sliding_window=use_sliding_window,
+                                                                                step_size=step_size,
+                                                                                use_gaussian=use_gaussian,
+                                                                                all_in_gpu=all_in_gpu,
+                                                                                mixed_precision=self.fp16,
+                                                                                verbose=False)
+                predicted_segmentation = ret[0] # T, depth, H, W
+                softmax_pred = ret[1] # T, C, depth, H, W
+                flow_pred = ret[2] # T, C, depth, H, W
+                registered_pred = ret[3] # T, C, depth, H, W
+                lv_strain_bottleneck_pred = ret[4] # T, depth
+                rv_strain_bottleneck_pred = ret[5] # T, depth
+
+                assert len(softmax_pred) == len(flow_pred) == len(registered_pred) == len(lv_strain_bottleneck_pred)
+
+                #for d, all_where in enumerate(all_where_list):
+                #    sorted_where = np.argsort(all_where)
+                #    print(all_where)
+                #    print(sorted_where)
+                #    softmax_pred[:, :, d] = softmax_pred[sorted_where, :, d]
+                #    flow_pred[:, :, d] = flow_pred[sorted_where, :, d]
+                #    registered_pred[:, :, d] = registered_pred[sorted_where, :, d]
+                #    lv_strain_pred[:, d] = lv_strain_pred[sorted_where, d]
+                #    rv_strain_pred[:, d] = rv_strain_pred[sorted_where, d]
+                #    phase_list[:, :, d] = phase_list[sorted_where, :, d]
+
+                assert len(softmax_pred) == len(flow_pred) == len(phase_list)
+
+                results_strain_list.append(export_pool.starmap_async(save_strain_bottleneck, ((newpath_strain_lv_tangential, 
+                                                                            patient_id,
+                                                                            lv_strain_bottleneck_pred),)))
+
+                for t in range(len(softmax_pred)):
+                    properties = load_pickle(self.dataset[phase_list[t]]['properties_file'])
+                    fname = properties['list_of_data_files'][0].split(os.sep)[-1][:-12]
+
+                    current_softmax_pred = softmax_pred[t]
+                    current_softmax_pred = current_softmax_pred.transpose([0] + [i + 1 for i in self.transpose_backward])
+
+                    if save_softmax:
+                        softmax_fname = join(output_folder, fname + ".npz")
+                    else:
+                        softmax_fname = None
+
+                    splitted = fname.split('frame')
+                    from_nb = t - 1 if t > 0 else 0
+                    to_nb = t
+                    flow_name = splitted[0] + 'frame' + str(from_nb + 1).zfill(2) + '_to_' + str(to_nb + 1).zfill(2)
+                    flow_path = join(newpath_flow, flow_name + ".npz")
+                    current_flow = flow_pred[t]
+                    current_flow = current_flow.transpose([0] + [i + 1 for i in self.transpose_backward])
+
+                    registered_path = join(newpath_registered, fname + ".nii.gz")
+                    current_registered = registered_pred[t]
+                    current_registered = current_registered.transpose([0] + [i + 1 for i in self.transpose_backward])
+
+                    """There is a problem with python process communication that prevents us from communicating objects
+                    larger than 2 GB between processes (basically when the length of the pickle string that will be sent is
+                    communicated by the multiprocessing.Pipe object then the placeholder (I think) does not allow for long
+                    enough strings (lol). This could be fixed by changing i to l (for long) but that would require manually
+                    patching system python code. We circumvent that problem here by saving softmax_pred to a npy file that will
+                    then be read (and finally deleted) by the Process. save_segmentation_nifti_from_softmax can take either
+                    filename or np.ndarray and will handle this automatically"""
+                    if np.prod(current_softmax_pred.shape) > (2e9 / 4 * 0.85):  # *0.85 just to be save
+                        np.save(join(newpath_seg, fname + ".npy"), current_softmax_pred)
+                        current_softmax_pred = join(newpath_seg, fname + ".npy")
+
+                    results.append(export_pool.starmap_async(save_segmentation_nifti_from_softmax,
+                                                            ((current_softmax_pred, join(newpath_seg, fname + ".nii.gz"),
+                                                            properties, interpolation_order, self.regions_class_order,
+                                                            None, None,
+                                                            softmax_fname, None, force_separate_z,
+                                                            interpolation_order_z, False, current_flow, flow_path,
+                                                            current_registered, registered_path),
+                                                            )
+                                                            )
+                                )
+                    
+                    
+                    metadata_list.append(self.create_metadata_dict(properties))
+                    pred_gt_tuples.append([join(newpath_seg, fname + ".nii.gz"),
+                                            join(self.gt_niftis_folder, fname + ".nii.gz")])
+                    if t > 0:
+                        to_validate_registered_list.append(fname + ".nii.gz")
+                        metadata_list_registered.append(self.create_metadata_dict(properties))
+                        pred_gt_tuples_register.append([registered_path,
+                                                join(self.gt_niftis_folder, fname + ".nii.gz")])
+
+        _ = [i.get() for i in results]
+        _ = [i.get() for i in results_strain_list]
+        self.print_to_log_file("finished prediction")
+        #strain_results['mean_lv_tangential'] = np.concatenate([np.array(x['lv_tangential']) for x in strain_results['all']]).mean()
+        #save_json(strain_results, os.path.join(newpath_strain, 'summary.json'))
+
+        # evaluate raw predictions
+        self.print_to_log_file("evaluation of raw predictions")
+        task = self.dataset_directory.split(os.sep)[-1]
+        job_name = self.experiment_name
+        _ = aggregate_scores(pred_gt_tuples_register, labels=list(range(self.num_classes)),
+                             json_output_file=join(newpath_registered, "summary.json"),
+                             json_name=job_name + " val tiled %s" % (str(use_sliding_window)),
+                             json_author="Fabian",
+                             json_task=task, num_threads=default_num_threads,
+                             advanced=True,
+                             metadata_list=metadata_list_registered)
+        _ = aggregate_scores(pred_gt_tuples, labels=list(range(self.num_classes)),
+                             json_output_file=join(newpath_seg, "summary.json"),
+                             json_name=job_name + " val tiled %s" % (str(use_sliding_window)),
+                             json_author="Fabian",
+                             json_task=task, num_threads=default_num_threads,
+                             advanced=True,
+                             metadata_list=metadata_list)
+
+        if run_postprocessing_on_folds:
+            # in the old nnunet we would stop here. Now we add a postprocessing. This postprocessing can remove everything
+            # except the largest connected component for each class. To see if this improves results, we do this for all
+            # classes and then rerun the evaluation. Those classes for which this resulted in an improved dice score will
+            # have this applied during inference as well
+            self.print_to_log_file("determining postprocessing")
+            base_segmentation = join(self.output_folder, 'Segmentation')
+            determine_postprocessing(base_segmentation, self.gt_niftis_folder, validation_folder_name,
+                                     final_subf_name=validation_folder_name + "_postprocessed", debug=debug, log_function=log_function,
+                                     metadata_list=metadata_list, to_validate_list=None)
+            
+            base_registered = join(self.output_folder, 'Registered')
+            determine_postprocessing(base_registered, self.gt_niftis_folder, validation_folder_name,
+                                     final_subf_name=validation_folder_name + "_postprocessed", debug=debug, log_function=log_function,
+                                     metadata_list=metadata_list_registered, to_validate_list=to_validate_registered_list)
+            # after this the final predictions for the vlaidation set can be found in validation_folder_name_base + "_postprocessed"
+            # They are always in that folder, even if no postprocessing as applied!
+
+        self.print_to_log_file("Saving Bottleneck strain")
+        self.strain_compute_metric_bottleneck_threads(os.path.join(self.output_folder, 'Strain', 'LV', 'Tangential'))
+        self.print_to_log_file("Saving segmentation strain")
+        self.save_strain_compute_metric_threads(os.path.join(self.output_folder, 'Segmentation', 'temp_allClasses'))
+        #self.save_strain_compute_metric(os.path.join(self.output_folder, 'Segmentation', 'temp_allClasses'))
+        self.print_to_log_file("Saving Registered strain")
+        self.save_strain_compute_metric_threads(os.path.join(self.output_folder, 'Registered', 'temp_allClasses'))
+        #self.save_strain_compute_metric(os.path.join(self.output_folder, 'Registered', 'temp_allClasses'))
+        self.print_to_log_file("Logging flow error")
+        #self.compute_contour_metric(os.path.join(self.output_folder, 'Flow', 'validation_raw'))
+        self.compute_contour_metric_threads(os.path.join(self.output_folder, 'Flow', 'validation_raw'))
+
+
+        # detemining postprocesing on a per-fold basis may be OK for this fold but what if another fold finds another
+        # postprocesing to be better? In this case we need to consolidate. At the time the consolidation is going to be
+        # done we won't know what self.gt_niftis_folder was, so now we copy all the niftis into a separate folder to
+        # be used later
+        self.print_to_log_file("Moving ground truth files")
+        self.move_gt_files_threads()
+        #gt_nifti_folder = join(self.output_folder_base, "gt_niftis")
+        #maybe_mkdir_p(gt_nifti_folder)
+        #for f in subfiles(self.gt_niftis_folder, suffix=".nii.gz"):
+        #    success = False
+        #    attempts = 0
+        #    e = None
+        #    while not success and attempts < 10:
+        #        try:
+        #            shutil.copy(f, gt_nifti_folder)
+        #            success = True
+        #        except OSError as e:
+        #            attempts += 1
+        #            sleep(1)
+        #    if not success:
+        #        print("Could not copy gt nifti file %s into folder %s" % (f, gt_nifti_folder))
+        #        if e is not None:
+        #            raise e
+
+        self.network.train(current_mode)
+    
+
+
+
+    def validate_flow_one_step_recursive(self, processor, log_function, step, do_mirroring: bool = True, use_sliding_window: bool = True, step_size: float = 0.5,
+                 save_softmax: bool = True, use_gaussian: bool = True, overwrite: bool = True,
+                 validation_folder_name: str = 'validation_raw', debug: bool = True, all_in_gpu: bool = False,
+                 segmentation_export_kwargs: dict = None, run_postprocessing_on_folds: bool = True, output_folder=None, save_flow=True):
+
+        """
+        if debug=True then the temporary files generated for postprocessing determination will be kept
+        """
+        current_mode = self.network.training
+        self.network.eval()
+
+        assert self.was_initialized, "must initialize, ideally with checkpoint (or train first)"
+        if self.dataset_val is None:
+            self.load_dataset()
+            self.do_split()
+
+        if segmentation_export_kwargs is None:
+            if 'segmentation_export_params' in self.plans.keys():
+                force_separate_z = self.plans['segmentation_export_params']['force_separate_z']
+                interpolation_order = self.plans['segmentation_export_params']['interpolation_order']
+                interpolation_order_z = self.plans['segmentation_export_params']['interpolation_order_z']
+            else:
+                force_separate_z = None
+                interpolation_order = 1
+                interpolation_order_z = 0
+        else:
+            force_separate_z = segmentation_export_kwargs['force_separate_z']
+            interpolation_order = segmentation_export_kwargs['interpolation_order']
+            interpolation_order_z = segmentation_export_kwargs['interpolation_order_z']
+
+        # predictions as they come from the network go here
+        if output_folder is not None:
+            self.output_folder = output_folder
+        #output_folder = join(self.output_folder, validation_folder_name)
+        #maybe_mkdir_p(output_folder)
+        # this is for debug purposes
+        my_input_args = {'do_mirroring': do_mirroring,
+                         'use_sliding_window': use_sliding_window,
+                         'step_size': step_size,
+                         'save_softmax': save_softmax,
+                         'use_gaussian': use_gaussian,
+                         'overwrite': overwrite,
+                         'validation_folder_name': validation_folder_name,
+                         'debug': debug,
+                         'all_in_gpu': all_in_gpu,
+                         'segmentation_export_kwargs': segmentation_export_kwargs,
+                         }
+        save_json(my_input_args, join(self.output_folder, "validation_args.json"))
+
+        if do_mirroring:
+            if not self.data_aug_params['do_mirror']:
+                raise RuntimeError("We did not train with mirroring so you cannot do inference with mirroring enabled")
+            mirror_axes = self.data_aug_params['mirror_axes']
+        else:
+            mirror_axes = ()
+
+        pred_gt_tuples = []
+        pred_gt_tuples_register_local = []
+        pred_gt_tuples_register_global = []
+
+        export_pool = Pool(default_num_threads)
+        results = []
+
+        newpath_flow = join(self.output_folder, 'Flow', validation_folder_name)
+        if not os.path.exists(newpath_flow):
+            os.makedirs(newpath_flow)
+
+        newpath_registered_local = join(self.output_folder, 'Registered_local', validation_folder_name)
+        if not os.path.exists(newpath_registered_local):
+            os.makedirs(newpath_registered_local)
+
+        newpath_registered_global = join(self.output_folder, 'Registered_global', validation_folder_name)
+        if not os.path.exists(newpath_registered_global):
+            os.makedirs(newpath_registered_global)
+
+        newpath_seg = join(self.output_folder, 'Segmentation', validation_folder_name)
+        if not os.path.exists(newpath_seg):
+            os.makedirs(newpath_seg)
+        
+        to_validate_registered_list = []
+
+        list_of_keys = list(self.dataset_val.keys())
+        un_list_of_keys = list(self.dataset_un_val.keys())
+        patient_id_list = np.unique([x[:10] for x in list_of_keys])
+        metadata_list = []
+        metadata_list_registered = []
+        for patient_id in tqdm(patient_id_list):
+            all_keys = list_of_keys + un_list_of_keys
+            phase_list = [x for x in all_keys if patient_id in x]
+            phase_list = np.array(sorted(phase_list, key=lambda x: int(x[16:18])))
+            phase_list = np.array(phase_list)
+            global_labeled_idx = np.where(~np.char.endswith(phase_list, '_u'))[0]
+
+            frame_indices = np.arange(len(phase_list))
+
+            before_where = np.argwhere(frame_indices < global_labeled_idx[0]).reshape(-1,)
+            after_where = np.argwhere(frame_indices >= global_labeled_idx[0]).reshape(-1,)
+            assert after_where[0] == global_labeled_idx[0]
+
+            before_str = phase_list[before_where]
+            after_str = phase_list[after_where]
+
+            all_where = np.concatenate([after_where, before_where])
+            phase_list = np.concatenate([after_str, before_str])
+
+            if '_u' in phase_list[0]:
+                properties = load_pickle(self.unlabeled_dataset[phase_list[0]]['properties_file'])
+            else:
+                properties = load_pickle(self.dataset[phase_list[0]]['properties_file'])
+
+            unlabeled = np.full(shape=((len(phase_list), 1) + properties['size_after_resampling']), fill_value=np.nan)
+            target = np.full(shape=((len(phase_list), 1) + properties['size_after_resampling']), fill_value=np.nan)
+            target_mask = np.zeros(shape=(len(phase_list),), dtype=bool)
+
+            if overwrite or (not isfile(join(output_folder, phase_list[0] + ".nii.gz"))) or (save_softmax and not isfile(join(output_folder, phase_list[0] + ".npz"))):
+                for idx, frame in enumerate(phase_list):
+                    #if frame == k:
+                    #    labeled_idx = idx
+                    if '_u' in frame:
+                        current_data = np.load(self.dataset_un_val[frame]['data_file'])['data']
+                        current_data = current_data + 1e-8
+                        unlabeled[idx] = current_data
+                    else:
+                        current_data = np.load(self.dataset_val[frame]['data_file'])['data']
+                        #current_data[-1][current_data[-1] == -1] = 0
+                        target[idx] = current_data[1]
+                        target[idx][target[idx] == -1] = 0
+                        unlabeled[idx] = current_data[0] + 1e-8
+                        target_mask[idx] = True
+                    #self.print_to_log_file(k, data.shape)
+                
+                #if self.step > 1:
+                #    values = values[::self.step]
+                assert target_mask[0] == True
+                ret = self.predict_preprocessed_data_return_seg_and_softmax_flow(unlabeled=unlabeled,
+                                                                                target=target,
+                                                                                target_mask=target_mask,
+                                                                                processor=processor,
+                                                                                do_mirroring=do_mirroring,
+                                                                                mirror_axes=mirror_axes,
+                                                                                use_sliding_window=use_sliding_window,
+                                                                                step_size=step_size,
+                                                                                use_gaussian=use_gaussian,
+                                                                                all_in_gpu=all_in_gpu,
+                                                                                mixed_precision=self.fp16,
+                                                                                verbose=False)
+                predicted_segmentation = ret[0] # T, depth, H, W
+                softmax_pred = ret[1] # T, C, depth, H, W
+                flow_pred = ret[2] # T, C, depth, H, W
+                registered_pred_local = ret[3] # T, C, depth, H, W
+                registered_pred_global = ret[4] # T, C, depth, H, W
+
+                assert len(softmax_pred) == len(flow_pred) == len(registered_pred_local) == len(registered_pred_global)
+
+                sorted_where = np.argsort(all_where)
+                predicted_segmentation = predicted_segmentation[sorted_where]
+                softmax_pred = softmax_pred[sorted_where]
+                flow_pred = flow_pred[sorted_where]
+                registered_pred_local = registered_pred_local[sorted_where]
+                registered_pred_global = registered_pred_global[sorted_where]
+                target_mask = target_mask[sorted_where]
+                phase_list = phase_list[sorted_where]
+
+                #matplotlib.use('QtAgg')
+                #fig, ax = plt.subplots(1, 7)
+                #plot_idx = 0
+                #for a in range(8, 15):
+                #    current_img = softmax_pred[a, :, 0]
+                #    current_img = current_img.argmax(0)
+                #    ax[plot_idx].imshow(current_img, cmap='gray')
+                #    plot_idx += 1
+                #plt.show()
+                #plt.waitforbuttonpress()
+                #plt.close(fig)
+
+                #stop_indices = [len(x) for x in windows]
+                #videos = [phase_list[x] for x in windows]
+
+                #matplotlib.use('QtAgg')
+                #print(labeled_idx)
+                #print(video_padding)
+                #fig, ax = plt.subplots(1, self.video_length)
+                #for i in range(self.video_length):
+                #    ax[i].imshow(data[i, 0, 5], cmap='gray')
+                #plt.show()
+
+                assert len(softmax_pred) == len(flow_pred) == len(phase_list)
+
+                and_mask = target_mask
+                gt_indices = np.where(and_mask)[0]
+                assert len(gt_indices) == 2
+
+                for t in range(len(softmax_pred)):
+                    if '_u' in phase_list[t]:
+                        properties = load_pickle(self.unlabeled_dataset[phase_list[t]]['properties_file'])
+                    else:
+                        properties = load_pickle(self.dataset[phase_list[t]]['properties_file'])
+                    fname = properties['list_of_data_files'][0].split(os.sep)[-1][:-12]
+
+                    current_softmax_pred = softmax_pred[t]
+                    current_softmax_pred = current_softmax_pred.transpose([0] + [i + 1 for i in self.transpose_backward])
+
+                    if save_softmax:
+                        softmax_fname = join(output_folder, fname + ".npz")
+                    else:
+                        softmax_fname = None
+
+                    splitted = fname.split('frame')
+                    to_nb = int(splitted[-1].split('_')[0].split('.')[0])
+                    flow_name = splitted[0] + 'frame' + '01'.zfill(2) + '_to_' + str(to_nb).zfill(2)
+                    flow_path = join(newpath_flow, flow_name + ".nii.gz")
+                    current_flow = flow_pred[t]
+                    current_flow = current_flow.transpose([0] + [i + 1 for i in self.transpose_backward])
+
+                    registered_path_local = join(newpath_registered_local, fname + ".nii.gz")
+                    current_registered_local = registered_pred_local[t]
+                    current_registered_local = current_registered_local.transpose([0] + [i + 1 for i in self.transpose_backward])
+
+                    registered_path_global = join(newpath_registered_global, fname + ".nii.gz")
+                    current_registered_global = registered_pred_global[t]
+                    current_registered_global = current_registered_global.transpose([0] + [i + 1 for i in self.transpose_backward])
+
+                    """There is a problem with python process communication that prevents us from communicating objects
+                    larger than 2 GB between processes (basically when the length of the pickle string that will be sent is
+                    communicated by the multiprocessing.Pipe object then the placeholder (I think) does not allow for long
+                    enough strings (lol). This could be fixed by changing i to l (for long) but that would require manually
+                    patching system python code. We circumvent that problem here by saving softmax_pred to a npy file that will
+                    then be read (and finally deleted) by the Process. save_segmentation_nifti_from_softmax can take either
+                    filename or np.ndarray and will handle this automatically"""
+                    if np.prod(current_softmax_pred.shape) > (2e9 / 4 * 0.85):  # *0.85 just to be save
+                        np.save(join(newpath_seg, fname + ".npy"), current_softmax_pred)
+                        current_softmax_pred = join(newpath_seg, fname + ".npy")
+
+                    results.append(export_pool.starmap_async(save_segmentation_nifti_from_softmax,
+                                                            ((current_softmax_pred, join(newpath_seg, fname + ".nii.gz"),
+                                                            properties, interpolation_order, self.regions_class_order,
+                                                            None, None,
+                                                            softmax_fname, None, force_separate_z,
+                                                            interpolation_order_z, False, current_flow, flow_path,
+                                                            current_registered_local, registered_path_local, current_registered_global, registered_path_global),
+                                                            )
+                                                            )
+                                )
+                    
+                    
+                    if t in gt_indices:
+                        metadata_list.append(self.create_metadata_dict(properties))
+                        pred_gt_tuples.append([join(newpath_seg, fname + ".nii.gz"),
+                                                join(self.gt_niftis_folder, fname + ".nii.gz")])
+                    if t == gt_indices[1]:
+                        to_validate_registered_list.append(fname + ".nii.gz")
+                        metadata_list_registered.append(self.create_metadata_dict(properties))
+                        pred_gt_tuples_register_local.append([registered_path_local,
+                                                join(self.gt_niftis_folder, fname + ".nii.gz")])
+                        pred_gt_tuples_register_global.append([registered_path_global,
+                                                join(self.gt_niftis_folder, fname + ".nii.gz")])
+
+        _ = [i.get() for i in results]
+        self.print_to_log_file("finished prediction")
+
+        # evaluate raw predictions
+        self.print_to_log_file("evaluation of raw predictions")
+        task = self.dataset_directory.split(os.sep)[-1]
+        job_name = self.experiment_name
+        _ = aggregate_scores(pred_gt_tuples_register_local, labels=list(range(self.num_classes)),
+                             json_output_file=join(newpath_registered_local, "summary.json"),
+                             json_name=job_name + " val tiled %s" % (str(use_sliding_window)),
+                             json_author="Fabian",
+                             json_task=task, num_threads=default_num_threads,
+                             advanced=True,
+                             metadata_list=metadata_list_registered)
+        _ = aggregate_scores(pred_gt_tuples_register_global, labels=list(range(self.num_classes)),
+                             json_output_file=join(newpath_registered_global, "summary.json"),
+                             json_name=job_name + " val tiled %s" % (str(use_sliding_window)),
+                             json_author="Fabian",
+                             json_task=task, num_threads=default_num_threads,
+                             advanced=True,
+                             metadata_list=metadata_list)
+        _ = aggregate_scores(pred_gt_tuples, labels=list(range(self.num_classes)),
+                             json_output_file=join(newpath_seg, "summary.json"),
+                             json_name=job_name + " val tiled %s" % (str(use_sliding_window)),
+                             json_author="Fabian",
+                             json_task=task, num_threads=default_num_threads,
+                             advanced=True,
+                             metadata_list=metadata_list)
+
+        if run_postprocessing_on_folds:
+            # in the old nnunet we would stop here. Now we add a postprocessing. This postprocessing can remove everything
+            # except the largest connected component for each class. To see if this improves results, we do this for all
+            # classes and then rerun the evaluation. Those classes for which this resulted in an improved dice score will
+            # have this applied during inference as well
+            self.print_to_log_file("determining postprocessing")
+            base_segmentation = join(self.output_folder, 'Segmentation')
+            determine_postprocessing(base_segmentation, self.gt_niftis_folder, validation_folder_name,
+                                     final_subf_name=validation_folder_name + "_postprocessed", debug=debug, log_function=log_function,
+                                     metadata_list=metadata_list, to_validate_list=None)
+            
+            base_registered_local = join(self.output_folder, 'Registered_local')
+            determine_postprocessing(base_registered_local, self.gt_niftis_folder, validation_folder_name,
+                                     final_subf_name=validation_folder_name + "_postprocessed", debug=debug, log_function=log_function,
+                                     metadata_list=metadata_list_registered, to_validate_list=to_validate_registered_list)
+            
+            base_registered_global = join(self.output_folder, 'Registered_global')
+            determine_postprocessing(base_registered_global, self.gt_niftis_folder, validation_folder_name,
+                                     final_subf_name=validation_folder_name + "_postprocessed", debug=debug, log_function=log_function,
+                                     metadata_list=metadata_list_registered, to_validate_list=to_validate_registered_list)
+            # after this the final predictions for the vlaidation set can be found in validation_folder_name_base + "_postprocessed"
+            # They are always in that folder, even if no postprocessing as applied!
+
+        # detemining postprocesing on a per-fold basis may be OK for this fold but what if another fold finds another
+        # postprocesing to be better? In this case we need to consolidate. At the time the consolidation is going to be
+        # done we won't know what self.gt_niftis_folder was, so now we copy all the niftis into a separate folder to
+        # be used later
+        gt_nifti_folder = join(self.output_folder_base, "gt_niftis")
+        maybe_mkdir_p(gt_nifti_folder)
+        for f in subfiles(self.gt_niftis_folder, suffix=".nii.gz"):
+            success = False
+            attempts = 0
+            e = None
+            while not success and attempts < 10:
+                try:
+                    shutil.copy(f, gt_nifti_folder)
+                    success = True
+                except OSError as e:
+                    attempts += 1
+                    sleep(1)
+            if not success:
+                print("Could not copy gt nifti file %s into folder %s" % (f, gt_nifti_folder))
+                if e is not None:
+                    raise e
+
+        self.network.train(current_mode)
+
+    
+
+
+    def validate_flow_overlap(self, processor, log_function, step, do_mirroring: bool = True, use_sliding_window: bool = True, step_size: float = 0.5,
+                 save_softmax: bool = True, use_gaussian: bool = True, overwrite: bool = True,
+                 validation_folder_name: str = 'validation_raw', debug: bool = True, all_in_gpu: bool = False,
+                 segmentation_export_kwargs: dict = None, run_postprocessing_on_folds: bool = True, output_folder=None, save_flow=True):
+
+        """
+        if debug=True then the temporary files generated for postprocessing determination will be kept
+        """
+        current_mode = self.network.training
+        self.network.eval()
+
+        assert self.was_initialized, "must initialize, ideally with checkpoint (or train first)"
+        if self.dataset_val is None:
+            self.load_dataset()
+            self.do_split()
+
+        if segmentation_export_kwargs is None:
+            if 'segmentation_export_params' in self.plans.keys():
+                force_separate_z = self.plans['segmentation_export_params']['force_separate_z']
+                interpolation_order = self.plans['segmentation_export_params']['interpolation_order']
+                interpolation_order_z = self.plans['segmentation_export_params']['interpolation_order_z']
+            else:
+                force_separate_z = None
+                interpolation_order = 1
+                interpolation_order_z = 0
+        else:
+            force_separate_z = segmentation_export_kwargs['force_separate_z']
+            interpolation_order = segmentation_export_kwargs['interpolation_order']
+            interpolation_order_z = segmentation_export_kwargs['interpolation_order_z']
+
+        # predictions as they come from the network go here
+        if output_folder is not None:
+            self.output_folder = output_folder
+        #output_folder = join(self.output_folder, validation_folder_name)
+        #maybe_mkdir_p(output_folder)
+        # this is for debug purposes
+        my_input_args = {'do_mirroring': do_mirroring,
+                         'use_sliding_window': use_sliding_window,
+                         'step_size': step_size,
+                         'save_softmax': save_softmax,
+                         'use_gaussian': use_gaussian,
+                         'overwrite': overwrite,
+                         'validation_folder_name': validation_folder_name,
+                         'debug': debug,
+                         'all_in_gpu': all_in_gpu,
+                         'segmentation_export_kwargs': segmentation_export_kwargs,
+                         }
+        save_json(my_input_args, join(self.output_folder, "validation_args.json"))
+
+        if do_mirroring:
+            if not self.data_aug_params['do_mirror']:
+                raise RuntimeError("We did not train with mirroring so you cannot do inference with mirroring enabled")
+            mirror_axes = self.data_aug_params['mirror_axes']
+        else:
+            mirror_axes = ()
+
+        pred_gt_tuples = []
+        pred_gt_tuples_register = []
+
+        export_pool = Pool(default_num_threads)
+        results = []
+
+        newpath_flow = join(self.output_folder, 'Flow', validation_folder_name)
+        if not os.path.exists(newpath_flow):
+            os.makedirs(newpath_flow)
+
+        newpath_registered = join(self.output_folder, 'Registered', validation_folder_name)
+        if not os.path.exists(newpath_registered):
+            os.makedirs(newpath_registered)
+
+        newpath_seg = join(self.output_folder, 'Segmentation', validation_folder_name)
+        if not os.path.exists(newpath_seg):
+            os.makedirs(newpath_seg)
+        
+        to_validate_registered_list = []
+
+        list_of_keys = list(self.dataset_val.keys())
+        un_list_of_keys = list(self.dataset_un_val.keys())
+        patient_id_list = np.unique([x[:10] for x in list_of_keys])
+        metadata_list = []
+        metadata_list_registered = []
+        for patient_id in tqdm(patient_id_list):
+            all_keys = list_of_keys + un_list_of_keys
+            phase_list = [x for x in all_keys if patient_id in x]
+            phase_list = np.array(sorted(phase_list, key=lambda x: int(x[16:18])))
+            phase_list = np.array(phase_list)
+            global_labeled_idx = np.where(~np.char.endswith(phase_list, '_u'))[0]
+
+            frame_indices = np.arange(len(phase_list))
+
+            before_where = np.argwhere(frame_indices < global_labeled_idx[0]).reshape(-1,)
+            after_where = np.argwhere(frame_indices >= global_labeled_idx[0]).reshape(-1,)
+            assert after_where[0] == global_labeled_idx[0]
+
+            before_str = phase_list[before_where]
+            after_str = phase_list[after_where]
+
+            all_where = np.concatenate([after_where, before_where])
+            phase_list = np.concatenate([after_str, before_str])
+
+            if '_u' in phase_list[0]:
+                properties = load_pickle(self.unlabeled_dataset[phase_list[0]]['properties_file'])
+            else:
+                properties = load_pickle(self.dataset[phase_list[0]]['properties_file'])
+
+            unlabeled = np.full(shape=((len(phase_list), 1) + properties['size_after_resampling']), fill_value=np.nan)
+            target = np.full(shape=((len(phase_list), 1) + properties['size_after_resampling']), fill_value=np.nan)
+            target_mask = np.zeros(shape=(len(phase_list),), dtype=bool)
+
+            if overwrite or (not isfile(join(output_folder, phase_list[0] + ".nii.gz"))) or (save_softmax and not isfile(join(output_folder, phase_list[0] + ".npz"))):
+                for idx, frame in enumerate(phase_list):
+                    #if frame == k:
+                    #    labeled_idx = idx
+                    if '_u' in frame:
+                        current_data = np.load(self.dataset_un_val[frame]['data_file'])['data']
+                        current_data = current_data + 1e-8
+                        unlabeled[idx] = current_data
+                    else:
+                        current_data = np.load(self.dataset_val[frame]['data_file'])['data']
+                        #current_data[-1][current_data[-1] == -1] = 0
+                        target[idx] = current_data[1]
+                        target[idx][target[idx] == -1] = 0
+                        unlabeled[idx] = current_data[0] + 1e-8
+                        target_mask[idx] = True
+                    #self.print_to_log_file(k, data.shape)
+
+                step = int(ceil((len(phase_list) - 1) / (self.video_length - 1)))
+                values = np.arange(1, len(phase_list))
+                windows = [values[i::step] for i in range(step)]
+                output_dict = {'softmax': [], 'flow': [], 'registered': [], 'windows': []}
+                merged_dict = {'softmax': np.full((len(phase_list), 4) + properties['size_after_resampling'], fill_value=np.nan),
+                                'flow': np.full((len(phase_list), 2) + properties['size_after_resampling'], fill_value=np.nan),
+                                'registered': np.full((len(phase_list), 1) + properties['size_after_resampling'], fill_value=np.nan)}
+                for window_idx, window in enumerate(windows):
+                    pad_idx = []
+                    if len(window) < self.video_length - 1:
+                        to_pad = (self.video_length - 1) - len(window)
+                        pad_idx = [(window[-1] + (step * i)) % len(phase_list) for i in range(1, to_pad + 1)]
+                    window = np.concatenate([[0], window, pad_idx]).astype(int)
+                    assert len(window) == self.video_length
+                    current_unlabeled = unlabeled[window]
+                    current_target = target[window]
+
+                    assert np.all(np.isfinite(current_target[0]))
+
+                    ret = self.predict_preprocessed_data_return_seg_and_softmax_flow(unlabeled=current_unlabeled,
+                                                                                target=current_target,
+                                                                                processor=processor,
+                                                                                do_mirroring=do_mirroring,
+                                                                                mirror_axes=mirror_axes,
+                                                                                use_sliding_window=use_sliding_window,
+                                                                                step_size=step_size,
+                                                                                use_gaussian=use_gaussian,
+                                                                                all_in_gpu=all_in_gpu,
+                                                                                mixed_precision=self.fp16,
+                                                                                verbose=False)
+                    predicted_segmentation = ret[0] # T, depth, H, W
+                    softmax_pred = ret[1] # T, C, depth, H, W
+                    flow_pred = ret[2] # T, C, depth, H, W
+                    registered_pred = ret[3] # T, C, depth, H, W
+                    if pad_idx != []:
+                        softmax_pred = softmax_pred[:-to_pad]
+                        flow_pred = flow_pred[:-to_pad]
+                        registered_pred = registered_pred[:-to_pad]
+                        window = window[:-to_pad]
+                    if window_idx < len(windows) - 1:
+                        softmax_pred = softmax_pred[1:]
+                        flow_pred = flow_pred[1:]
+                        registered_pred = registered_pred[1:]
+                        window = window[1:]
+
+                    assert len(window) == len(softmax_pred)
+                    output_dict['softmax'].append(softmax_pred)
+                    output_dict['flow'].append(flow_pred)
+                    output_dict['registered'].append(registered_pred)
+                    output_dict['windows'].append(window)
+                
+                assert len(merged_dict['softmax'][output_dict['windows'][0]]) == len(output_dict['softmax'][0])
+                
+                for idx, window in enumerate(output_dict['windows']):
+                    merged_dict['softmax'][window] = output_dict['softmax'][idx]
+                    merged_dict['flow'][window] = output_dict['flow'][idx]
+                    merged_dict['registered'][window] = output_dict['registered'][idx]
+
+                assert np.all(np.isfinite(merged_dict['softmax']))
+
+                sorted_where = np.argsort(all_where)
+                merged_dict['softmax'] = merged_dict['softmax'][sorted_where]
+                merged_dict['flow'] = merged_dict['flow'][sorted_where]
+                merged_dict['registered'] = merged_dict['registered'][sorted_where]
+
+                #matplotlib.use('QtAgg')
+                #fig, ax = plt.subplots(1, 7)
+                #plot_idx = 0
+                #for a in range(8, 15):
+                #    current_img = softmax_pred[a, :, 0]
+                #    current_img = current_img.argmax(0)
+                #    ax[plot_idx].imshow(current_img, cmap='gray')
+                #    plot_idx += 1
+                #plt.show()
+                #plt.waitforbuttonpress()
+                #plt.close(fig)
+
+                #stop_indices = [len(x) for x in windows]
+                #videos = [phase_list[x] for x in windows]
+
+                #matplotlib.use('QtAgg')
+                #print(labeled_idx)
+                #print(video_padding)
+                #fig, ax = plt.subplots(1, self.video_length)
+                #for i in range(self.video_length):
+                #    ax[i].imshow(data[i, 0, 5], cmap='gray')
+                #plt.show()
+
+                and_mask = target_mask
+                gt_indices = np.where(and_mask)[0]
+                assert len(gt_indices) == 2
+
+                for t in range(len(merged_dict['softmax'])):
+                    if '_u' in phase_list[t]:
+                        properties = load_pickle(self.unlabeled_dataset[phase_list[t]]['properties_file'])
+                    else:
+                        properties = load_pickle(self.dataset[phase_list[t]]['properties_file'])
+                    fname = properties['list_of_data_files'][0].split(os.sep)[-1][:-12]
+
+                    current_softmax_pred = merged_dict['softmax'][t]
+                    current_softmax_pred = current_softmax_pred.transpose([0] + [i + 1 for i in self.transpose_backward])
+
+                    if save_softmax:
+                        softmax_fname = join(output_folder, fname + ".npz")
+                    else:
+                        softmax_fname = None
+
+                    splitted = fname.split('frame')
+                    to_nb = int(splitted[-1].split('_')[0].split('.')[0])
+                    flow_name = splitted[0] + 'frame' + '01'.zfill(2) + '_to_' + str(to_nb).zfill(2)
+                    flow_path = join(newpath_flow, flow_name + ".nii.gz")
+                    current_flow = merged_dict['flow'][t]
+                    current_flow = current_flow.transpose([0] + [i + 1 for i in self.transpose_backward])
+
+                    registered_path = join(newpath_registered, fname + ".nii.gz")
+                    current_registered = merged_dict['registered'][t]
+                    current_registered = current_registered.transpose([0] + [i + 1 for i in self.transpose_backward])
+
+                    """There is a problem with python process communication that prevents us from communicating objects
+                    larger than 2 GB between processes (basically when the length of the pickle string that will be sent is
+                    communicated by the multiprocessing.Pipe object then the placeholder (I think) does not allow for long
+                    enough strings (lol). This could be fixed by changing i to l (for long) but that would require manually
+                    patching system python code. We circumvent that problem here by saving softmax_pred to a npy file that will
+                    then be read (and finally deleted) by the Process. save_segmentation_nifti_from_softmax can take either
+                    filename or np.ndarray and will handle this automatically"""
+                    if np.prod(current_softmax_pred.shape) > (2e9 / 4 * 0.85):  # *0.85 just to be save
+                        np.save(join(newpath_seg, fname + ".npy"), current_softmax_pred)
+                        current_softmax_pred = join(newpath_seg, fname + ".npy")
+
+                    results.append(export_pool.starmap_async(save_segmentation_nifti_from_softmax,
+                                                            ((current_softmax_pred, join(newpath_seg, fname + ".nii.gz"),
+                                                            properties, interpolation_order, self.regions_class_order,
+                                                            None, None,
+                                                            softmax_fname, None, force_separate_z,
+                                                            interpolation_order_z, False, current_flow, flow_path,
+                                                            current_registered, registered_path),
+                                                            )
+                                                            )
+                                )
+                    
+                    
+                    if t in gt_indices:
+                        metadata_list.append(self.create_metadata_dict(properties))
+                        pred_gt_tuples.append([join(newpath_seg, fname + ".nii.gz"),
+                                                join(self.gt_niftis_folder, fname + ".nii.gz")])
+                    if t == gt_indices[1]:
+                        to_validate_registered_list.append(fname + ".nii.gz")
+                        metadata_list_registered.append(self.create_metadata_dict(properties))
+                        pred_gt_tuples_register.append([registered_path,
+                                                join(self.gt_niftis_folder, fname + ".nii.gz")])
+
+        _ = [i.get() for i in results]
+        self.print_to_log_file("finished prediction")
+
+        # evaluate raw predictions
+        self.print_to_log_file("evaluation of raw predictions")
+        task = self.dataset_directory.split(os.sep)[-1]
+        job_name = self.experiment_name
+        _ = aggregate_scores(pred_gt_tuples_register, labels=list(range(self.num_classes)),
+                             json_output_file=join(newpath_registered, "summary.json"),
+                             json_name=job_name + " val tiled %s" % (str(use_sliding_window)),
+                             json_author="Fabian",
+                             json_task=task, num_threads=default_num_threads,
+                             advanced=True,
+                             metadata_list=metadata_list_registered)
+        _ = aggregate_scores(pred_gt_tuples, labels=list(range(self.num_classes)),
+                             json_output_file=join(newpath_seg, "summary.json"),
+                             json_name=job_name + " val tiled %s" % (str(use_sliding_window)),
+                             json_author="Fabian",
+                             json_task=task, num_threads=default_num_threads,
+                             advanced=True,
+                             metadata_list=metadata_list)
+
+        if run_postprocessing_on_folds:
+            # in the old nnunet we would stop here. Now we add a postprocessing. This postprocessing can remove everything
+            # except the largest connected component for each class. To see if this improves results, we do this for all
+            # classes and then rerun the evaluation. Those classes for which this resulted in an improved dice score will
+            # have this applied during inference as well
+            self.print_to_log_file("determining postprocessing")
+            base_segmentation = join(self.output_folder, 'Segmentation')
+            determine_postprocessing(base_segmentation, self.gt_niftis_folder, validation_folder_name,
+                                     final_subf_name=validation_folder_name + "_postprocessed", debug=debug, log_function=log_function,
+                                     metadata_list=metadata_list, to_validate_list=None)
+            
+            base_registered = join(self.output_folder, 'Registered')
+            determine_postprocessing(base_registered, self.gt_niftis_folder, validation_folder_name,
+                                     final_subf_name=validation_folder_name + "_postprocessed", debug=debug, log_function=log_function,
+                                     metadata_list=metadata_list_registered, to_validate_list=to_validate_registered_list)
+            # after this the final predictions for the vlaidation set can be found in validation_folder_name_base + "_postprocessed"
+            # They are always in that folder, even if no postprocessing as applied!
+
+        # detemining postprocesing on a per-fold basis may be OK for this fold but what if another fold finds another
+        # postprocesing to be better? In this case we need to consolidate. At the time the consolidation is going to be
+        # done we won't know what self.gt_niftis_folder was, so now we copy all the niftis into a separate folder to
+        # be used later
+        gt_nifti_folder = join(self.output_folder_base, "gt_niftis")
+        maybe_mkdir_p(gt_nifti_folder)
+        for f in subfiles(self.gt_niftis_folder, suffix=".nii.gz"):
+            success = False
+            attempts = 0
+            e = None
+            while not success and attempts < 10:
+                try:
+                    shutil.copy(f, gt_nifti_folder)
+                    success = True
+                except OSError as e:
+                    attempts += 1
+                    sleep(1)
+            if not success:
+                print("Could not copy gt nifti file %s into folder %s" % (f, gt_nifti_folder))
+                if e is not None:
+                    raise e
+
+        self.network.train(current_mode)
+
+
+    def validate_flow_overlap_alt(self, processor, log_function, do_mirroring: bool = True, use_sliding_window: bool = True, step_size: float = 0.5,
+                 save_softmax: bool = True, use_gaussian: bool = True, overwrite: bool = True,
+                 validation_folder_name: str = 'validation_raw', debug: bool = True, all_in_gpu: bool = False,
+                 segmentation_export_kwargs: dict = None, run_postprocessing_on_folds: bool = True, output_folder=None, save_flow=True):
+
+        """
+        if debug=True then the temporary files generated for postprocessing determination will be kept
+        """
+        current_mode = self.network.training
+        self.network.eval()
+
+        assert self.was_initialized, "must initialize, ideally with checkpoint (or train first)"
+        if self.dataset_val is None:
+            self.load_dataset()
+            self.do_split()
+
+        if segmentation_export_kwargs is None:
+            if 'segmentation_export_params' in self.plans.keys():
+                force_separate_z = self.plans['segmentation_export_params']['force_separate_z']
+                interpolation_order = self.plans['segmentation_export_params']['interpolation_order']
+                interpolation_order_z = self.plans['segmentation_export_params']['interpolation_order_z']
+            else:
+                force_separate_z = None
+                interpolation_order = 1
+                interpolation_order_z = 0
+        else:
+            force_separate_z = segmentation_export_kwargs['force_separate_z']
+            interpolation_order = segmentation_export_kwargs['interpolation_order']
+            interpolation_order_z = segmentation_export_kwargs['interpolation_order_z']
+
+        # predictions as they come from the network go here
+        if output_folder is not None:
+            self.output_folder = output_folder
+        #output_folder = join(self.output_folder, validation_folder_name)
+        #maybe_mkdir_p(output_folder)
+        # this is for debug purposes
+        my_input_args = {'do_mirroring': do_mirroring,
+                         'use_sliding_window': use_sliding_window,
+                         'step_size': step_size,
+                         'save_softmax': save_softmax,
+                         'use_gaussian': use_gaussian,
+                         'overwrite': overwrite,
+                         'validation_folder_name': validation_folder_name,
+                         'debug': debug,
+                         'all_in_gpu': all_in_gpu,
+                         'segmentation_export_kwargs': segmentation_export_kwargs,
+                         }
+        save_json(my_input_args, join(self.output_folder, "validation_args.json"))
+
+        if do_mirroring:
+            if not self.data_aug_params['do_mirror']:
+                raise RuntimeError("We did not train with mirroring so you cannot do inference with mirroring enabled")
+            mirror_axes = self.data_aug_params['mirror_axes']
+        else:
+            mirror_axes = ()
+
+        pred_gt_tuples = []
+        pred_gt_tuples_register = []
+
+        export_pool = Pool(default_num_threads)
+        results = []
+
+        newpath_flow = join(self.output_folder, 'Flow', validation_folder_name)
+        if not os.path.exists(newpath_flow):
+            os.makedirs(newpath_flow)
+
+        newpath_registered = join(self.output_folder, 'Registered', validation_folder_name)
+        if not os.path.exists(newpath_registered):
+            os.makedirs(newpath_registered)
+
+        newpath_seg = join(self.output_folder, 'Segmentation', validation_folder_name)
+        if not os.path.exists(newpath_seg):
+            os.makedirs(newpath_seg)
+        
+        to_validate_registered_list = []
+
+        list_of_keys = list(self.dataset_val.keys())
+        un_list_of_keys = list(self.dataset_un_val.keys())
+        patient_id_list = np.unique([x[:10] for x in list_of_keys])
+        metadata_list = []
+        metadata_list_registered = []
+        for patient_id in tqdm(patient_id_list):
+            all_keys = list_of_keys + un_list_of_keys
+            phase_list = [x for x in all_keys if patient_id in x]
+            phase_list = np.array(sorted(phase_list, key=lambda x: int(x[16:18])))
+            phase_list = np.array(phase_list)
+            global_labeled_idx = np.where(~np.char.endswith(phase_list, '_u'))[0]
+
+            frame_indices = np.arange(len(phase_list))
+
+            before_where = np.argwhere(frame_indices < global_labeled_idx[0]).reshape(-1,)
+            after_where = np.argwhere(frame_indices >= global_labeled_idx[0]).reshape(-1,)
+            assert after_where[0] == global_labeled_idx[0]
+
+            before_str = phase_list[before_where]
+            after_str = phase_list[after_where]
+
+            all_where = np.concatenate([after_where, before_where])
+            phase_list = np.concatenate([after_str, before_str])
+
+            if '_u' in phase_list[0]:
+                properties = load_pickle(self.unlabeled_dataset[phase_list[0]]['properties_file'])
+            else:
+                properties = load_pickle(self.dataset[phase_list[0]]['properties_file'])
+
+            unlabeled = np.full(shape=((len(phase_list), 1) + properties['size_after_resampling']), fill_value=np.nan)
+            target = np.full(shape=((len(phase_list), 1) + properties['size_after_resampling']), fill_value=np.nan)
+            target_mask = np.zeros(shape=(len(phase_list),), dtype=bool)
+
+            if overwrite or (not isfile(join(output_folder, phase_list[0] + ".nii.gz"))) or (save_softmax and not isfile(join(output_folder, phase_list[0] + ".npz"))):
+                for idx, frame in enumerate(phase_list):
+                    #if frame == k:
+                    #    labeled_idx = idx
+                    if '_u' in frame:
+                        current_data = np.load(self.dataset_un_val[frame]['data_file'])['data']
+                        current_data = current_data + 1e-8
+                        unlabeled[idx] = current_data
+                    else:
+                        current_data = np.load(self.dataset_val[frame]['data_file'])['data']
+                        #current_data[-1][current_data[-1] == -1] = 0
+                        target[idx] = current_data[1]
+                        target[idx][target[idx] == -1] = 0
+                        unlabeled[idx] = current_data[0] + 1e-8
+                        target_mask[idx] = True
+                    #self.print_to_log_file(k, data.shape)
+
+                step = int(ceil(len(phase_list) / self.video_length))
+                values = np.arange(len(phase_list))
+                values = np.pad(values, (0, 100), mode='wrap')
+                windows = [values[i::step] for i in range(step)]
+                windows = [windows[i][:self.video_length] for i in range(len(windows))]
+                output_dict = {'softmax': [], 'flow': [], 'registered': [], 'windows': []}
+                merged_dict = {'softmax': np.full((len(phase_list), 4) + properties['size_after_resampling'], fill_value=np.nan),
+                                'flow': np.full((len(phase_list), 2) + properties['size_after_resampling'], fill_value=np.nan),
+                                'registered': np.full((len(phase_list), 1) + properties['size_after_resampling'], fill_value=np.nan)}
+                
+                for window in windows:
+                    assert len(window) == self.video_length
+                    current_unlabeled = unlabeled[window]
+                    current_target = target[window]
+
+                    current_target_mask = np.zeros(shape=(len(window),), dtype=bool)
+                    ed_index = np.where(window == 0)[0]
+                    current_target_mask[ed_index] = True
+
+                    #assert np.all(np.isfinite(current_target[0]))
+
+                    ret = self.predict_preprocessed_data_return_seg_and_softmax_flow(unlabeled=current_unlabeled,
+                                                                                target=current_target,
+                                                                                target_mask=current_target_mask,
+                                                                                processor=processor,
+                                                                                do_mirroring=do_mirroring,
+                                                                                mirror_axes=mirror_axes,
+                                                                                use_sliding_window=use_sliding_window,
+                                                                                step_size=step_size,
+                                                                                use_gaussian=use_gaussian,
+                                                                                all_in_gpu=all_in_gpu,
+                                                                                mixed_precision=self.fp16,
+                                                                                verbose=False)
+                    predicted_segmentation = ret[0] # T, depth, H, W
+                    softmax_pred = ret[1] # T, C, depth, H, W
+                    flow_pred = ret[2] # T, C, depth, H, W
+                    registered_pred = ret[3] # T, C, depth, H, W
+
+                    start_padding_idx = np.where(window[:-1] > window[1:])[0]
+
+                    if start_padding_idx:
+                        softmax_pred = softmax_pred[:start_padding_idx + 1]
+                        flow_pred = flow_pred[:start_padding_idx + 1]
+                        registered_pred = registered_pred[:start_padding_idx + 1]
+                        window = window[:start_padding_idx + 1]
+
+                    assert len(window) == len(softmax_pred)
+                    output_dict['softmax'].append(softmax_pred)
+                    output_dict['flow'].append(flow_pred)
+                    output_dict['registered'].append(registered_pred)
+                    output_dict['windows'].append(window)
+                
+                assert len(merged_dict['softmax'][output_dict['windows'][0]]) == len(output_dict['softmax'][0])
+                
+                for idx, window in enumerate(output_dict['windows']):
+                    merged_dict['softmax'][window] = output_dict['softmax'][idx]
+                    merged_dict['flow'][window] = output_dict['flow'][idx]
+                    merged_dict['registered'][window] = output_dict['registered'][idx]
+
+                assert np.all(np.isfinite(merged_dict['softmax']))
+
+                sorted_where = np.argsort(all_where)
+                merged_dict['softmax'] = merged_dict['softmax'][sorted_where]
+                merged_dict['flow'] = merged_dict['flow'][sorted_where]
+                merged_dict['registered'] = merged_dict['registered'][sorted_where]
+                target_mask = target_mask[sorted_where]
+                phase_list = phase_list[sorted_where]
+
+                #matplotlib.use('QtAgg')
+                #fig, ax = plt.subplots(1, 7)
+                #plot_idx = 0
+                #for a in range(8, 15):
+                #    current_img = softmax_pred[a, :, 0]
+                #    current_img = current_img.argmax(0)
+                #    ax[plot_idx].imshow(current_img, cmap='gray')
+                #    plot_idx += 1
+                #plt.show()
+                #plt.waitforbuttonpress()
+                #plt.close(fig)
+
+                #stop_indices = [len(x) for x in windows]
+                #videos = [phase_list[x] for x in windows]
+
+                #matplotlib.use('QtAgg')
+                #print(labeled_idx)
+                #print(video_padding)
+                #fig, ax = plt.subplots(1, self.video_length)
+                #for i in range(self.video_length):
+                #    ax[i].imshow(data[i, 0, 5], cmap='gray')
+                #plt.show()
+
+                and_mask = target_mask
+                gt_indices = np.where(and_mask)[0]
+                assert len(gt_indices) == 2
+
+                for t in range(len(merged_dict['softmax'])):
+                    if '_u' in phase_list[t]:
+                        properties = load_pickle(self.unlabeled_dataset[phase_list[t]]['properties_file'])
+                    else:
+                        properties = load_pickle(self.dataset[phase_list[t]]['properties_file'])
+                    fname = properties['list_of_data_files'][0].split(os.sep)[-1][:-12]
+
+                    current_softmax_pred = merged_dict['softmax'][t]
+                    current_softmax_pred = current_softmax_pred.transpose([0] + [i + 1 for i in self.transpose_backward])
+
+                    if save_softmax:
+                        softmax_fname = join(output_folder, fname + ".npz")
+                    else:
+                        softmax_fname = None
+
+                    splitted = fname.split('frame')
+                    to_nb = int(splitted[-1].split('_')[0].split('.')[0])
+                    flow_name = splitted[0] + 'frame' + '01'.zfill(2) + '_to_' + str(to_nb).zfill(2)
+                    flow_path = join(newpath_flow, flow_name + ".nii.gz")
+                    current_flow = merged_dict['flow'][t]
+                    current_flow = current_flow.transpose([0] + [i + 1 for i in self.transpose_backward])
+
+                    registered_path = join(newpath_registered, fname + ".nii.gz")
+                    current_registered = merged_dict['registered'][t]
+                    current_registered = current_registered.transpose([0] + [i + 1 for i in self.transpose_backward])
+
+                    """There is a problem with python process communication that prevents us from communicating objects
+                    larger than 2 GB between processes (basically when the length of the pickle string that will be sent is
+                    communicated by the multiprocessing.Pipe object then the placeholder (I think) does not allow for long
+                    enough strings (lol). This could be fixed by changing i to l (for long) but that would require manually
+                    patching system python code. We circumvent that problem here by saving softmax_pred to a npy file that will
+                    then be read (and finally deleted) by the Process. save_segmentation_nifti_from_softmax can take either
+                    filename or np.ndarray and will handle this automatically"""
+                    if np.prod(current_softmax_pred.shape) > (2e9 / 4 * 0.85):  # *0.85 just to be save
+                        np.save(join(newpath_seg, fname + ".npy"), current_softmax_pred)
+                        current_softmax_pred = join(newpath_seg, fname + ".npy")
+
+                    results.append(export_pool.starmap_async(save_segmentation_nifti_from_softmax,
+                                                            ((current_softmax_pred, join(newpath_seg, fname + ".nii.gz"),
+                                                            properties, interpolation_order, self.regions_class_order,
+                                                            None, None,
+                                                            softmax_fname, None, force_separate_z,
+                                                            interpolation_order_z, False, current_flow, flow_path,
+                                                            current_registered, registered_path),
+                                                            )
+                                                            )
+                                )
+                    
+                    
+                    if t in gt_indices:
+                        metadata_list.append(self.create_metadata_dict(properties))
+                        pred_gt_tuples.append([join(newpath_seg, fname + ".nii.gz"),
+                                                join(self.gt_niftis_folder, fname + ".nii.gz")])
+                    if t == gt_indices[1]:
+                        to_validate_registered_list.append(fname + ".nii.gz")
+                        metadata_list_registered.append(self.create_metadata_dict(properties))
+                        pred_gt_tuples_register.append([registered_path,
+                                                join(self.gt_niftis_folder, fname + ".nii.gz")])
+
+        _ = [i.get() for i in results]
+        self.print_to_log_file("finished prediction")
+
+        # evaluate raw predictions
+        self.print_to_log_file("evaluation of raw predictions")
+        task = self.dataset_directory.split(os.sep)[-1]
+        job_name = self.experiment_name
+        _ = aggregate_scores(pred_gt_tuples_register, labels=list(range(self.num_classes)),
+                             json_output_file=join(newpath_registered, "summary.json"),
+                             json_name=job_name + " val tiled %s" % (str(use_sliding_window)),
+                             json_author="Fabian",
+                             json_task=task, num_threads=default_num_threads,
+                             advanced=True,
+                             metadata_list=metadata_list_registered)
+        _ = aggregate_scores(pred_gt_tuples, labels=list(range(self.num_classes)),
+                             json_output_file=join(newpath_seg, "summary.json"),
+                             json_name=job_name + " val tiled %s" % (str(use_sliding_window)),
+                             json_author="Fabian",
+                             json_task=task, num_threads=default_num_threads,
+                             advanced=True,
+                             metadata_list=metadata_list)
+
+        if run_postprocessing_on_folds:
+            # in the old nnunet we would stop here. Now we add a postprocessing. This postprocessing can remove everything
+            # except the largest connected component for each class. To see if this improves results, we do this for all
+            # classes and then rerun the evaluation. Those classes for which this resulted in an improved dice score will
+            # have this applied during inference as well
+            self.print_to_log_file("determining postprocessing")
+            base_segmentation = join(self.output_folder, 'Segmentation')
+            determine_postprocessing(base_segmentation, self.gt_niftis_folder, validation_folder_name,
+                                     final_subf_name=validation_folder_name + "_postprocessed", debug=debug, log_function=log_function,
+                                     metadata_list=metadata_list, to_validate_list=None)
+            
+            base_registered = join(self.output_folder, 'Registered')
+            determine_postprocessing(base_registered, self.gt_niftis_folder, validation_folder_name,
+                                     final_subf_name=validation_folder_name + "_postprocessed", debug=debug, log_function=log_function,
+                                     metadata_list=metadata_list_registered, to_validate_list=to_validate_registered_list)
+            # after this the final predictions for the vlaidation set can be found in validation_folder_name_base + "_postprocessed"
+            # They are always in that folder, even if no postprocessing as applied!
+
+        # detemining postprocesing on a per-fold basis may be OK for this fold but what if another fold finds another
+        # postprocesing to be better? In this case we need to consolidate. At the time the consolidation is going to be
+        # done we won't know what self.gt_niftis_folder was, so now we copy all the niftis into a separate folder to
+        # be used later
+        gt_nifti_folder = join(self.output_folder_base, "gt_niftis")
+        maybe_mkdir_p(gt_nifti_folder)
+        for f in subfiles(self.gt_niftis_folder, suffix=".nii.gz"):
+            success = False
+            attempts = 0
+            e = None
+            while not success and attempts < 10:
+                try:
+                    shutil.copy(f, gt_nifti_folder)
+                    success = True
+                except OSError as e:
+                    attempts += 1
+                    sleep(1)
+            if not success:
+                print("Could not copy gt nifti file %s into folder %s" % (f, gt_nifti_folder))
+                if e is not None:
+                    raise e
+
+        self.network.train(current_mode)
+
+
+    def validate_flow_sequence(self, processor, log_function, step, do_mirroring: bool = True, use_sliding_window: bool = True, step_size: float = 0.5,
+                 save_softmax: bool = True, use_gaussian: bool = True, overwrite: bool = True,
+                 validation_folder_name: str = 'validation_raw', debug: bool = True, all_in_gpu: bool = False,
+                 segmentation_export_kwargs: dict = None, run_postprocessing_on_folds: bool = True, output_folder=None, save_flow=True):
+
+        """
+        if debug=True then the temporary files generated for postprocessing determination will be kept
+        """
+        current_mode = self.network.training
+        self.network.eval()
+
+        assert self.was_initialized, "must initialize, ideally with checkpoint (or train first)"
+        if self.dataset_val is None:
+            self.load_dataset()
+            self.do_split()
+
+        if segmentation_export_kwargs is None:
+            if 'segmentation_export_params' in self.plans.keys():
+                force_separate_z = self.plans['segmentation_export_params']['force_separate_z']
+                interpolation_order = self.plans['segmentation_export_params']['interpolation_order']
+                interpolation_order_z = self.plans['segmentation_export_params']['interpolation_order_z']
+            else:
+                force_separate_z = None
+                interpolation_order = 1
+                interpolation_order_z = 0
+        else:
+            force_separate_z = segmentation_export_kwargs['force_separate_z']
+            interpolation_order = segmentation_export_kwargs['interpolation_order']
+            interpolation_order_z = segmentation_export_kwargs['interpolation_order_z']
+
+        # predictions as they come from the network go here
+        if output_folder is not None:
+            self.output_folder = output_folder
+        #output_folder = join(self.output_folder, validation_folder_name)
+        #maybe_mkdir_p(output_folder)
+        # this is for debug purposes
+        my_input_args = {'do_mirroring': do_mirroring,
+                         'use_sliding_window': use_sliding_window,
+                         'step_size': step_size,
+                         'save_softmax': save_softmax,
+                         'use_gaussian': use_gaussian,
+                         'overwrite': overwrite,
+                         'validation_folder_name': validation_folder_name,
+                         'debug': debug,
+                         'all_in_gpu': all_in_gpu,
+                         'segmentation_export_kwargs': segmentation_export_kwargs,
+                         }
+        save_json(my_input_args, join(self.output_folder, "validation_args.json"))
+
+        if do_mirroring:
+            if not self.data_aug_params['do_mirror']:
+                raise RuntimeError("We did not train with mirroring so you cannot do inference with mirroring enabled")
+            mirror_axes = self.data_aug_params['mirror_axes']
+        else:
+            mirror_axes = ()
+
+        pred_gt_tuples = []
+        pred_gt_tuples_register = []
+
+        export_pool = Pool(default_num_threads)
+        results = []
+
+        newpath_flow = join(self.output_folder, 'Flow', validation_folder_name)
+        if not os.path.exists(newpath_flow):
+            os.makedirs(newpath_flow)
+
+        newpath_registered = join(self.output_folder, 'Registered', validation_folder_name)
+        if not os.path.exists(newpath_registered):
+            os.makedirs(newpath_registered)
+
+        newpath_seg = join(self.output_folder, 'Segmentation', validation_folder_name)
+        if not os.path.exists(newpath_seg):
+            os.makedirs(newpath_seg)
+        
+        to_validate_registered_list = []
+
+        list_of_keys = list(self.dataset_val.keys())
+        un_list_of_keys = list(self.dataset_un_val.keys())
+        patient_id_list = np.unique([x[:10] for x in list_of_keys])
+        metadata_list = []
+        metadata_list_registered = []
+        for patient_id in tqdm(patient_id_list):
+            all_keys = list_of_keys + un_list_of_keys
+            phase_list = [x for x in all_keys if patient_id in x]
+            phase_list = np.array(sorted(phase_list, key=lambda x: int(x[16:18])))
+            phase_list = np.array(phase_list)
+            global_labeled_idx = np.where(~np.char.endswith(phase_list, '_u'))[0]
+
+            frame_indices = np.arange(len(phase_list))
+
+            before_where = np.argwhere(frame_indices < global_labeled_idx[0]).reshape(-1,)
+            after_where = np.argwhere(frame_indices >= global_labeled_idx[0]).reshape(-1,)
+            assert after_where[0] == global_labeled_idx[0]
+
+            before_str = phase_list[before_where]
+            after_str = phase_list[after_where]
+
+            all_where = np.concatenate([after_where, before_where])
+            phase_list = np.concatenate([after_str, before_str])
+
+            if '_u' in phase_list[0]:
+                properties = load_pickle(self.unlabeled_dataset[phase_list[0]]['properties_file'])
+            else:
+                properties = load_pickle(self.dataset[phase_list[0]]['properties_file'])
+
+            unlabeled = np.full(shape=((len(phase_list), 1) + properties['size_after_resampling']), fill_value=np.nan)
+            target = np.full(shape=((len(phase_list), 1) + properties['size_after_resampling']), fill_value=np.nan)
+            target_mask = np.zeros(shape=(len(phase_list),), dtype=bool)
+
+            if overwrite or (not isfile(join(output_folder, phase_list[0] + ".nii.gz"))) or (save_softmax and not isfile(join(output_folder, phase_list[0] + ".npz"))):
+                for idx, frame in enumerate(phase_list):
+                    #if frame == k:
+                    #    labeled_idx = idx
+                    if '_u' in frame:
+                        current_data = np.load(self.dataset_un_val[frame]['data_file'])['data']
+                        current_data = current_data + 1e-8
+                        unlabeled[idx] = current_data
+                    else:
+                        current_data = np.load(self.dataset_val[frame]['data_file'])['data']
+                        #current_data[-1][current_data[-1] == -1] = 0
+                        target[idx] = current_data[1]
+                        target[idx][target[idx] == -1] = 0
+                        unlabeled[idx] = current_data[0] + 1e-8
+                        target_mask[idx] = True
+                    #self.print_to_log_file(k, data.shape)
+
+                values = np.arange(len(phase_list))
+                nb_sequences = int(ceil(len(phase_list) / (self.video_length - 1)))
+                windows = [values[(self.video_length - 1) * i:(self.video_length - 1) * (i+1)] for i in range(nb_sequences)]
+                windows = [np.concatenate([[0], windows[i]]) for i in range(len(windows))]
+                output_dict = {'softmax': [], 'flow': [], 'registered': [], 'windows': []}
+                merged_dict = {'softmax': np.full((len(phase_list), 4) + properties['size_after_resampling'], fill_value=np.nan),
+                                'flow': np.full((len(phase_list), 2) + properties['size_after_resampling'], fill_value=np.nan),
+                                'registered': np.full((len(phase_list), 1) + properties['size_after_resampling'], fill_value=np.nan)}
+                for window_idx, window in enumerate(windows):
+                    #pad_idx = []
+                    to_pad_right = 0
+                    if len(window) < self.video_length:
+                        to_pad_right = self.video_length - len(window)
+                        window = np.pad(window, pad_width=(0, to_pad_right), mode='edge').astype(int)
+                    assert len(window) == self.video_length
+                    current_unlabeled = unlabeled[window]
+                    current_target = target[window]
+
+                    #assert np.all(np.isfinite(current_target[0]))
+
+                    ret = self.predict_preprocessed_data_return_seg_and_softmax_flow(unlabeled=current_unlabeled,
+                                                                                target=current_target,
+                                                                                processor=processor,
+                                                                                do_mirroring=do_mirroring,
+                                                                                mirror_axes=mirror_axes,
+                                                                                use_sliding_window=use_sliding_window,
+                                                                                step_size=step_size,
+                                                                                use_gaussian=use_gaussian,
+                                                                                all_in_gpu=all_in_gpu,
+                                                                                mixed_precision=self.fp16,
+                                                                                verbose=False)
+                    predicted_segmentation = ret[0] # T, depth, H, W
+                    softmax_pred = ret[1] # T, C, depth, H, W
+                    flow_pred = ret[2] # T, C, depth, H, W
+                    registered_pred = ret[3] # T, C, depth, H, W
+                    if to_pad_right > 0:
+                        softmax_pred = softmax_pred[:-to_pad_right]
+                        flow_pred = flow_pred[:-to_pad_right]
+                        registered_pred = registered_pred[:-to_pad_right]
+                        window = window[:-to_pad_right]
+                    softmax_pred = softmax_pred[1:]
+                    flow_pred = flow_pred[1:]
+                    registered_pred = registered_pred[1:]
+                    window = window[1:]
+
+                    assert len(window) == len(softmax_pred)
+                    output_dict['softmax'].append(softmax_pred)
+                    output_dict['flow'].append(flow_pred)
+                    output_dict['registered'].append(registered_pred)
+                    output_dict['windows'].append(window)
+                
+                assert len(merged_dict['softmax'][output_dict['windows'][0]]) == len(output_dict['softmax'][0])
+                
+                for idx, window in enumerate(output_dict['windows']):
+                    merged_dict['softmax'][window] = output_dict['softmax'][idx]
+                    merged_dict['flow'][window] = output_dict['flow'][idx]
+                    merged_dict['registered'][window] = output_dict['registered'][idx]
+
+                assert np.all(np.isfinite(merged_dict['softmax']))
+
+                sorted_where = np.argsort(all_where)
+                merged_dict['softmax'] = merged_dict['softmax'][sorted_where]
+                merged_dict['flow'] = merged_dict['flow'][sorted_where]
+                merged_dict['registered'] = merged_dict['registered'][sorted_where]
+                target_mask = target_mask[sorted_where]
+                phase_list = phase_list[sorted_where]
+
+                #matplotlib.use('QtAgg')
+                #fig, ax = plt.subplots(1, 7)
+                #plot_idx = 0
+                #for a in range(8, 15):
+                #    current_img = softmax_pred[a, :, 0]
+                #    current_img = current_img.argmax(0)
+                #    ax[plot_idx].imshow(current_img, cmap='gray')
+                #    plot_idx += 1
+                #plt.show()
+                #plt.waitforbuttonpress()
+                #plt.close(fig)
+
+                #stop_indices = [len(x) for x in windows]
+                #videos = [phase_list[x] for x in windows]
+
+                #matplotlib.use('QtAgg')
+                #print(labeled_idx)
+                #print(video_padding)
+                #fig, ax = plt.subplots(1, self.video_length)
+                #for i in range(self.video_length):
+                #    ax[i].imshow(data[i, 0, 5], cmap='gray')
+                #plt.show()
+
+                and_mask = target_mask
+                gt_indices = np.where(and_mask)[0]
+                assert len(gt_indices) == 2
+
+                for t in range(len(merged_dict['softmax'])):
+                    if '_u' in phase_list[t]:
+                        properties = load_pickle(self.unlabeled_dataset[phase_list[t]]['properties_file'])
+                    else:
+                        properties = load_pickle(self.dataset[phase_list[t]]['properties_file'])
+                    fname = properties['list_of_data_files'][0].split(os.sep)[-1][:-12]
+
+                    current_softmax_pred = merged_dict['softmax'][t]
+                    current_softmax_pred = current_softmax_pred.transpose([0] + [i + 1 for i in self.transpose_backward])
+
+                    if save_softmax:
+                        softmax_fname = join(output_folder, fname + ".npz")
+                    else:
+                        softmax_fname = None
+
+                    splitted = fname.split('frame')
+                    to_nb = int(splitted[-1].split('_')[0].split('.')[0])
+                    flow_name = splitted[0] + 'frame' + '01'.zfill(2) + '_to_' + str(to_nb).zfill(2)
+                    flow_path = join(newpath_flow, flow_name + ".nii.gz")
+                    current_flow = merged_dict['flow'][t]
+                    current_flow = current_flow.transpose([0] + [i + 1 for i in self.transpose_backward])
+
+                    registered_path = join(newpath_registered, fname + ".nii.gz")
+                    current_registered = merged_dict['registered'][t]
+                    current_registered = current_registered.transpose([0] + [i + 1 for i in self.transpose_backward])
+
+                    """There is a problem with python process communication that prevents us from communicating objects
+                    larger than 2 GB between processes (basically when the length of the pickle string that will be sent is
+                    communicated by the multiprocessing.Pipe object then the placeholder (I think) does not allow for long
+                    enough strings (lol). This could be fixed by changing i to l (for long) but that would require manually
+                    patching system python code. We circumvent that problem here by saving softmax_pred to a npy file that will
+                    then be read (and finally deleted) by the Process. save_segmentation_nifti_from_softmax can take either
+                    filename or np.ndarray and will handle this automatically"""
+                    if np.prod(current_softmax_pred.shape) > (2e9 / 4 * 0.85):  # *0.85 just to be save
+                        np.save(join(newpath_seg, fname + ".npy"), current_softmax_pred)
+                        current_softmax_pred = join(newpath_seg, fname + ".npy")
+
+                    results.append(export_pool.starmap_async(save_segmentation_nifti_from_softmax,
+                                                            ((current_softmax_pred, join(newpath_seg, fname + ".nii.gz"),
+                                                            properties, interpolation_order, self.regions_class_order,
+                                                            None, None,
+                                                            softmax_fname, None, force_separate_z,
+                                                            interpolation_order_z, False, current_flow, flow_path,
+                                                            current_registered, registered_path),
+                                                            )
+                                                            )
+                                )
+                    
+                    
+                    if t in gt_indices:
+                        metadata_list.append(self.create_metadata_dict(properties))
+                        pred_gt_tuples.append([join(newpath_seg, fname + ".nii.gz"),
+                                                join(self.gt_niftis_folder, fname + ".nii.gz")])
+                    if t == gt_indices[1]:
+                        to_validate_registered_list.append(fname + ".nii.gz")
+                        metadata_list_registered.append(self.create_metadata_dict(properties))
+                        pred_gt_tuples_register.append([registered_path,
+                                                join(self.gt_niftis_folder, fname + ".nii.gz")])
+
+        _ = [i.get() for i in results]
+        self.print_to_log_file("finished prediction")
+
+        # evaluate raw predictions
+        self.print_to_log_file("evaluation of raw predictions")
+        task = self.dataset_directory.split(os.sep)[-1]
+        job_name = self.experiment_name
+        _ = aggregate_scores(pred_gt_tuples_register, labels=list(range(self.num_classes)),
+                             json_output_file=join(newpath_registered, "summary.json"),
+                             json_name=job_name + " val tiled %s" % (str(use_sliding_window)),
+                             json_author="Fabian",
+                             json_task=task, num_threads=default_num_threads,
+                             advanced=True,
+                             metadata_list=metadata_list_registered)
+        _ = aggregate_scores(pred_gt_tuples, labels=list(range(self.num_classes)),
+                             json_output_file=join(newpath_seg, "summary.json"),
+                             json_name=job_name + " val tiled %s" % (str(use_sliding_window)),
+                             json_author="Fabian",
+                             json_task=task, num_threads=default_num_threads,
+                             advanced=True,
+                             metadata_list=metadata_list)
+
+        if run_postprocessing_on_folds:
+            # in the old nnunet we would stop here. Now we add a postprocessing. This postprocessing can remove everything
+            # except the largest connected component for each class. To see if this improves results, we do this for all
+            # classes and then rerun the evaluation. Those classes for which this resulted in an improved dice score will
+            # have this applied during inference as well
+            self.print_to_log_file("determining postprocessing")
+            base_segmentation = join(self.output_folder, 'Segmentation')
+            determine_postprocessing(base_segmentation, self.gt_niftis_folder, validation_folder_name,
+                                     final_subf_name=validation_folder_name + "_postprocessed", debug=debug, log_function=log_function,
+                                     metadata_list=metadata_list, to_validate_list=None)
+            
+            base_registered = join(self.output_folder, 'Registered')
+            determine_postprocessing(base_registered, self.gt_niftis_folder, validation_folder_name,
+                                     final_subf_name=validation_folder_name + "_postprocessed", debug=debug, log_function=log_function,
+                                     metadata_list=metadata_list_registered, to_validate_list=to_validate_registered_list)
             # after this the final predictions for the vlaidation set can be found in validation_folder_name_base + "_postprocessed"
             # They are always in that folder, even if no postprocessing as applied!
 
@@ -1957,3 +4349,8 @@ class nnUNetTrainer(NetworkTrainer):
         info['plans'] = self.plans
 
         write_pickle(info, fname + ".pkl")
+
+
+
+
+

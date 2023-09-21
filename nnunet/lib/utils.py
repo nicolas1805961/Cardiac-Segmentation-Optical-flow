@@ -30,19 +30,22 @@ from torch.nn.functional import grid_sample
 class MotionEstimation(nn.Module):
     def __init__(self):
         super().__init__()
-        self.tanh = torch.nn.Tanh()
     
-    def generate_grid(self, flow):
+    def get_identity_grid(self, flow):
         B, C, H, W = flow.shape
-        grid_h, grid_w = torch.meshgrid([torch.linspace(-1, 1, H), torch.linspace(-1, 1, W)])  # (h, w)
+        grid_w, grid_h = torch.meshgrid([torch.linspace(-1, 1, H), torch.linspace(-1, 1, W)])  # (h, w)
         grid_h = grid_h.cuda().float()
         grid_w = grid_w.cuda().float()
 
         grid_w = nn.Parameter(grid_w, requires_grad=False)
         grid_h = nn.Parameter(grid_h, requires_grad=False)
 
-        grid = torch.stack([grid_w, grid_h], dim=-1)[None].repeat(B, 1, 1, 1)
-
+        grid = torch.stack([grid_h, grid_w], dim=-1)[None].repeat(B, 1, 1, 1)
+        return grid
+    
+    def generate_grid(self, flow):
+        
+        grid = self.get_identity_grid(flow)
         #matplotlib.use('QtAgg')
         #fig, ax = plt.subplots(1, 2)
         #ax[0].imshow(grid_h.cpu())
@@ -61,9 +64,17 @@ class MotionEstimation(nn.Module):
         #offsets = torch.stack((offset_h, offset_w), 3)
         #return offsets
         return grid + flow
+    
+    def get_delta(self, flow):
+        B, C, H, W = flow.shape
+        grid = self.generate_grid(flow=flow)
+        identity_grid = self.get_identity_grid(flow=flow)
+        grid = ((grid + 1) / 2) * H
+        identity_grid = ((identity_grid + 1) / 2) * H
+        delta = (grid - identity_grid).permute(0, 3, 1, 2).contiguous()
+        return delta
 
     def forward(self, flow, original, mode='bilinear'):
-        flow = self.tanh(flow)
         grid = self.generate_grid(flow=flow)
         return grid_sample(original, grid, mode=mode, align_corners=True)
 
@@ -859,9 +870,10 @@ class Filter(nn.Module):
         return out, weights.detach()
 
 
-class ConvBlocks(nn.Module):
+
+class ConvBlocksLegacy(nn.Module):
     def __init__(self, in_dim, out_dim, nb_blocks, norm, kernel_size=3, dpr=None):
-        super(ConvBlocks, self).__init__()
+        super(ConvBlocksLegacy, self).__init__()
         dims = torch.linspace(in_dim, out_dim, nb_blocks+1).int()
 
         self.blocks = nn.ModuleList()
@@ -879,6 +891,192 @@ class ConvBlocks(nn.Module):
         for block in self.blocks:
             x = block(x)
         return x
+    
+
+#class ConvBlocks2D(nn.Module):
+#    def __init__(self, in_dim, out_dim, nb_blocks, kernel_size=3):
+#        super(ConvBlocks2D, self).__init__()
+#        dims = torch.linspace(in_dim, out_dim, nb_blocks+1).int()
+#        dims[1:-1] = torch.IntTensor([8 * round(x.item() / 8) for x in dims[1:-1]])
+#
+#        self.blocks = nn.ModuleList()
+#
+#        for i in range(nb_blocks):
+#            block = nn.Sequential(nn.Conv2d(in_channels=dims[i], out_channels=dims[i+1], kernel_size=kernel_size, padding='same'), 
+#                                        nn.GroupNorm(8, dims[i+1]),
+#                                        nn.GELU(),)
+#            self.blocks.append(block)
+#    
+#    def forward(self, x):
+#        for block in self.blocks:
+#            x = block(x)
+#        return x
+
+class ResnetBlock2D(nn.Module):
+    def __init__(self, in_dim, out_dim, kernel_size=3):
+        super(ResnetBlock2D, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels=in_dim, out_channels=out_dim, kernel_size=kernel_size, padding='same')
+        self.norm1 = nn.GroupNorm(8, out_dim)
+        self.conv2 = nn.Conv2d(in_channels=out_dim, out_channels=out_dim, kernel_size=kernel_size, padding='same')
+        self.norm2 = nn.GroupNorm(8, out_dim)
+        
+        self.res_conv = nn.Conv2d(in_dim, out_dim, 1) if in_dim != out_dim else nn.Identity()
+        self.gelu = nn.GELU()
+    
+    def forward(self, x):
+        identity = x
+        
+        x = self.conv1(x)
+        x = self.norm1(x)
+        x = self.gelu(x)
+
+        x = self.conv2(x)
+        x = self.norm2(x)
+
+        x = x + self.res_conv(identity)
+        x = self.gelu(x)
+
+        return x
+    
+
+class ConvBlocks2D(nn.Module):
+    def __init__(self, in_dim, out_dim, nb_blocks, kernel_size=3):
+        super(ConvBlocks2D, self).__init__()
+        dims = torch.linspace(in_dim, out_dim, nb_blocks+1).int()
+
+        self.blocks = nn.ModuleList()
+
+        for i in range(nb_blocks):
+            block = ResnetBlock2D(in_dim=dims[i], out_dim=dims[i+1], kernel_size=kernel_size)
+            self.blocks.append(block)
+    
+    def forward(self, x):
+        for block in self.blocks:
+            x = block(x)
+        return x
+
+
+class ConvBlocks3D(nn.Module):
+    def __init__(self, in_dim, out_dim, nb_blocks, kernel_size=3):
+        super(ConvBlocks3D, self).__init__()
+        dims = torch.linspace(in_dim, out_dim, nb_blocks+1).int()
+
+        self.blocks = nn.ModuleList()
+        for i in range(nb_blocks):
+            block = nn.Sequential(nn.Conv3d(in_channels=dims[i], out_channels=dims[i+1], kernel_size=kernel_size, padding='same'), 
+                                        nn.GroupNorm(8, dims[i+1]),
+                                        nn.GELU())
+            self.blocks.append(block)
+    
+    def forward(self, x):
+        for block in self.blocks:
+            x = block(x)
+        return x
+
+
+class ConvBlocks3DPos(nn.Module):
+    def __init__(self, in_dim, out_dim, nb_blocks, embedding_dim, kernel_size=3):
+        super(ConvBlocks3DPos, self).__init__()
+        dims = torch.linspace(in_dim, out_dim, nb_blocks+1).int()
+
+        self.blocks_3d = nn.ModuleList()
+        self.linear_layers = nn.ModuleList()
+        for i in range(nb_blocks):
+            block = nn.Sequential(nn.Conv3d(in_channels=dims[i], out_channels=dims[i+1], kernel_size=kernel_size, padding='same'), 
+                                        nn.GroupNorm(8, dims[i+1]),
+                                        nn.GELU())
+            linear_layer = nn.Linear(embedding_dim, dims[i+1])
+            self.blocks_3d.append(block)
+            self.linear_layers.append(linear_layer)
+    
+    def forward(self, x, embedding):
+        B, C, T, H, W = x.shape
+        for block, linear_layer in zip(self.blocks_3d, self.linear_layers):
+            x = block(x)
+            h = linear_layer(embedding)
+            x = x + h[:, :, None, None, None].repeat(1, 1, T, H, W)
+        return x
+    
+
+class PatchMerging3D2D(nn.Module):
+    """ Patch Merging Layer
+    Args:
+        dim (int): Number of input channels.
+        norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
+    """
+
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.reduction_3d = nn.Sequential(
+            nn.Conv3d(in_dim, out_dim, kernel_size=3, stride=(1, 2, 2), padding=1),
+            nn.GroupNorm(8, out_dim),
+            nn.GELU())
+        self.reduction_2d = nn.Sequential(
+                nn.Conv2d(in_dim, out_dim, kernel_size=3, stride=2, padding=1),
+                nn.GroupNorm(8, out_dim),
+                nn.GELU())
+
+    def forward(self, x_3d, x_2d):
+        x_3d = self.reduction(x_3d)
+        x_2d = self.reduction(x_2d)
+        x_3d[:, :, 0] = x_3d[:, :, 0] + x_2d
+        return x_3d, x_2d
+
+
+
+class ConvBlocks2D2D(nn.Module):
+    def __init__(self, in_dim, out_dim, nb_blocks, kernel_size=3, dpr=None):
+        super(ConvBlocks2D2D, self).__init__()
+        dims = torch.linspace(in_dim, out_dim, nb_blocks+1).int()
+
+        self.blocks_2d = nn.ModuleList()
+        self.reduction_layers = nn.ModuleList()
+        for i in range(nb_blocks):
+            block_2d = nn.Sequential(nn.Conv2d(in_channels=dims[i], out_channels=dims[i+1], kernel_size=kernel_size, padding='same'), 
+                                        nn.GroupNorm(8, dims[i+1]), 
+                                        nn.GELU())
+            reduction_layer = nn.Conv2d(in_channels=2 * dims[i+1], out_channels=dims[i+1], kernel_size=1)
+
+            self.blocks_2d.append(block_2d)
+            self.reduction_layers.append(reduction_layer)
+        
+    
+    def forward(self, x, label):
+        for block_2d, reduction_layer in zip(self.blocks_2d, self.reduction_layers):
+            x = block_2d(x)
+            x = torch.cat([x, label], dim=1)
+            x = reduction_layer(x)
+
+            x_3d[:, :, 0] = x_3d[:, :, 0] + x_2d
+        return x_3d, x_2d
+
+
+class ConvBlocks3D2D(nn.Module):
+    def __init__(self, in_dim, out_dim, nb_blocks, kernel_size=3, dpr=None):
+        super(ConvBlocks3D, self).__init__()
+        dims = torch.linspace(in_dim, out_dim, nb_blocks+1).int()
+
+        self.blocks_3d = nn.ModuleList()
+        self.blocks_2d = nn.ModuleList()
+        for i in range(nb_blocks):
+            block_3d = nn.Sequential(nn.Conv3d(in_channels=dims[i], out_channels=dims[i+1], kernel_size=kernel_size, padding='same'), 
+                                        nn.GroupNorm(8, dims[i+1]), 
+                                        nn.GELU())
+            block_2d = nn.Sequential(nn.Conv2d(in_channels=dims[i], out_channels=dims[i+1], kernel_size=kernel_size, padding='same'), 
+                                        nn.GroupNorm(8, dims[i+1]), 
+                                        nn.GELU())
+            self.blocks_3d.append(block_3d)
+            self.blocks_2d.append(block_2d)
+    
+    def forward(self, x_3d, x_2d):
+        for block_3d, block_2d in zip(self.blocks_3d, self.blocks_2d):
+            x_3d = block_3d(x_3d)
+            x_2d = block_2d(x_2d)
+            x_3d[:, :, 0] = x_3d[:, :, 0] + x_2d
+        return x_3d, x_2d
+    
 
 
 class ConvBlocks1D(nn.Module):
@@ -1247,7 +1445,8 @@ class CatLayer(nn.Module):
     def forward(self, x1, x2):
         return torch.cat([x1, x2], dim=1)
 
-class PatchExpand(nn.Module):
+
+class PatchExpandLegacy(nn.Module):
     def __init__(self, in_dim, out_dim, swin_abs_pos, norm):
         super().__init__()
         self.out_dim = out_dim
@@ -1273,36 +1472,38 @@ class PatchExpand(nn.Module):
             abs_pos = self.pos_object(shape_util=(x.shape[0], H * 2, W * 2), device=x.device)
             x = x + abs_pos
         return x
+    
 
 
-class PatchExpandConv3D(nn.Module):
-    def __init__(self, blur, blur_kernel, in_dim, out_dim, swin_abs_pos, device):
+class PatchExpand2D(nn.Module):
+    def __init__(self, in_dim, out_dim):
         super().__init__()
         self.out_dim = out_dim
-        if blur:
-            self.up = nn.Sequential(
-                nn.ConvTranspose3d(in_dim, out_dim, kernel_size=(1, 2, 2), stride=(1, 2, 2)),
-                nn.BatchNorm3d(out_dim),
-                nn.GELU(),
-                BlurLayer3D(blur_kernel, stride=1))
-        else:
-            self.up = nn.Sequential(
-                nn.ConvTranspose3d(in_dim, out_dim, kernel_size=(1, 2, 2), stride=(1, 2, 2)),
-                nn.BatchNorm3d(out_dim),
-                nn.GELU())
-        self.swin_abs_pos = swin_abs_pos
-        self.device = device
-        self.pos_object = PositionEmbeddingSine3d(num_pos_feats=out_dim//3, normalize=True)
+        self.up = nn.Sequential(
+            nn.ConvTranspose2d(in_dim, out_dim, 2, 2),
+            nn.GroupNorm(8, out_dim),
+            nn.GELU())
 
     def forward(self, x):
-        B, C, D, H, W = x.shape
-
         x = self.up(x)
-        if self.swin_abs_pos:
-            abs_pos = self.pos_object(shape_util=(B, D, H * 2, W * 2), device=self.device)
-            x = x + abs_pos
-
         return x
+
+
+
+class PatchExpand3D(nn.Module):
+    def __init__(self, in_dim, out_dim, kernel_size, stride):
+        super().__init__()
+        self.out_dim = out_dim
+        self.up = nn.Sequential(
+            nn.ConvTranspose3d(in_dim, out_dim, kernel_size=kernel_size, stride=stride),
+            nn.GroupNorm(8, out_dim),
+            nn.GELU())
+
+    def forward(self, x):
+        x = self.up(x)
+        return x
+
+
 
 class concat_merge_conv_rescale(nn.Module):
     def __init__(self, in_dim, out_dim, input_resolution, norm_layer=nn.LayerNorm):
@@ -1465,7 +1666,7 @@ class PatchMergingSwin(nn.Module):
         
         return x
 
-class PatchMerging(nn.Module):
+class PatchMergingLegacy(nn.Module):
     """ Patch Merging Layer
     Args:
         dim (int): Number of input channels.
@@ -1499,6 +1700,48 @@ class PatchMerging(nn.Module):
             abs_pos = self.pos_object(shape_util=(x.shape[0], H // 2, W // 2), device=self.device)
             x = x + abs_pos
         
+        return x
+
+
+class PatchMerging2D(nn.Module):
+    """ Patch Merging Layer
+    Args:
+        dim (int): Number of input channels.
+        norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
+    """
+
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.reduction = nn.Sequential(
+            nn.Conv2d(in_dim, out_dim, kernel_size=3, stride=2, padding=1),
+            nn.GroupNorm(8, out_dim),
+            nn.GELU())
+
+    def forward(self, x):
+        x = self.reduction(x)
+        return x
+
+
+class PatchMerging3D(nn.Module):
+    """ Patch Merging Layer
+    Args:
+        dim (int): Number of input channels.
+        norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
+    """
+
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.reduction = nn.Sequential(
+            nn.Conv3d(in_dim, out_dim, kernel_size=3, stride=(1, 2, 2), padding=1),
+            nn.GroupNorm(8, out_dim),
+            nn.GELU())
+
+    def forward(self, x):
+        x = self.reduction(x)
         return x
 
 class PatchMergingSwin3D(nn.Module):
@@ -1541,41 +1784,6 @@ class PatchMergingSwin3D(nn.Module):
         
         return x
 
-class PatchMergingConv3D(nn.Module):
-    """ Patch Merging Layer
-    Args:
-        dim (int): Number of input channels.
-        norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
-    """
-
-    def __init__(self, blur, blur_kernel, in_dim, out_dim, swin_abs_pos, device):
-        super().__init__()
-        self.in_dim = in_dim
-        self.out_dim = out_dim
-        if blur:
-            self.reduction = nn.Sequential(
-                nn.Conv3d(in_dim, out_dim, kernel_size=3, stride=1, padding=1),
-                nn.BatchNorm3d(out_dim),
-                nn.GELU(),
-                BlurLayer3D(blur_kernel, stride=(1, 2, 2)))
-        else:
-            self.reduction = nn.Sequential(
-                nn.Conv3d(in_dim, out_dim, kernel_size=3, stride=(1, 2, 2), padding=1),
-                nn.BatchNorm3d(out_dim),
-                nn.GELU())
-        self.swin_abs_pos = swin_abs_pos
-        self.device = device
-        self.pos_object = PositionEmbeddingSine3d(num_pos_feats=out_dim/3, normalize=True)
-
-    def forward(self, x):
-        B, C, D, H, W = x.shape
-
-        x = self.reduction(x)
-        if self.swin_abs_pos:
-            abs_pos = self.pos_object(shape_util=(B, D, H // 2, W // 2), device=self.device)
-            x = x + abs_pos
-        
-        return x
 
 class ConvLayerDiscriminator(nn.Module):
     def __init__(self, input_resolution, in_dim, out_dim, nb_se_blocks, dpr, shortcut):

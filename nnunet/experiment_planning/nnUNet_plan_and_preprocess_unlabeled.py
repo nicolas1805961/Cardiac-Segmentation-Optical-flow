@@ -12,7 +12,7 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
-
+from glob import glob
 import nnunet
 from batchgenerators.utilities.file_and_folder_operations import *
 from nnunet.experiment_planning.DatasetAnalyzer import DatasetAnalyzer
@@ -96,21 +96,40 @@ def main():
                   "skip 2d planning and preprocessing.")
         assert planner_name3d == 'ExperimentPlanner3D_v21_Pretrained', "When using --overwrite_plans you need to use " \
                                                                        "'-pl3d ExperimentPlanner3D_v21_Pretrained'"
+    
+
+    
 
     # we need raw data
     tasks = []
     for i in task_ids:
         i = int(i)
-
         task_name = convert_id_to_task_name(i)
+
+        preprocessing_output_dir_this_task = os.path.join(preprocessing_output_dir, task_name)
+
+        #maybe_mkdir_p(join(preprocessing_output_dir_this_task, "imagesTr"))
+        #maybe_mkdir_p(join(preprocessing_output_dir_this_task, "imagesTs"))
+        #maybe_mkdir_p(join(preprocessing_output_dir_this_task, "labelsTr"))
+        maybe_mkdir_p(join(preprocessing_output_dir_this_task, "strain", "LV", "radial"))
+        maybe_mkdir_p(join(preprocessing_output_dir_this_task, "strain", "LV", "tangential"))
+        maybe_mkdir_p(join(preprocessing_output_dir_this_task, "strain", "RV", "tangential"))
+        maybe_mkdir_p(join(preprocessing_output_dir_this_task, "contour", "RV"))
+        maybe_mkdir_p(join(preprocessing_output_dir_this_task, "contour", "LV"))
+
+        if len(next(os.walk(os.path.join(nnUNet_raw_data, task_name)))[1]) > 3:
+            npy_paths = glob(os.path.join(nnUNet_raw_data, task_name, '**', '*.npy'), recursive=True)
+            for npy_path in npy_paths:
+                split_index = 4 if 'strain' in npy_path else 3
+                start_path = [preprocessing_output_dir_this_task]
+                start_path.extend(npy_path.split(os.sep)[-split_index:])
+                shutil.copy(npy_path, os.path.join(*start_path))
 
         if args.verify_dataset_integrity:
             verify_dataset_integrity(join(nnUNet_raw_data, task_name))
 
-        if '28' in task_name or '29' in task_name or '30' in task_name:
-            crop(task_name, False, tf, get_info=True)
-        else:
-            crop(task_name, False, tf)
+        crop(task_name, False, tf)
+        if '27' in task_name or '31' in task_name:
             crop_unlabeled(task_name, False, tf)
 
         tasks.append(task_name)
@@ -160,6 +179,8 @@ def main():
         shutil.copy(join(cropped_out_dir, "dataset_properties.pkl"), preprocessing_output_dir_this_task)
         shutil.copy(join(nnUNet_raw_data, t, "dataset.json"), preprocessing_output_dir_this_task)
 
+        
+
         #if planner_2d_unlabeled is not None:
         #    exp_planner = planner_2d_unlabeled(cropped_out_dir, preprocessing_output_dir_this_task)
         #    exp_planner.plan_experiment()
@@ -179,6 +200,7 @@ def main():
         #    exp_planner.plan_experiment()
         #    if not dont_run_preprocessing:  # double negative, yooo
         #        exp_planner.run_preprocessing(threads)
+
         if planner_2d is not None:
             exp_planner = planner_2d(cropped_out_dir, preprocessing_output_dir_this_task)
             exp_planner.plan_experiment()

@@ -74,7 +74,7 @@ from nnunet.training.loss_functions.crossentropy import RobustCrossEntropyLoss, 
 from nnunet.training.dataloading.dataset_loading import DataLoader2DMiddle, DataLoader2DUnlabeled, DataLoader2DBinary
 from nnunet.training.dataloading.dataset_loading import load_dataset, load_unlabeled_dataset
 from nnunet.network_architecture.MTL_model import ModelWrap
-from nnunet.lib.utils import RFR, ConvBlocks, Resblock, LayerNorm, RFR_1d, Resblock1D, ConvBlocks1D
+from nnunet.lib.utils import RFR, ConvBlocksLegacy, Resblock, LayerNorm, RFR_1d, Resblock1D, ConvBlocks1D
 from nnunet.lib.loss import SeparabilityLoss, ContrastiveLoss
 from nnunet.training.data_augmentation.cutmix import cutmix, batched_rand_bbox
 import shutil
@@ -142,15 +142,14 @@ class nnMTLTrainerV2(nnUNetTrainer):
         if self.log_images:
             self.vis = Visualizer(unlabeled=self.unlabeled,
                                     adversarial_loss=self.adversarial_loss,
-                                    middle_unlabeled=self.middle_unlabeled,
-                                    middle=False,
                                     registered_seg=self.registered_seg,
                                     writer=self.writer)
 
-        if self.inference:
-            self.output_folder = output_folder
-        else:
+        if config is None:
             self.output_folder = self.log_dir
+        else:
+            self.output_folder = output_folder
+        
 
         self.setup_loss_functions(loss_weights)
         
@@ -498,7 +497,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
             conv_layer = Resblock
             conv_layer_1d = Resblock1D
         else:
-            conv_layer = ConvBlocks
+            conv_layer = ConvBlocksLegacy
             conv_layer_1d = ConvBlocks1D
         return conv_layer, conv_layer_1d
 
@@ -567,6 +566,13 @@ class nnMTLTrainerV2(nnUNetTrainer):
 
             in_shape = torch.randn(self.config['batch_size'], 1, self.image_size, self.image_size)
             self.network = build_2d_model(self.config, conv_layer=conv_layer, norm=getattr(torch.nn, self.config['norm']), log_function=self.print_to_log_file, image_size=self.image_size, window_size=self.window_size, middle=False, num_classes=num_classes)
+
+            #path = r"C:\Users\Portal\Documents\ACDC_output_old\Baseline\fold_0\model_final_checkpoint.model"
+            #loaded = torch.load(path)['state_dict']
+            #self.network.load_state_dict(loaded)
+            #self.network.eval()
+
+
             model_input_data = in_shape
             models['model'] = (self.network, model_input_data)
 

@@ -15,7 +15,7 @@ import sys
 import torch.nn as nn
 import matplotlib.pyplot as plt
 from ..lib.encoder import Encoder, Encoder1D
-from ..lib.utils import MLP, MotionEstimation, DeformableTransformer, ConvBlocks, Filter, ConvBlock, GetSeparability, GetCrossSimilarityMatrix, ReplicateChannels, To_image, From_image, rescale, CCA
+from ..lib.utils import MLP, MotionEstimation, DeformableTransformer, ConvBlocks2D, Filter, ConvBlock, GetSeparability, GetCrossSimilarityMatrix, ReplicateChannels, To_image, From_image, rescale, CCA
 from ..lib import swin_transformer_2
 from ..lib import decoder_alt
 import torchvision.transforms.functional as TF

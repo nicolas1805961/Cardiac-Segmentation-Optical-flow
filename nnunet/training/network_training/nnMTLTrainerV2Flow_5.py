@@ -12,6 +12,8 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
+from monai.transforms import KeepLargestConnectedComponent
+from kornia.morphology import erosion
 from ruamel.yaml import YAML
 from torch.autograd import Variable
 from nnunet.training.network_training.data_augmentation import Augmenter
@@ -80,7 +82,7 @@ from nnunet.training.loss_functions.crossentropy import RobustCrossEntropyLoss, 
 from nnunet.training.dataloading.dataset_loading import DataLoaderFlowTrain5, DataLoaderFlowValidationOneStep
 from nnunet.training.dataloading.dataset_loading import load_dataset, load_unlabeled_dataset
 from nnunet.network_architecture.MTL_model import ModelWrap
-from nnunet.lib.utils import RFR, ConvBlocks, Resblock, LayerNorm, RFR_1d, Resblock1D, ConvBlocks1D, MotionEstimation
+from nnunet.lib.utils import RFR, ConvBlocks2D, Resblock, LayerNorm, RFR_1d, Resblock1D, ConvBlocks1D, MotionEstimation
 from nnunet.lib.loss import SeparabilityLoss, ContrastiveLoss
 from nnunet.training.data_augmentation.cutmix import cutmix, batched_rand_bbox
 import shutil
@@ -128,6 +130,7 @@ class nnMTLTrainerV2Flow5(nnUNetTrainer):
         self.use_progress_bar=True
         self.motion_estimation = MotionEstimation()
         self.load_only_batchnorm = self.config['load_only_batchnorm']
+        self.padding = self.config['padding']
 
         self.fine_tuning = True if self.video_length > 2 and not self.inference else False
         #self.fine_tuning = False
@@ -140,6 +143,7 @@ class nnMTLTrainerV2Flow5(nnUNetTrainer):
         self.consistency_loss_weight = self.config['consistency_loss_weight']
         self.do_adv = self.config['do_adv']
         self.blackout_percent = self.config['blackout_percent']
+        self.only_first = self.config['only_first']
 
         self.discriminator_lr = self.config['discriminator_lr']
         self.discriminator_decay = self.config['discriminator_decay']
@@ -160,6 +164,9 @@ class nnMTLTrainerV2Flow5(nnUNetTrainer):
         self.seg_registered_pred_loss_weight = self.config['seg_registered_pred_loss_weight']
         self.image_flow_loss_weight = self.config['image_flow_loss_weight']
         self.long_image_flow_loss_weight = self.config['long_image_flow_loss_weight']
+        self.first_flow_loss_weight = self.config['first_flow_loss_weight']
+        self.seg_curvature_loss_weight = self.config['seg_curvature_loss_weight']
+        self.flow_curvature_loss_weight = self.config['flow_curvature_loss_weight']
 
         timestr = strftime("%Y-%m-%d_%HH%M")
         self.log_dir = os.path.join(copy(self.output_folder), timestr)
@@ -200,9 +207,12 @@ class nnMTLTrainerV2Flow5(nnUNetTrainer):
         loss_data = {'segmentation': [self.segmentation_loss_weight, float('nan')]}
         loss_data['image_flow'] = [self.image_flow_loss_weight, float('nan')]
         loss_data['flow_regularization'] = [1.0, float('nan')]
+        loss_data['seg_curvature'] = [self.seg_curvature_loss_weight, float('nan')]
+        loss_data['flow_curvature'] = [self.flow_curvature_loss_weight, float('nan')]
         if self.all_to_all:
             loss_data['pred_registered_target'] = [self.pred_registered_target_loss_weight, float('nan')]
             loss_data['pred_registered_pred'] = [self.pred_registered_pred_loss_weight, float('nan')]
+            loss_data['first_flow'] = [self.first_flow_loss_weight, float('nan')]
         loss_data['seg_registered_target'] = [self.seg_registered_target_loss_weight, float('nan')]
         loss_data['seg_registered_pred'] = [self.seg_registered_pred_loss_weight, float('nan')]
         #if not self.one_to_all:
@@ -318,13 +328,19 @@ class nnMTLTrainerV2Flow5(nnUNetTrainer):
 
     def choose_loss(self):
         if self.deep_supervision:
-            return self.compute_losses_ds
-        elif self.all_to_all:
-            return self.compute_losses_all_to_all
-        elif self.one_to_all:
-            return self.compute_losses_one_to_all
+            if self.all_to_all:
+                return self.compute_losses_all_to_all_ds
+            elif self.one_to_all:
+                return self.compute_losses_one_to_all_ds
+            else:
+                return self.compute_losses_ds
         else:
-            return self.compute_losses
+            if self.all_to_all:
+                return self.compute_losses_all_to_all
+            elif self.one_to_all:
+                return self.compute_losses_one_to_all
+            else:
+                return self.compute_losses
     
     def count_parameters(self, config, models):
         if not self.inference:
@@ -385,16 +401,17 @@ class nnMTLTrainerV2Flow5(nnUNetTrainer):
                         if isinstance(module, nn.BatchNorm2d) and module_name in k:
                             new_state_dict[k] = v
                     else:
-                        if module_name in k:
+                        if module_name in k and 'conv_1d' not in k:
                             new_state_dict[k] = v
                             #if new_state_dict[k].shape != v.shape:
                             #    print(k)
                             #else:
                             #    new_state_dict[k] = v
 
-        missing_keys, unexpected_keys = model.load_state_dict(new_state_dict, strict=False)
-
-        assert len(unexpected_keys) == 0, f'Unexpected_keys: {unexpected_keys}'
+        try:
+            missing_keys, unexpected_keys = model.load_state_dict(new_state_dict, strict=False)
+        except Exception as e:
+            self.print_to_log_file(e)
 
         self.freeze_batchnorm_layers(model)
 
@@ -559,7 +576,7 @@ class nnMTLTrainerV2Flow5(nnUNetTrainer):
         all_pred = out['seg'].permute(1, 0, 2, 3, 4).contiguous() # B, T, 1, H, W
         forward_flow = out['forward_flow'].permute(1, 0, 2, 3, 4).contiguous() # B, T, 2, H, W
         target_mask = target_mask.permute(1, 0).contiguous() # B, T
-        seg_registered_forward = out['seg_registered_forward'].permute(1, 0, 2, 3).contiguous() # B, T-1, H, W
+        seg_registered_forward = out['seg_registered_forward'].permute(1, 0, 2, 3).contiguous() # B, T, H, W
         #if not self.one_to_all:
         #    pred_registered_backward = out['pred_registered_backward'].permute(1, 0, 2, 3).contiguous() # B, T-1, H, W
 
@@ -614,7 +631,6 @@ class nnMTLTrainerV2Flow5(nnUNetTrainer):
                                                 registered_input=out['registered_input_forward'][:, b, 0],
                                                 registered_seg=current_seg_registered_forward, #current_seg_registered_forward,
                                                 target=current_target,
-                                                fixed=unlabeled[b, 1:, 0],
                                                 motion_flow=motion_flow)
                     #self.vis.set_up_image_seg_registered_long(seg_dice=seg_dice[b].mean(), 
                     #                                     seg_registered_long=out['seg_registered_forward_long'][b, 0],
@@ -800,7 +816,7 @@ class nnMTLTrainerV2Flow5(nnUNetTrainer):
                             run_postprocessing_on_folds=run_postprocessing_on_folds, debug=True, output_folder=output_folder, save_flow=True)
         
         elif self.inference_mode == 'overlap':
-            ret = super().validate_flow(processor=self.processor, log_function=self.print_to_log_file, step=1, do_mirroring=do_mirroring, use_sliding_window=use_sliding_window, step_size=step_size,
+            ret = super().validate_flow_sequence(processor=self.processor, log_function=self.print_to_log_file, step=1, do_mirroring=do_mirroring, use_sliding_window=use_sliding_window, step_size=step_size,
                                 save_softmax=save_softmax, use_gaussian=use_gaussian,
                                 overwrite=overwrite, validation_folder_name=validation_folder_name,
                                 all_in_gpu=all_in_gpu, segmentation_export_kwargs=segmentation_export_kwargs,
@@ -1119,16 +1135,70 @@ class nnMTLTrainerV2Flow5(nnUNetTrainer):
         return out
     
 
+    def get_perimeter(self, x):
+        kernel = torch.ones(size=(3, 3), device=x.device)
+        eroded = erosion(x, kernel)
+
+        #matplotlib.use('QtAgg')
+        #fig, ax = plt.subplots(1, 2)
+        #ax[0].imshow(x[0, 0].detach().cpu(), cmap='gray')
+        #ax[1].imshow((x - eroded)[0, 0].detach().cpu(), cmap='gray')
+        #plt.show()
+
+        perimeter = torch.sum(torch.abs(x - eroded))
+        return perimeter
+    
+
+    def get_strain_curve(self, x):
+        # T, B, 1, H, W
+        endo_perim_list = []
+        epi_perim_list = []
+        for i in range(len(x)):
+            current_frame = x[i]
+            binarized_endo = (current_frame == 3).float()
+            binarized_epi = torch.logical_or(current_frame == 2, binarized_endo).float()
+            perim_endo = self.get_perimeter(binarized_endo)
+            perim_epi = self.get_perimeter(binarized_epi)
+            assert perim_endo >= 0
+            assert perim_epi >= 0
+            endo_perim_list.append(perim_endo)
+            epi_perim_list.append(perim_epi)
+        
+        endo_strain = [(endo_perim_list[i] - endo_perim_list[0]) / (endo_perim_list[0] + 1e-8) for i in range(len(endo_perim_list))]
+        epi_strain = [(epi_perim_list[i] - epi_perim_list[0]) / (epi_perim_list[0] + 1e-8) for i in range(len(epi_perim_list))]
+
+        #endo_strain = [(endo_perim_list[i] - endo_perim_list[0]) for i in range(len(endo_perim_list))]
+        #epi_strain = [(epi_perim_list[i] - epi_perim_list[0]) for i in range(len(epi_perim_list))]
+
+        endo_strain = torch.tensor(endo_strain)
+        epi_strain = torch.tensor(epi_strain)
+
+        lv_strain = (endo_strain + epi_strain) / 2
+
+        return lv_strain
+
+
+    def get_curvature(self, x):
+        # T, B, 1, H, W
+        strain = self.get_strain_curve(x)
+        second_order_derivative = torch.abs(strain[:-2] - 2* strain[1:-1] + strain[2:])
+        assert torch.all(torch.isfinite(second_order_derivative)), strain
+        return second_order_derivative
+
+    
     def compute_losses_all_to_all(self, target_mask, unlabeled, out, target):
         out['registered_input_backward'] = []
         out['registered_input_forward'] = []
         out['seg_registered_forward'] = []
 
-        self.writer.add_scalar('Iteration/flow_magnitude', torch.abs(out['forward_flow']).mean(), self.iter_nb)
+        if not self.only_first:
+            self.writer.add_scalars('Iteration/attn_weights', {'frame_' + str(i):torch.abs(out['attn_weights'][i, 0]) for i in range(self.video_length)}, self.iter_nb)
 
         t_indices, b_indices = torch.nonzero(target_mask, as_tuple=True)
         seg_loss_l = self.segmentation_loss(out['seg'][t_indices, b_indices], target[t_indices, b_indices])
         self.loss_data['segmentation'][1] = seg_loss_l
+
+        self.loss_data['first_flow'][1] = self.mse_loss(out['forward_flow'][0], torch.zeros_like(out['forward_flow'][0]))
 
         initial_target = target[0]
         initial_target = torch.nn.functional.one_hot(initial_target[:, 0].long(), num_classes=4).permute(0, 3, 1, 2).contiguous().float()
@@ -1136,7 +1206,8 @@ class nnMTLTrainerV2Flow5(nnUNetTrainer):
         initial_target_registered_list = []
         for t in range(1, len(unlabeled)):
             for j in range(t):
-                incremental_flow = out['forward_flow'][t] - out['forward_flow'][j]
+                flow_difference = out['forward_flow'][t] - out['forward_flow'][j]
+                incremental_flow = self.motion_estimation(flow=out['forward_flow'][j], original=flow_difference, mode='bilinear')
                 pred_registered = self.motion_estimation(flow=incremental_flow, original=out['seg'][j], mode='bilinear')
                 pred_registered_list.append(pred_registered)
                 if j == 0:
@@ -1147,10 +1218,13 @@ class nnMTLTrainerV2Flow5(nnUNetTrainer):
         pred_registered_list = torch.stack(pred_registered_list, dim=0) # T_max, B, 4, H, W
         out['seg_registered_forward'] = initial_target_registered_list
 
-        target_pred = torch.softmax(out['seg'], dim=2) # T, B, 4, H, W
-        target_pred = torch.argmax(target_pred, dim=2, keepdim=True) # T, B, 1, H, W
+        target_pred = torch.softmax(out['seg'][1:], dim=2) # T - 1, B, 4, H, W
+        target_pred = torch.argmax(target_pred, dim=2, keepdim=True) # T - 1, B, 1, H, W
 
-        seg_registered_loss_pred = self.segmentation_loss(out['seg_registered_forward'].permute(1, 2, 3, 4, 0), target_pred[1:].permute(1, 2, 3, 4, 0))
+        flow_curvature = self.get_curvature(torch.argmax(out['seg_registered_forward'], dim=2, keepdim=True))
+        seg_curvature = self.get_curvature(target_pred)
+
+        seg_registered_loss_pred = self.segmentation_loss(out['seg_registered_forward'].permute(1, 2, 3, 4, 0), target_pred.permute(1, 2, 3, 4, 0))
         self.loss_data['seg_registered_pred'][1] = seg_registered_loss_pred
 
         t_indices, b_indices = torch.nonzero(target_mask[1:], as_tuple=True)
@@ -1163,6 +1237,8 @@ class nnMTLTrainerV2Flow5(nnUNetTrainer):
         target_pred_all = torch.cat([target_pred[i][None].repeat(i, 1, 1, 1, 1) for i in range(1, len(unlabeled))], dim=0)
         target_all = torch.cat([target[i][None].repeat(i, 1, 1, 1, 1) for i in range(1, len(unlabeled))], dim=0)
         target_mask_all = torch.cat([target_mask[i][None].repeat(i, 1) for i in range(1, len(unlabeled))], dim=0)
+
+        #target_pred_all = torch.argmax(target_pred_all, dim=2, keepdim=True) # T, B, 1, H, W
 
         pred_registered_loss_pred = self.cross_entropy_loss(pred_registered_list.permute(1, 2, 3, 4, 0), target_pred_all.permute(1, 2, 3, 4, 0))
         self.loss_data['pred_registered_pred'][1] = pred_registered_loss_pred
@@ -1194,14 +1270,176 @@ class nnMTLTrainerV2Flow5(nnUNetTrainer):
         #    ax[2, i].imshow(unlabeled[0, 0, 0].detach().cpu(), cmap='gray')
         #plt.show()
 
-        for t in range(len(unlabeled) - 1):
+        for t in range(len(unlabeled)):
             registered_input_forward = self.motion_estimation(flow=out['forward_flow'][t], original=unlabeled[t])
             out['registered_input_forward'].append(registered_input_forward)
         
         out['registered_input_forward'] = torch.stack(out['registered_input_forward'], dim=0)
 
-        forward_flow_loss = self.mse_loss(out['registered_input_forward'], unlabeled[1:])
-        flow_regularization_loss_forward = self.image_flow_loss(flow=out['forward_flow'][:-1], iter_nb=self.iter_nb)
+        forward_flow_loss = self.mse_loss(out['registered_input_forward'], unlabeled)
+        flow_regularization_loss_forward = self.image_flow_loss(flow=out['forward_flow'])
+        self.loss_data['image_flow'][1] = forward_flow_loss
+        self.loss_data['flow_regularization'][1] = flow_regularization_loss_forward
+        if self.video_length == 2:
+            self.loss_data['seg_curvature'][1] = torch.zeros(size=(1,))
+            self.loss_data['flow_curvature'][1] = torch.zeros(size=(1,))
+        else:
+            self.loss_data['seg_curvature'][1] = seg_curvature.mean()
+            self.loss_data['flow_curvature'][1] = flow_curvature.mean()
+        
+        #print(new_target.shape)
+        #matplotlib.use('QtAgg')
+        #fig, ax = plt.subplots(1, len(new_target))
+        #for o in range(len(new_target)):
+        #    ax[o].imshow(new_target[o, 0, 0].detach().cpu(), cmap='gray')
+        #plt.show()
+
+        #b_list = []
+        #for b in range(self.batch_size):
+        #    index = torch.nonzero(target_mask[:, b])[0].item()
+        #    initial_target = target[index, b]
+        #    initial_target = torch.nn.functional.one_hot(initial_target[0].long(), num_classes=4).permute(2, 0, 1).contiguous().float()[None]
+#
+        #    #matplotlib.use('QtAgg')
+        #    #fig, ax = plt.subplots(1, 4)
+        #    #for o in range(4):
+        #    #    ax[o].imshow(initial_target[0, o].detach().cpu(), cmap='gray')
+        #    #plt.show()
+#
+        #    forward_hops = len(unlabeled) - 1 - index
+        #    backward_hops = index
+        #    t_list = []
+        #    current_target = initial_target
+        #    for i in range(backward_hops):
+        #        current_target = self.motion_estimation(flow=out['backward_flow'][index - i, b][None], original=current_target, mode='bilinear')
+        #        t_list.append(torch.argmax(current_target[0], dim=0, keepdim=True))
+        #    current_target = initial_target
+        #    for i in range(forward_hops):
+        #        current_target = self.motion_estimation(flow=out['forward_flow'][index + i, b][None], original=current_target, mode='bilinear')
+        #        t_list.append(torch.argmax(current_target[0], dim=0, keepdim=True))
+        #    t_list = torch.stack(t_list, dim=0)
+        #    b_list.append(t_list)
+        #out['seg_registered'] = torch.stack(b_list, dim=1)
+        #assert len(out['seg_registered']) == len(unlabeled) - 1
+
+        if self.do_adv:
+            loss_fake, output_fake = self.get_fake_loss(out, label=1, detach=False)
+            self.loss_data['adversarial'][1] = loss_fake.mean()
+
+        return out
+    
+
+    def compute_losses_all_to_all_ds(self, target_mask, unlabeled, out, target):
+        out['registered_input_backward'] = []
+        out['registered_input_forward'] = []
+        out['seg_registered_forward'] = []
+
+        self.writer.add_scalar('Iteration/flow_magnitude', torch.abs(out['forward_flow'][0]).mean(), self.iter_nb)
+
+        seg_loss_l = []
+        t_indices, b_indices = torch.nonzero(target_mask, as_tuple=True)
+        for idx, w in enumerate(self.ds_weights):
+            scale_loss = w * self.segmentation_loss(out['seg'][idx][t_indices, b_indices], target[t_indices, b_indices])
+            seg_loss_l.append(scale_loss.view(1,))
+        self.loss_data['segmentation'][1] = torch.cat(seg_loss_l).mean()
+
+        self.loss_data['first_flow'][1] = self.mse_loss(out['forward_flow'][0][0], torch.zeros_like(out['forward_flow'][0][0]))
+
+        initial_target = target[0]
+        initial_target = torch.nn.functional.one_hot(initial_target[:, 0].long(), num_classes=4).permute(0, 3, 1, 2).contiguous().float()
+        target_to_target_loss_list = []
+        target_to_pred_loss_list = []
+        pred_to_target_loss_list = []
+        pred_to_pred_loss_list = []
+        for idx, w in enumerate(self.ds_weights):
+            pred_registered_list = []
+            initial_target_registered_list = []
+            for t in range(len(unlabeled)):
+                if t == 0:
+                    incremental_flow = out['forward_flow'][idx][0]
+                    pred_registered = self.motion_estimation(flow=incremental_flow, original=out['seg'][idx][0], mode='bilinear')
+                    pred_registered_list.append(pred_registered)
+                    initial_target_registered = self.motion_estimation(flow=incremental_flow, original=initial_target, mode='bilinear')
+                    initial_target_registered_list.append(initial_target_registered)
+                else:
+                    for j in range(t):
+                        incremental_flow = out['forward_flow'][idx][t] - out['forward_flow'][idx][j]
+                        pred_registered = self.motion_estimation(flow=incremental_flow, original=out['seg'][idx][j], mode='bilinear')
+                        pred_registered_list.append(pred_registered)
+                        if j == 0:
+                            initial_target_registered = self.motion_estimation(flow=incremental_flow, original=initial_target, mode='bilinear')
+                            #initial_target_registered = self.motion_estimation(flow=out['forward_flow'][t], original=initial_target, mode='bilinear')
+                            initial_target_registered_list.append(initial_target_registered)
+            initial_target_registered_list = torch.stack(initial_target_registered_list, dim=0) # T, B, 4, H, W
+            pred_registered_list = torch.stack(pred_registered_list, dim=0) # T_max, B, 4, H, W
+            if idx == 0:
+                out['seg_registered_forward'] = initial_target_registered_list
+
+            target_pred = torch.softmax(out['seg'][idx], dim=2) # T, B, 4, H, W
+            target_pred = torch.argmax(target_pred, dim=2, keepdim=True) # T, B, 1, H, W
+
+            seg_registered_loss_pred = w * self.segmentation_loss(initial_target_registered_list.permute(1, 2, 3, 4, 0), target_pred.permute(1, 2, 3, 4, 0))
+            target_to_pred_loss_list.append(seg_registered_loss_pred.view(-1,))
+
+            t_indices, b_indices = torch.nonzero(target_mask, as_tuple=True)
+            seg_registered_loss_target = w * self.segmentation_loss(initial_target_registered_list[t_indices, b_indices], target[t_indices, b_indices])
+            target_to_target_loss_list.append(seg_registered_loss_target.view(-1,))
+
+            target_pred = torch.softmax(out['seg'][idx], dim=2) # T, B, 4, H, W
+            target_pred_all = torch.cat([target_pred[i][None].repeat(i, 1, 1, 1, 1) for i in range(1, len(unlabeled))], dim=0)
+            target_all = torch.cat([target[i][None].repeat(i, 1, 1, 1, 1) for i in range(1, len(unlabeled))], dim=0)
+            target_mask_all = torch.cat([target_mask[i][None].repeat(i, 1) for i in range(1, len(unlabeled))], dim=0)
+
+            target_pred_all = torch.cat([target_pred[0][None], target_pred_all], dim=0)
+            target_all = torch.cat([target[0][None], target_all], dim=0)
+            target_mask_all = torch.cat([target_mask[0][None], target_mask_all], dim=0)
+        
+            pred_registered_loss_pred = w * self.cross_entropy_loss(pred_registered_list.permute(1, 2, 3, 4, 0), target_pred_all.permute(1, 2, 3, 4, 0))
+            pred_to_pred_loss_list.append(pred_registered_loss_pred.view(-1,))
+
+            t_indices, b_indices = torch.nonzero(target_mask_all, as_tuple=True)
+            pred_registered_loss_target = w * self.segmentation_loss(pred_registered_list[t_indices, b_indices], target_all[t_indices, b_indices])
+            pred_to_target_loss_list.append(pred_registered_loss_target.view(-1,))
+
+        self.loss_data['seg_registered_pred'][1] = torch.cat(target_to_pred_loss_list).mean()
+        self.loss_data['seg_registered_target'][1] = torch.cat(target_to_target_loss_list).mean()
+
+        out['seg_registered_forward'] = torch.argmax(out['seg_registered_forward'], dim=2)
+
+        self.loss_data['pred_registered_pred'][1] = torch.cat(pred_to_pred_loss_list).mean()
+        self.loss_data['pred_registered_target'][1] = torch.cat(pred_to_target_loss_list).mean()
+
+        #t_list_backward = []
+        #for i in range(1, len(unlabeled)):
+        #    cumulated_seg = out['seg'][i] # B, 4, H, W
+        #    current_pred_registered = self.motion_estimation(flow=out['backward_flow'][i], original=cumulated_seg)
+        #    t_list_backward.append(current_pred_registered)
+        #t_list_backward = torch.stack(t_list_backward, dim=0) # T - 1, B, 4, H, W
+        #out['pred_registered_backward'] = t_list_backward
+#
+        #pred_registered_target = target[0][None].repeat(len(out['pred_registered_backward']), 1, 1, 1, 1)
+        #pred_registered_loss = self.segmentation_loss(out['pred_registered_backward'].permute(1, 2, 3, 4, 0), pred_registered_target.permute(1, 2, 3, 4, 0))
+        #self.loss_data['pred_registered'][1] = pred_registered_loss
+#
+        #out['pred_registered_backward'] = torch.softmax(out['pred_registered_backward'], dim=2)
+        #out['pred_registered_backward'] = torch.argmax(out['pred_registered_backward'], dim=2)
+
+        #matplotlib.use('QtAgg')
+        #fig, ax = plt.subplots(3, 4)
+        #for i in range(4):
+        #    ax[0, i].imshow(out['seg_registered_backward_long'][0, i].detach().cpu(), cmap='gray')
+        #    ax[1, i].imshow(b_list_backward_target[0, 0].detach().cpu(), cmap='gray')
+        #    ax[2, i].imshow(unlabeled[0, 0, 0].detach().cpu(), cmap='gray')
+        #plt.show()
+
+        for t in range(len(unlabeled)):
+            registered_input_forward = self.motion_estimation(flow=out['forward_flow'][0][t], original=unlabeled[t])
+            out['registered_input_forward'].append(registered_input_forward)
+        
+        out['registered_input_forward'] = torch.stack(out['registered_input_forward'], dim=0)
+
+        forward_flow_loss = self.mse_loss(out['registered_input_forward'], unlabeled)
+        flow_regularization_loss_forward = self.image_flow_loss(flow=out['forward_flow'][0], iter_nb=self.iter_nb)
         self.loss_data['image_flow'][1] = forward_flow_loss
         self.loss_data['flow_regularization'][1] = flow_regularization_loss_forward
         
@@ -1245,7 +1483,6 @@ class nnMTLTrainerV2Flow5(nnUNetTrainer):
             self.loss_data['adversarial'][1] = loss_fake.mean()
 
         return out
-
 
 
     def compute_losses_one_to_all(self, target_mask, unlabeled, out, target):
@@ -1641,7 +1878,7 @@ class nnMTLTrainerV2Flow5(nnUNetTrainer):
         l = self.consolidate_only_one_loss_data(self.loss_data, log=False)
         if self.deep_supervision:
             out['seg'] = out['seg'][0]
-            out['backward_flow'] = out['backward_flow'][0]
+            #out['backward_flow'] = out['backward_flow'][0]
             out['forward_flow'] = out['forward_flow'][0]
         self.val_loss.append(l.mean().detach().cpu())
 
@@ -1719,6 +1956,51 @@ class nnMTLTrainerV2Flow5(nnUNetTrainer):
         registered = registered[:, 0]
         assert torch.all(torch.isfinite(flow_target))
         return registered, flow_target
+
+
+    def warp_linear_all_to_all(self, target, flow, and_mask):
+        registered_list = []
+        flow_target_list = []
+        for b in range(len(target)):
+            indices = torch.nonzero(and_mask[b]) # 2, 1
+            ed_target = target[b, indices[0].item()][None]
+            es_target = target[b, indices[1].item()][None]
+            flow_ed_to_es = (flow[b, indices[1].item()] - flow[b, indices[0].item()])[None]
+            ed_target = torch.nn.functional.one_hot(ed_target[:, 0].long(), num_classes=4).permute(0, 3, 1, 2).contiguous().float()
+            es_pred = self.motion_estimation(flow=flow_ed_to_es, original=ed_target, mode='bilinear')
+            
+            registered_list.append(es_pred[0])
+            flow_target_list.append(es_target)
+        registered = torch.stack(registered_list, dim=0) # B, 4, H, W
+        registered = torch.argmax(registered, dim=1, keepdim=True) # B, 1, H, W
+        flow_target = torch.stack(flow_target_list, dim=0) # B, 1, H, W
+
+        flow_target = flow_target[:, 0]
+        registered = registered[:, 0]
+        assert torch.all(torch.isfinite(flow_target))
+        return registered, flow_target
+    
+
+    def warp_linear(self, seg, target, flow, and_mask):
+        registered_list = []
+        flow_target_list = []
+        for b in range(len(target)):
+            indices = torch.nonzero(and_mask[b]) # 2, 1
+            es_target = target[b, indices[1].item()][None]
+            flow_difference = (flow[b, indices[1].item()] - flow[b, indices[1].item() - 1])[None]
+            incremental_flow = self.motion_estimation(flow=flow[b, indices[1].item() - 1][None], original=flow_difference, mode='bilinear')
+            registered = self.motion_estimation(flow=incremental_flow, original=seg[b, indices[1].item() - 1][None], mode='bilinear')
+            
+            registered_list.append(registered[0])
+            flow_target_list.append(es_target)
+        registered = torch.stack(registered_list, dim=0) # B, 4, H, W
+        registered = torch.argmax(registered, dim=1, keepdim=True) # B, 1, H, W
+        flow_target = torch.stack(flow_target_list, dim=0) # B, 1, H, W
+
+        flow_target = flow_target[:, 0]
+        registered = registered[:, 0]
+        assert torch.all(torch.isfinite(flow_target))
+        return registered, flow_target
     
 
     def get_stats(self, out, target, mask, padding):
@@ -1728,10 +2010,10 @@ class nnMTLTrainerV2Flow5(nnUNetTrainer):
         flow = out['forward_flow'].permute(1, 0, 2, 3, 4).contiguous() # B, T, 2, H, W
         num_classes = seg.shape[2]
 
-        if not self.one_to_all and not self.all_to_all:
-            registered, flow_target = self.warp_linear_sequential(target, flow, and_mask)
+        if self.only_first:
+            registered, flow_target = self.warp_linear_all_to_all(target, flow, and_mask)
         else:
-            registered, flow_target = self.warp_linear_one_to_all(target, flow, and_mask)
+            registered, flow_target = self.warp_linear(seg, target, flow, and_mask)
 
         #registered_list = []
         #flow_target_list = []

@@ -16,7 +16,7 @@ import sys
 import torch.nn as nn
 import matplotlib.pyplot as plt
 from ..lib.encoder import Encoder, Encoder1D
-from ..lib.utils import MLP, MotionEstimation, DeformableTransformer, ConvBlocks, Filter, ConvBlock, GetSeparability, GetCrossSimilarityMatrix, ReplicateChannels, To_image, From_image, rescale, CCA
+from ..lib.utils import MLP, MotionEstimation, DeformableTransformer, ConvBlocks2D, Filter, ConvBlock, GetSeparability, GetCrossSimilarityMatrix, ReplicateChannels, To_image, From_image, rescale, CCA
 from ..lib import swin_transformer_2
 from ..lib import decoder_alt
 import torchvision.transforms.functional as TF
@@ -30,7 +30,7 @@ from ..lib.vq_vae import VectorQuantizer, VectorQuantizerEMA, VanillaVAE, Quanti
 from torch.cuda.amp import autocast
 from nnunet.utilities.random_stuff import no_op
 from typing import Union, Tuple
-from ..lib.vit_transformer import _get_clones, TransformerDecoder, TransformerFlowEncoderWindow, TransformerFlowEncoderDoubleWindow, TransformerFlowEncoderIterativeStep, TransformerFlowEncoderWindowFirst, TransformerFlowEncoderStep, TransformerFlowEncoder, TransformerFlowDecoder, SpatioTemporalTransformer, SpatialTransformerLayer, SlotTransformer, TransformerEncoderLayer, SlotAttention, CrossTransformerEncoderLayer, CrossRelativeSpatialTransformerLayer
+from ..lib.vit_transformer import TransformerFlowEncoderFirstSeparate, TransformerFlowEncoderAllOnlyContext, TransformerFlowEncoderFirst, TransformerFlowEncoderAllSeparate
 from batchgenerators.augmentations.utils import pad_nd_image
 from ..training.dataloading.dataset_loading import get_idx, select_idx
 from ..lib.position_embedding import PositionEmbeddingSine2d, PositionEmbeddingSine1d
@@ -84,11 +84,14 @@ class OpticalFlowModel4(SegmentationNetwork):
                 drop_path_rate,
                 log_function,
                 dot_multiplier,
-                nb_tokens,
                 temporal_kernel_size,
                 inference_mode,
-                bidirectional,
+                padding,
+                video_length,
+                split,
                 one_to_all,
+                all_to_all,
+                only_first,
                 norm_2d):
         super(OpticalFlowModel4, self).__init__()
         self.num_stages = (len(conv_depth))
@@ -104,7 +107,10 @@ class OpticalFlowModel4(SegmentationNetwork):
         self.temporal_kernel_size = temporal_kernel_size
         self.inference_mode = inference_mode
         self.one_to_all = one_to_all
-        self.bidirectional = bidirectional
+        self.all_to_all = all_to_all
+        self.video_length = video_length
+        self.split = split
+        self.only_first = only_first
         
         self.num_classes = 4
 
@@ -118,7 +124,7 @@ class OpticalFlowModel4(SegmentationNetwork):
         dpr_bottleneck = dpr[-1]
 
         self.motion_estimation = MotionEstimation()
-
+        
         self.encoder = Encoder(conv_layer=conv_layer_2d, norm=norm_2d, out_dims=out_encoder_dims, device=device, in_dims=in_dims, conv_depth=conv_depth, dpr=dpr_encoder)
         decoder_in_dims = in_dims[:]
         decoder_in_dims[0] = self.num_classes
@@ -129,24 +135,25 @@ class OpticalFlowModel4(SegmentationNetwork):
 
         H, W = (int(image_size / 2**(self.num_stages)), int(image_size / 2**(self.num_stages)))
         #d_ffn = min(2048, self.d_model * 4)
-        if self.one_to_all:
-            self.transformer_flow_encoder = TransformerFlowEncoderIterativeStep(dim=self.d_model, nhead=self.bottleneck_heads, num_layers=self.nb_layers, nb_tokens=nb_tokens, temporal_kernel_size=temporal_kernel_size)
-            #self.transformer_flow_encoder = TransformerFlowEncoderStep(dim=self.d_model, nhead=self.bottleneck_heads, num_layers=self.nb_layers, nb_tokens=nb_tokens, temporal_kernel_size=temporal_kernel_size)
-            #self.transformer_flow_encoder = TransformerFlowEncoderWindowFirst(dim=self.d_model, nhead=self.bottleneck_heads, num_layers=self.nb_layers, nb_tokens=nb_tokens, temporal_kernel_size=temporal_kernel_size)
-            #self.transformer_flow_encoder = TransformerFlowEncoderDoubleWindow(dim=self.d_model, nhead=self.bottleneck_heads, num_layers=self.nb_layers, nb_tokens=nb_tokens, temporal_kernel_size=temporal_kernel_size)
+        if self.only_first:
+            self.transformer_flow_encoder = TransformerFlowEncoderFirst(dim=self.d_model, nhead=self.bottleneck_heads, num_layers=self.nb_layers, padding=padding)
         else:
-            self.transformer_flow_encoder = TransformerFlowEncoderWindow(dim=self.d_model, nhead=self.bottleneck_heads, num_layers=self.nb_layers, nb_tokens=nb_tokens, temporal_kernel_size=temporal_kernel_size)
+            self.transformer_flow_encoder = TransformerFlowEncoderAllOnlyContext(dim=self.d_model, nhead=self.bottleneck_heads, num_layers=self.nb_layers, padding=padding)
         
         #for i in range(nb_conv_1d):
         #    conv_1d = nn.Sequential(nn.Conv1d(in_channels=self.d_model, out_channels=self.d_model, kernel_size=3, padding='same'),
         #                            )
         
-        self.conv_1d = nn.Conv1d(in_channels=self.d_model, out_channels=self.d_model, kernel_size=17, padding='same')
+        #self.conv_1d = nn.Conv1d(in_channels=self.d_model, out_channels=self.d_model, kernel_size=51, padding='same')
 
         self.skip_co_reduction_list = nn.ModuleList()
         for idx, dim in enumerate(out_encoder_dims):
-            reduction = nn.Conv2d(in_channels=dim * 2, out_channels=dim, kernel_size=1)
-            #reduction = conv_layer(in_dim=dim * 2, out_dim=dim, nb_blocks=conv_depth[idx],  kernel_size=3, dpr=[0], norm=norm_2d)
+            if self.split:
+                #out_dim = int(dim / self.video_length)
+                #reduction = nn.Conv2d(in_channels=dim, out_channels=out_dim, kernel_size=1)
+                reduction = nn.Conv2d(in_channels=dim * self.video_length, out_channels=dim, kernel_size=1)
+            else:
+                reduction = nn.Conv2d(in_channels=dim * 2, out_channels=dim, kernel_size=1)
             self.skip_co_reduction_list.append(reduction)
 
         #self.widen = nn.Linear(in_features=nb_tokens, out_features=self.d_model)
@@ -181,15 +188,18 @@ class OpticalFlowModel4(SegmentationNetwork):
         return all_scale_list
     
     def forward(self, unlabeled):
-        if self.one_to_all:
+        if self.only_first:
             return self.forward_one_to_all(unlabeled)
+        elif self.split:
+            return self.forward_one_to_all_split(unlabeled)
         else:
-            return self.forward_one_way(unlabeled)
+            return self.forward_one_to_all(unlabeled)
     
 
     def forward_one_way(self, unlabeled):
         out = {'seg': [],
-                'forward_flow': []}
+                'forward_flow': [],
+                'attn_weights': None}
         
         #if self.training and self.blackout and not unlabeled.requires_grad:
         #    nb_masked = np.rint(np.random.uniform(0, 0.2) * len(unlabeled)).astype(int)
@@ -225,7 +235,8 @@ class OpticalFlowModel4(SegmentationNetwork):
 
         T, B, C, H, W = unlabeled_features.shape
 
-        unlabeled_features = self.transformer_flow_encoder(spatial_features=unlabeled_features, pos_1d=pos_1d) # T, B, H*W, C
+        unlabeled_features, weights = self.transformer_flow_encoder(spatial_features=unlabeled_features, pos_1d=pos_1d) # T, B, H*W, C
+        out['attn_weights'] = weights
 
         for t in range(len(unlabeled_features)):
 
@@ -257,7 +268,6 @@ class OpticalFlowModel4(SegmentationNetwork):
         #seg = torch.cat([seg_1[0][None], middle, seg_2[-1][None]], dim=0)
 
         return out
-    
 
 
     def forward_one_to_all(self, unlabeled):
@@ -294,11 +304,12 @@ class OpticalFlowModel4(SegmentationNetwork):
 
         pos_1d = torch.flatten(unlabeled_features, start_dim=-2).mean(-1) # T, B, C
         pos_1d = pos_1d.permute(1, 2, 0).contiguous()
-        pos_1d = self.conv_1d(pos_1d)
+        #pos_1d = self.conv_1d(pos_1d)
+        pos_1d = torch.zeros_like(pos_1d)
 
         T, B, C, H, W = unlabeled_features.shape
 
-        unlabeled_features = self.transformer_flow_encoder(spatial_features=unlabeled_features, pos_1d=pos_1d) # T, B, H*W, C
+        unlabeled_features, weights = self.transformer_flow_encoder(spatial_features=unlabeled_features, pos_1d=pos_1d) # T, B, H*W, C
 
         for t in range(len(unlabeled_features)):
 
@@ -309,7 +320,6 @@ class OpticalFlowModel4(SegmentationNetwork):
                 flow_skip_co.append(concatenated_forward)
 
             to_decode_feature = unlabeled_features[t] # B, L, C
-
             to_decode_feature = to_decode_feature.permute(0, 2, 1).contiguous().view(B, C, H, W)
 
             seg = self.seg_decoder(to_decode_feature, unlabeled_skip_co_list[t])
@@ -326,11 +336,11 @@ class OpticalFlowModel4(SegmentationNetwork):
         #middle = torch.stack([seg_1[1:], seg_2[:-1]], dim=0).mean(0)
         #seg = torch.cat([seg_1[0][None], middle, seg_2[-1][None]], dim=0)
 
+        out['attn_weights'] = weights
         return out
+    
 
-
-
-    def forward_two_way(self, unlabeled):
+    def forward_one_to_all_split(self, unlabeled):
         out = {'seg': [],
                 'forward_flow': []}
         
@@ -364,33 +374,31 @@ class OpticalFlowModel4(SegmentationNetwork):
 
         pos_1d = torch.flatten(unlabeled_features, start_dim=-2).mean(-1) # T, B, C
         pos_1d = pos_1d.permute(1, 2, 0).contiguous()
-        pos_1d = self.conv_1d(pos_1d)
+        #pos_1d = self.conv_1d(pos_1d)
+        pos_1d = torch.zeros_like(pos_1d)
 
         T, B, C, H, W = unlabeled_features.shape
 
-        unlabeled_features_backward = unlabeled_features
-        unlabeled_features_backward = self.transformer_flow_encoder(spatial_features=unlabeled_features_backward, pos_1d=pos_1d) # T, B, H*W, C
+        unlabeled_features, weights = self.transformer_flow_encoder(spatial_features=unlabeled_features, pos_1d=pos_1d) # T, B, H*W, C
 
-        unlabeled_features_forward = torch.flip(unlabeled_features, dims=[0])
-        unlabeled_features_forward = self.transformer_flow_encoder(spatial_features=unlabeled_features_forward, pos_1d=pos_1d) # T, B, H*W, C
-        unlabeled_features_forward = torch.flip(unlabeled_features_forward, dims=[0])
-
-        unlabeled_features = torch.cat([unlabeled_features_backward, unlabeled_features_forward], dim=-1)
-        unlabeled_features = self.reduce_bidirectional(unlabeled_features)
+        #flow_skip_co = []
+        #for s, reduction_layer in enumerate(self.skip_co_reduction_list):
+        #    reduced_list = []
+        #    for t in range(len(unlabeled_features)):
+        #        reduced = reduction_layer(unlabeled_skip_co_list[t][s])
+        #        reduced_list.append(reduced)
+        #    concatenated = torch.cat(reduced_list, dim=1)
+        #    flow_skip_co.append(concatenated)
+        
+        flow_skip_co = []
+        for s, reduction_layer in enumerate(self.skip_co_reduction_list):
+            concatenated = torch.cat([unlabeled_skip_co_list[t][s] for t in range(len(unlabeled_features))], dim=1)
+            reduced = reduction_layer(concatenated)
+            flow_skip_co.append(reduced)
 
         for t in range(len(unlabeled_features)):
 
-            flow_skip_co = []
-            for s, reduction_layer in enumerate(self.skip_co_reduction_list):
-                if t == len(unlabeled_features) - 1:
-                    concatenated_forward = torch.cat([torch.zeros_like(unlabeled_skip_co_list[t][s]), unlabeled_skip_co_list[t][s]], dim=1)
-                else:
-                    concatenated_forward = torch.cat([unlabeled_skip_co_list[t + 1][s], unlabeled_skip_co_list[t][s]], dim=1)
-                concatenated_forward = reduction_layer(concatenated_forward)
-                flow_skip_co.append(concatenated_forward)
-
             to_decode_feature = unlabeled_features[t] # B, L, C
-
             to_decode_feature = to_decode_feature.permute(0, 2, 1).contiguous().view(B, C, H, W)
 
             seg = self.seg_decoder(to_decode_feature, unlabeled_skip_co_list[t])
@@ -407,10 +415,12 @@ class OpticalFlowModel4(SegmentationNetwork):
         #middle = torch.stack([seg_1[1:], seg_2[:-1]], dim=0).mean(0)
         #seg = torch.cat([seg_1[0][None], middle, seg_2[-1][None]], dim=0)
 
+        out['attn_weights'] = weights
         return out
+
     
 
-    def predict_3D_flow(self, unlabeled, target_mask, padding_mask, target, processor, do_mirroring: bool, mirror_axes: Tuple[int, ...] = (0, 1, 2),
+    def predict_3D_flow(self, unlabeled, target, processor, do_mirroring: bool, mirror_axes: Tuple[int, ...] = (0, 1, 2),
                    use_sliding_window: bool = False,
                    step_size: float = 0.5, patch_size: Tuple[int, ...] = None, regions_class_order: Tuple[int, ...] = None,
                    use_gaussian: bool = False, pad_border_mode: str = "constant",
@@ -475,7 +485,7 @@ class OpticalFlowModel4(SegmentationNetwork):
             self.log_function("WARNING! Network is in train mode during inference. This may be intended, or not...")
             #print('WARNING! Network is in train mode during inference. This may be intended, or not...')
 
-        assert len(unlabeled[0, 0].shape) == 4, "data must have shape (c,x,y,z)"
+        assert len(unlabeled[0].shape) == 4, "data must have shape (c,x,y,z)"
 
         if mixed_precision:
             context = autocast
@@ -487,7 +497,7 @@ class OpticalFlowModel4(SegmentationNetwork):
         with context():
             with torch.no_grad():
                 if use_sliding_window:
-                    res = self._internal_predict_3D_2Dconv_tiled_flow(unlabeled, target_mask, padding_mask, target, processor, patch_size, do_mirroring, mirror_axes, step_size,
+                    res = self._internal_predict_3D_2Dconv_tiled_flow(unlabeled, target, processor, patch_size, do_mirroring, mirror_axes, step_size,
                                                                                 regions_class_order, use_gaussian, pad_border_mode,
                                                                                 pad_kwargs, all_in_gpu, False)
                 else:
@@ -629,7 +639,7 @@ class OpticalFlowModel4(SegmentationNetwork):
         return result_torch_seg, result_torch_flow, cropped_target, padding_need
     
 
-    def _internal_predict_3D_2Dconv_tiled_flow(self, unlabeled, target_mask, padding_mask, target, processor, patch_size: Tuple[int, int], do_mirroring: bool,
+    def _internal_predict_3D_2Dconv_tiled_flow(self, unlabeled, target, processor, patch_size: Tuple[int, int], do_mirroring: bool,
                                                 mirror_axes: tuple = (0, 1), step_size: float = 0.5,
                                                 regions_class_order: tuple = None, use_gaussian: bool = False,
                                                 pad_border_mode: str = "edge", pad_kwargs: dict =None,
@@ -641,19 +651,19 @@ class OpticalFlowModel4(SegmentationNetwork):
         if all_in_gpu:
             raise NotImplementedError
 
-        assert len(unlabeled[0, 0].shape) == 4, "data must be c, x, y, z"
+        assert len(unlabeled[0].shape) == 4, "data must be c, x, y, z"
 
         predicted_segmentation = []
         softmax_pred_list = []
         flow_pred_list = []
         registered_pred_list = []
 
-        for depth_idx in range(unlabeled.shape[3]):
+        for depth_idx in range(unlabeled.shape[2]):
 
             #current_video = [x[:, depth_idx] for x in frame_list]
 
             pred_seg, softmax_pred, flow_pred, registered_pred = self._internal_predict_2D_2Dconv_tiled_flow(
-                unlabeled[:, :, :, depth_idx], target_mask, padding_mask, target[:, :, depth_idx], processor, step_size, do_mirroring, mirror_axes, patch_size, regions_class_order, use_gaussian,
+                unlabeled[:, :, depth_idx], target[:, :, depth_idx], processor, step_size, do_mirroring, mirror_axes, patch_size, regions_class_order, use_gaussian,
                 pad_border_mode, pad_kwargs, all_in_gpu, verbose)
 
             predicted_segmentation.append(pred_seg[None])
@@ -669,14 +679,14 @@ class OpticalFlowModel4(SegmentationNetwork):
         return predicted_segmentation, softmax_pred, flow_pred, registered_pred
 
 
-    def _internal_predict_2D_2Dconv_tiled_flow(self, unlabeled, target_mask, padding_mask, target, processor, step_size: float, do_mirroring: bool, mirror_axes: tuple,
+    def _internal_predict_2D_2Dconv_tiled_flow(self, unlabeled, target, processor, step_size: float, do_mirroring: bool, mirror_axes: tuple,
                                           patch_size: tuple, regions_class_order: tuple, use_gaussian: bool,
                                           pad_border_mode: str, pad_kwargs: dict, all_in_gpu: bool,
                                           verbose: bool) -> Tuple[np.ndarray, np.ndarray]:
         # unlabeled = P, T1, 1, H, W
         # target = T2, 1, H, W
         # better safe than sorry
-        assert len(unlabeled[0, 0].shape) == 3, "x must be (c, x, y)"
+        assert len(unlabeled[0].shape) == 3, "x must be (c, x, y)"
 
         if verbose: print("step_size:", step_size)
         if verbose: print("do mirror:", do_mirroring)
@@ -720,12 +730,9 @@ class OpticalFlowModel4(SegmentationNetwork):
         #else:
         #    gaussian_importance_map = None
 
-        nb_frames = len(padding_mask[padding_mask])
+        nb_frames = len(unlabeled)
 
         if all_in_gpu:
-            and_mask = torch.logical_and(padding_mask, target_mask)
-            indices = torch.nonzero(and_mask) # 2, 1
-            nb_registered_frame = indices[1] - indices[0]
             # If we run the inference in GPU only (meaning all tensors are allocated on the GPU, this reduces
             # CPU-GPU communication but required more GPU memory) we need to preallocate a few things on GPU
 
@@ -743,37 +750,28 @@ class OpticalFlowModel4(SegmentationNetwork):
             #    add_for_nb_of_preds = torch.ones(patch_size, device=self.get_device())
 
             if verbose: print("initializing result array (on GPU)")
-            aggregated_results_seg = torch.zeros([nb_frames, self.num_classes] + list(unlabeled_data.shape[3:]), dtype=torch.half,
+            aggregated_results_seg = torch.zeros([nb_frames, self.num_classes] + list(unlabeled_data.shape[2:]), dtype=torch.half,
                                              device=self.get_device())
-            aggregated_results_flow = torch.zeros([nb_frames, 2] + list(unlabeled_data.shape[3:]), dtype=torch.half,
+            aggregated_results_flow = torch.zeros([nb_frames, 2] + list(unlabeled_data.shape[2:]), dtype=torch.half,
                                              device=self.get_device())
-            aggregated_results_registered = torch.zeros([nb_registered_frame, 1] + list(unlabeled_data.shape[3:]), dtype=torch.half,
+            aggregated_results_registered = torch.zeros([nb_frames, 1] + list(unlabeled_data.shape[2:]), dtype=torch.half,
                                              device=self.get_device())
 
             if verbose: print("moving data to GPU")
             unlabeled_data = torch.from_numpy(unlabeled_data).cuda(self.get_device(), non_blocking=True)
             target_data = torch.from_numpy(target_data).cuda(self.get_device(), non_blocking=True)
-            target_mask = torch.from_numpy(target_mask).cuda(self.get_device(), non_blocking=True)
-            padding_mask = torch.from_numpy(padding_mask).cuda(self.get_device(), non_blocking=True)
 
             #if verbose: print("initializing result_numsamples (on GPU)")
             #aggregated_nb_of_predictions_seg = torch.zeros([nb_frames, self.num_classes] + list(unlabeled_data.shape[2:]), dtype=torch.half,
             #                                           device=self.get_device())
         else:
-            target_mask = torch.from_numpy(target_mask)
-            padding_mask = torch.from_numpy(padding_mask)
-
-            and_mask = torch.logical_and(padding_mask, target_mask)
-            indices = torch.nonzero(and_mask) # 2, 1
-            nb_registered_frame = indices[1] - indices[0]
-
             #if use_gaussian and num_tiles > 1:
             #    add_for_nb_of_preds = self._gaussian_2d
             #else:
             #    add_for_nb_of_preds = np.ones(patch_size, dtype=np.float32)
-            aggregated_results_seg = np.zeros([nb_frames, self.num_classes] + list(unlabeled_data.shape[3:]), dtype=np.float32)
-            aggregated_results_flow = np.zeros([nb_frames, 2] + list(unlabeled_data.shape[3:]), dtype=np.float32)
-            aggregated_results_registered = np.zeros([nb_registered_frame, 1] + list(unlabeled_data.shape[3:]), dtype=np.float32)
+            aggregated_results_seg = np.zeros([nb_frames, self.num_classes] + list(unlabeled_data.shape[2:]), dtype=np.float32)
+            aggregated_results_flow = np.zeros([nb_frames, 2] + list(unlabeled_data.shape[2:]), dtype=np.float32)
+            aggregated_results_registered = np.zeros([nb_frames, 1] + list(unlabeled_data.shape[2:]), dtype=np.float32)
             #aggregated_nb_of_predictions_seg = np.zeros([nb_frames, self.num_classes] + list(unlabeled_data.shape[2:]), dtype=np.float32)
 
         H, W = unlabeled_data.shape[-2:]
@@ -782,25 +780,7 @@ class OpticalFlowModel4(SegmentationNetwork):
         x1 = int((W / 2) - (patch_size[1] / 2))
         x2 = int((W / 2) + (patch_size[1] / 2))
 
-        seg_list = []
-        flow_list = []
-        for i in range(len(unlabeled_data)):
-            seg, flow, target, padding_need = self._internal_maybe_mirror_and_pred_2D(unlabeled_data[i, :, None, :, y1:y2, x1:x2], target_data[:, None, :, y1:y2, x1:x2], processor, mirror_axes, do_mirroring)
-            if self.inference_mode == 'sliding_window':
-                idx = len(seg) // 2
-                seg = seg[idx][None]
-                flow = flow[idx][None]
-            elif i > 0:
-                seg = seg[1:]
-                flow = flow[1:]
-            seg_list.append(seg)
-            flow_list.append(flow)
-
-        seg = torch.cat(seg_list, axis=0) # T, B(1), 4, H, W
-        flow = torch.cat(flow_list, axis=0) # T, B(1), 2, H, W
-        assert len(seg) == len(padding_mask)
-        seg = seg[padding_mask]
-        flow = flow[padding_mask]
+        seg, flow, target, padding_need = self._internal_maybe_mirror_and_pred_2D(unlabeled_data[:, None, :, y1:y2, x1:x2], target_data[:, None, :, y1:y2, x1:x2], processor, mirror_axes, do_mirroring)
 
         assert nb_frames == len(seg) == len(flow)
 
@@ -815,21 +795,19 @@ class OpticalFlowModel4(SegmentationNetwork):
         #plt.waitforbuttonpress()
         #plt.close(fig)
 
-        and_mask = torch.logical_and(padding_mask, target_mask)
-        indices = torch.nonzero(and_mask) # 2, 1
-
         #print(target.shape)
         #matplotlib.use('QtAgg')
         #fig, ax = plt.subplots(1, 2)
         #ax[0].imshow(target[indices[0].item(), 0, 0].cpu(), cmap='gray')
         #ax[1].imshow(target[indices[1].item(), 0, 0].cpu(), cmap='gray')
         #plt.show()
-        if self.one_to_all:
-            all_motions = self.warp_linear_one_to_all(flow, indices, target)
-        else:
-            all_motions = self.warp_linear_sequential(flow, indices, target)
 
-        assert len(all_motions) == nb_registered_frame
+        if self.only_first or self.video_length == 2:
+            all_motions = self.warp_linear_all_to_all(flow, target)
+        else:
+            all_motions = self.warp_linear_all_to_all_alt(seg, flow, target)
+
+        assert len(all_motions) == nb_frames
         #for t in range(indices[1].item(), indices[0].item(), -1):
         #    current_motion = self.motion_estimation(flow=flow[t], original=current_motion, mode='nearest')
 
@@ -968,12 +946,46 @@ class OpticalFlowModel4(SegmentationNetwork):
         return current_motion
     
 
-    def warp_linear_one_to_all(self, flow, indices, target):
-        current_motion = target[indices[0].item()]
+    def warp_linear_all_to_all(self, flow, target):
+        current_motion = target[0]
         current_motion = torch.nn.functional.one_hot(current_motion[:, 0].long(), num_classes=4).permute(0, 3, 1, 2).contiguous().float()
         current_motion = to_cuda(current_motion, gpu_id=self.get_device())
         registered_list = []
-        for t in range(indices[0].item() + 1, indices[1].item() + 1):
+        #for t in range(0 + 1, indices[1].item() + 1):
+        for t in range(len(target)):
+            if t == 0:
+                incremental_flow = flow[t]
+            else:
+                flow_difference = flow[t] - flow[0]
+                incremental_flow = self.motion_estimation(flow=flow[0], original=flow_difference, mode='bilinear')
+            registered = self.motion_estimation(flow=incremental_flow, original=current_motion, mode='bilinear')
+            registered_list.append(torch.argmax(registered, dim=1, keepdim=True))
+        registered_list = torch.stack(registered_list, dim=0)
+        return registered_list
+    
+    def warp_linear_all_to_all_alt(self, seg, flow, target):
+        registered_list = []
+        for t in range(len(target)):
+            if t == 0:
+                incremental_flow = flow[t]
+                original = seg[t]
+            else:
+                flow_difference = flow[t] - flow[t - 1]
+                original = seg[t - 1]
+                incremental_flow = self.motion_estimation(flow=flow[t - 1], original=flow_difference, mode='bilinear')
+            registered = self.motion_estimation(flow=incremental_flow, original=original, mode='bilinear')
+            registered_list.append(torch.argmax(registered, dim=1, keepdim=True))
+        registered_list = torch.stack(registered_list, dim=0)
+        return registered_list
+        
+    
+    def warp_linear_one_to_all(self, flow, target):
+        current_motion = target[0]
+        current_motion = torch.nn.functional.one_hot(current_motion[:, 0].long(), num_classes=4).permute(0, 3, 1, 2).contiguous().float()
+        current_motion = to_cuda(current_motion, gpu_id=self.get_device())
+        registered_list = []
+        #for t in range(0 + 1, indices[1].item() + 1):
+        for t in range(len(target)):
             registered = self.motion_estimation(flow=flow[t], original=current_motion, mode='bilinear')
             registered_list.append(torch.argmax(registered, dim=1, keepdim=True))
         registered_list = torch.stack(registered_list, dim=0)

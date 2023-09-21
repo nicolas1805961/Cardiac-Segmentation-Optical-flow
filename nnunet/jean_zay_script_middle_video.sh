@@ -33,4 +33,17 @@ export RESULTS_FOLDER="out/nnUNet_trained_models"
 #python run/run_training.py 2d nnMTLTrainerV2Video Task027_ACDC 0 -p custom_experiment_planner --deterministic
 #python run/run_training.py 2d nnMTLTrainerV2Flow Task031_ACDC 0 -p custom_experiment_planner --deterministic
 #python run/run_training.py 2d nnMTLTrainerV2Flow4 Task031_ACDC 0 -p custom_experiment_planner --deterministic
-python run/run_training.py 2d nnMTLTrainerV2Flow5 Task031_ACDC 0 -p custom_experiment_planner --deterministic
+#python run/run_training.py 2d nnMTLTrainerV2Flow5 Task031_ACDC 0 -p custom_experiment_planner --deterministic
+#python run/run_training.py 2d nnMTLTrainerV2Flow6 Task031_ACDC 0 -p custom_experiment_planner --deterministic
+#python run/run_training.py 2d nnMTLTrainerV2FlowLabeled Task031_ACDC 0 -p custom_experiment_planner --deterministic
+#python run/run_training.py 2d nnMTLTrainerV2FlowPrediction Task031_ACDC 0 -p custom_experiment_planner --deterministic
+#python run/run_training.py 2d nnMTLTrainerV2StableDiffusion Task031_ACDC 0 -p custom_experiment_planner --deterministic
+#python run/run_training.py 2d nnMTLTrainerV2ControlNet Task031_ACDC 0 -p custom_experiment_planner --deterministic
+#python run/run_training.py 2d nnMTLTrainerV2FlowRecursive Task031_ACDC 0 -p custom_experiment_planner --deterministic
+#python run/run_training.py 2d nnMTLTrainerV2FlowRecursiveVideo Task031_ACDC 0 -p custom_experiment_planner --deterministic
+#python run/run_training.py 2d nnMTLTrainerV2FlowLib Task032_Lib 0 -p custom_experiment_planner --deterministic
+#python run/run_training.py 2d nnMTLTrainerV2FlowLib Task032_Lib 0 -p custom_experiment_planner --deterministic -val -w out/nnUNet_trained_models/nnUNet/2d/Task032_Lib/nnMTLTrainerV2FlowLib__custom_experiment_planner/fold_0/
+#python run/run_training.py 2d nnMTLTrainerV2FlowSimple Task031_ACDC 0 -p custom_experiment_planner --deterministic
+#python run/run_training.py 2d nnMTLTrainerV2FlowSimple Task032_Lib 0 -p custom_experiment_planner --deterministic -val -w out/nnUNet_trained_models/nnUNet/2d/Task031_ACDC/nnMTLTrainerV2FlowSimple__custom_experiment_planner/fold_0/2023-09-19_19H40/
+#python run/run_training.py 2d nnMTLTrainerV2FlowSimple Task032_Lib 0 -p custom_experiment_planner --deterministic
+python run/run_training.py 2d nnMTLTrainerV2FlowRecursiveVideo Task032_Lib 0 -p custom_experiment_planner --deterministic

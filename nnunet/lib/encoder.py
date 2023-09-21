@@ -5,7 +5,7 @@ import torch.nn as nn
 from timm.models.layers import trunc_normal_
 from mmcv.runner import load_checkpoint
 #import swin_transformer_3d
-from .utils import ConvBlocks, get_root_logger, CCA, ConvLayer3D, PatchMergingConv3D, PatchMergingSwin3D, PatchMerging, ResnetConvLayer
+from .utils import ConvBlocks2D, ConvBlocks3DPos, ConvBlocksLegacy, PatchMerging2D, ConvBlocks3D, PatchMerging3D2D, ConvBlocks3D2D, PatchMerging3D, get_root_logger, CCA, ConvLayer3D, PatchMergingLegacy, ResnetConvLayer
 from einops import rearrange
 from .swin_transformer_2 import BasicLayer
 #from vit_transformer import TransformerEncoderLayer, VitBasicLayer
@@ -389,7 +389,7 @@ class Encoder(nn.Module):
         self.downsample_layers = nn.ModuleList()
         for i_layer in range(self.num_stages):
             out_dim = 2*out_dims[i_layer] if i_layer == self.num_stages - 1 else in_dims[i_layer+1]
-            layer = conv_layer(in_dim=in_dims[i_layer],
+            layer = ConvBlocksLegacy(in_dim=in_dims[i_layer],
                                 kernel_size=3,
                                 out_dim=out_dims[i_layer],
                                 nb_blocks=conv_depth[i_layer], 
@@ -397,7 +397,85 @@ class Encoder(nn.Module):
                                 norm=norm)
                 #layer = ConvBlocks(in_dim=in_dims[i_layer], out_dim=out_dims[i_layer], nb_block=conv_depth[i_layer])
                                 
-            downsample_layer = PatchMerging(norm=norm, in_dim=out_dims[i_layer], out_dim=out_dim, device=device)
+            downsample_layer = PatchMergingLegacy(norm=norm, in_dim=out_dims[i_layer], out_dim=out_dim, device=device)
+            self.layers.append(layer)
+            self.downsample_layers.append(downsample_layer)
+
+        #self.norm = norm_layer(self.num_features)
+        #self.norm_after_conv = norm_layer(embed_dim)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    @torch.jit.ignore
+    def no_weight_decay(self):
+        return {'absolute_pos_embed'}
+
+    @torch.jit.ignore
+    def no_weight_decay_keywords(self):
+        return {'relative_position_bias_table'}
+
+    def forward(self, x):
+        skip_connections = []
+
+        for layer, downsample_layer in zip(self.layers, self.downsample_layers):
+            x = layer(x)
+            skip_connections.append(x)
+            x = downsample_layer(x)
+        
+        return x, skip_connections
+
+
+
+class Encoder2D(nn.Module):
+    r""" Swin Transformer
+        A PyTorch impl of : `Swin Transformer: Hierarchical Vision Transformer using Shifted Windows`  -
+          https://arxiv.org/pdf/2103.14030
+
+    Args:
+        img_size (int | tuple(int)): Input image size. Default 224
+        patch_size (int | tuple(int)): Patch size. Default: 4
+        in_chans (int): Number of input image channels. Default: 3
+        num_classes (int): Number of classes for classification head. Default: 1000
+        embed_dim (int): Patch embedding dimension. Default: 96
+        depths (tuple(int)): Depth of each Swin Transformer layer.
+        num_heads (tuple(int)): Number of attention heads in different layers.
+        window_size (int): Window size. Default: 7
+        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim. Default: 4
+        qkv_bias (bool): If True, add a learnable bias to query, key, value. Default: True
+        qk_scale (float): Override default qk scale of head_dim ** -0.5 if set. Default: None
+        drop_rate (float): Dropout rate. Default: 0
+        attn_drop_rate (float): Attention dropout rate. Default: 0
+        drop_path_rate (float): Stochastic depth rate. Default: 0.1
+        norm_layer (nn.Module): Normalization layer. Default: nn.LayerNorm.
+        ape (bool): If True, add absolute position embedding to the patch embedding. Default: False
+        patch_norm (bool): If True, add normalization after patch embedding. Default: True
+        use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False
+    """
+
+    def __init__(self, conv_depth, in_dims, out_dims):
+        super().__init__()
+
+        self.num_stages = len(conv_depth)
+
+        # build encoder layers
+        self.layers = nn.ModuleList()
+        self.downsample_layers = nn.ModuleList()
+        for i_layer in range(self.num_stages):
+            out_dim = 2*out_dims[i_layer] if i_layer == self.num_stages - 1 else in_dims[i_layer+1]
+            layer = ConvBlocks2D(in_dim=in_dims[i_layer],
+                                kernel_size=3,
+                                out_dim=out_dims[i_layer],
+                                nb_blocks=conv_depth[i_layer])
+                #layer = ConvBlocks(in_dim=in_dims[i_layer], out_dim=out_dims[i_layer], nb_block=conv_depth[i_layer])
+                                
+            downsample_layer = PatchMerging2D(in_dim=out_dims[i_layer], out_dim=out_dim)
             self.layers.append(layer)
             self.downsample_layers.append(downsample_layer)
 
@@ -431,6 +509,241 @@ class Encoder(nn.Module):
         
         return x, skip_connections
     
+
+class Encoder3DPos(nn.Module):
+    r""" Swin Transformer
+        A PyTorch impl of : `Swin Transformer: Hierarchical Vision Transformer using Shifted Windows`  -
+          https://arxiv.org/pdf/2103.14030
+
+    Args:
+        img_size (int | tuple(int)): Input image size. Default 224
+        patch_size (int | tuple(int)): Patch size. Default: 4
+        in_chans (int): Number of input image channels. Default: 3
+        num_classes (int): Number of classes for classification head. Default: 1000
+        embed_dim (int): Patch embedding dimension. Default: 96
+        depths (tuple(int)): Depth of each Swin Transformer layer.
+        num_heads (tuple(int)): Number of attention heads in different layers.
+        window_size (int): Window size. Default: 7
+        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim. Default: 4
+        qkv_bias (bool): If True, add a learnable bias to query, key, value. Default: True
+        qk_scale (float): Override default qk scale of head_dim ** -0.5 if set. Default: None
+        drop_rate (float): Dropout rate. Default: 0
+        attn_drop_rate (float): Attention dropout rate. Default: 0
+        drop_path_rate (float): Stochastic depth rate. Default: 0.1
+        norm_layer (nn.Module): Normalization layer. Default: nn.LayerNorm.
+        ape (bool): If True, add absolute position embedding to the patch embedding. Default: False
+        patch_norm (bool): If True, add normalization after patch embedding. Default: True
+        use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False
+    """
+
+    def __init__(self, conv_depth, in_dims, out_dims, embedding_dim):
+        super().__init__()
+
+        self.num_stages = len(conv_depth)
+
+        # build encoder layers
+        self.layers = nn.ModuleList()
+        self.downsample_layers = nn.ModuleList()
+        for i_layer in range(self.num_stages):
+            out_dim = 2*out_dims[i_layer] if i_layer == self.num_stages - 1 else in_dims[i_layer+1]
+            layer = ConvBlocks3DPos(in_dim=in_dims[i_layer],
+                                kernel_size=3,
+                                out_dim=out_dims[i_layer],
+                                nb_blocks=conv_depth[i_layer],
+                                embedding_dim=embedding_dim)
+                #layer = ConvBlocks(in_dim=in_dims[i_layer], out_dim=out_dims[i_layer], nb_block=conv_depth[i_layer])
+                                
+            downsample_layer = PatchMerging3D(in_dim=out_dims[i_layer], out_dim=out_dim)
+            self.layers.append(layer)
+            self.downsample_layers.append(downsample_layer)
+
+        #self.norm = norm_layer(self.num_features)
+        #self.norm_after_conv = norm_layer(embed_dim)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    @torch.jit.ignore
+    def no_weight_decay(self):
+        return {'absolute_pos_embed'}
+
+    @torch.jit.ignore
+    def no_weight_decay_keywords(self):
+        return {'relative_position_bias_table'}
+
+    def forward(self, x, embedding):
+        skip_connections = []
+
+        for layer, downsample_layer in zip(self.layers, self.downsample_layers):
+            x = layer(x, embedding)
+            skip_connections.append(x)
+            x = downsample_layer(x)
+        
+        return x, skip_connections
+    
+
+
+
+class Encoder3D(nn.Module):
+    r""" Swin Transformer
+        A PyTorch impl of : `Swin Transformer: Hierarchical Vision Transformer using Shifted Windows`  -
+          https://arxiv.org/pdf/2103.14030
+
+    Args:
+        img_size (int | tuple(int)): Input image size. Default 224
+        patch_size (int | tuple(int)): Patch size. Default: 4
+        in_chans (int): Number of input image channels. Default: 3
+        num_classes (int): Number of classes for classification head. Default: 1000
+        embed_dim (int): Patch embedding dimension. Default: 96
+        depths (tuple(int)): Depth of each Swin Transformer layer.
+        num_heads (tuple(int)): Number of attention heads in different layers.
+        window_size (int): Window size. Default: 7
+        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim. Default: 4
+        qkv_bias (bool): If True, add a learnable bias to query, key, value. Default: True
+        qk_scale (float): Override default qk scale of head_dim ** -0.5 if set. Default: None
+        drop_rate (float): Dropout rate. Default: 0
+        attn_drop_rate (float): Attention dropout rate. Default: 0
+        drop_path_rate (float): Stochastic depth rate. Default: 0.1
+        norm_layer (nn.Module): Normalization layer. Default: nn.LayerNorm.
+        ape (bool): If True, add absolute position embedding to the patch embedding. Default: False
+        patch_norm (bool): If True, add normalization after patch embedding. Default: True
+        use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False
+    """
+
+    def __init__(self, conv_depth, in_dims, out_dims):
+        super().__init__()
+
+        self.num_stages = len(conv_depth)
+
+        # build encoder layers
+        self.layers = nn.ModuleList()
+        self.downsample_layers = nn.ModuleList()
+        for i_layer in range(self.num_stages):
+            out_dim = 2*out_dims[i_layer] if i_layer == self.num_stages - 1 else in_dims[i_layer+1]
+            layer = ConvBlocks3D(in_dim=in_dims[i_layer],
+                                kernel_size=3,
+                                out_dim=out_dims[i_layer],
+                                nb_blocks=conv_depth[i_layer])
+                #layer = ConvBlocks(in_dim=in_dims[i_layer], out_dim=out_dims[i_layer], nb_block=conv_depth[i_layer])
+                                
+            downsample_layer = PatchMerging3D(in_dim=out_dims[i_layer], out_dim=out_dim)
+            self.layers.append(layer)
+            self.downsample_layers.append(downsample_layer)
+
+        #self.norm = norm_layer(self.num_features)
+        #self.norm_after_conv = norm_layer(embed_dim)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    @torch.jit.ignore
+    def no_weight_decay(self):
+        return {'absolute_pos_embed'}
+
+    @torch.jit.ignore
+    def no_weight_decay_keywords(self):
+        return {'relative_position_bias_table'}
+
+    def forward(self, x):
+        skip_connections = []
+
+        for layer, downsample_layer in zip(self.layers, self.downsample_layers):
+            x = layer(x)
+            skip_connections.append(x)
+            x = downsample_layer(x)
+        
+        return x, skip_connections
+    
+
+
+class Encoder3D2D(nn.Module):
+    r""" Swin Transformer
+        A PyTorch impl of : `Swin Transformer: Hierarchical Vision Transformer using Shifted Windows`  -
+          https://arxiv.org/pdf/2103.14030
+
+    Args:
+        img_size (int | tuple(int)): Input image size. Default 224
+        patch_size (int | tuple(int)): Patch size. Default: 4
+        in_chans (int): Number of input image channels. Default: 3
+        num_classes (int): Number of classes for classification head. Default: 1000
+        embed_dim (int): Patch embedding dimension. Default: 96
+        depths (tuple(int)): Depth of each Swin Transformer layer.
+        num_heads (tuple(int)): Number of attention heads in different layers.
+        window_size (int): Window size. Default: 7
+        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim. Default: 4
+        qkv_bias (bool): If True, add a learnable bias to query, key, value. Default: True
+        qk_scale (float): Override default qk scale of head_dim ** -0.5 if set. Default: None
+        drop_rate (float): Dropout rate. Default: 0
+        attn_drop_rate (float): Attention dropout rate. Default: 0
+        drop_path_rate (float): Stochastic depth rate. Default: 0.1
+        norm_layer (nn.Module): Normalization layer. Default: nn.LayerNorm.
+        ape (bool): If True, add absolute position embedding to the patch embedding. Default: False
+        patch_norm (bool): If True, add normalization after patch embedding. Default: True
+        use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False
+    """
+
+    def __init__(self, conv_depth, dpr, in_dims, out_dims):
+        super().__init__()
+
+        self.num_stages = len(conv_depth)
+
+        # build encoder layers
+        self.layers = nn.ModuleList()
+        self.downsample_layers = nn.ModuleList()
+        for i_layer in range(self.num_stages):
+            out_dim = 2*out_dims[i_layer] if i_layer == self.num_stages - 1 else in_dims[i_layer+1]
+            layer = ConvBlocks3D2D(in_dim=in_dims[i_layer],
+                                        kernel_size=3,
+                                        out_dim=out_dims[i_layer],
+                                        nb_blocks=conv_depth[i_layer], 
+                                        dpr=dpr[i_layer])
+                #layer = ConvBlocks(in_dim=in_dims[i_layer], out_dim=out_dims[i_layer], nb_block=conv_depth[i_layer])
+                                
+            downsample_layer = PatchMerging3D2D(in_dim=out_dims[i_layer], out_dim=out_dim)
+            self.layers.append(layer)
+            self.downsample_layers.append(downsample_layer)
+
+        #self.norm = norm_layer(self.num_features)
+        #self.norm_after_conv = norm_layer(embed_dim)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    @torch.jit.ignore
+    def no_weight_decay(self):
+        return {'absolute_pos_embed'}
+
+    @torch.jit.ignore
+    def no_weight_decay_keywords(self):
+        return {'relative_position_bias_table'}
+
+    def forward(self, x_3d, x_2d):
+        skip_connections = []
+
+        for layer, downsample_layer in zip(self.layers, self.downsample_layers):
+            x_3d, x_2d = layer(x_3d, x_2d)
+            skip_connections.append(x_3d)
+            x_3d, x_2d = downsample_layer(x_3d, x_2d)
+        
+        return x_3d, skip_connections
 
 
 class Encoder1D(nn.Module):
@@ -496,111 +809,7 @@ class Encoder1D(nn.Module):
         
         return x
     
-
-class Encoder3D(nn.Module):
-    r""" Swin Transformer
-        A PyTorch impl of : `Swin Transformer: Hierarchical Vision Transformer using Shifted Windows`  -
-          https://arxiv.org/pdf/2103.14030
-
-    Args:
-        img_size (int | tuple(int)): Input image size. Default 224
-        patch_size (int | tuple(int)): Patch size. Default: 4
-        in_chans (int): Number of input image channels. Default: 3
-        num_classes (int): Number of classes for classification head. Default: 1000
-        embed_dim (int): Patch embedding dimension. Default: 96
-        depths (tuple(int)): Depth of each Swin Transformer layer.
-        num_heads (tuple(int)): Number of attention heads in different layers.
-        window_size (int): Window size. Default: 7
-        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim. Default: 4
-        qkv_bias (bool): If True, add a learnable bias to query, key, value. Default: True
-        qk_scale (float): Override default qk scale of head_dim ** -0.5 if set. Default: None
-        drop_rate (float): Dropout rate. Default: 0
-        attn_drop_rate (float): Attention dropout rate. Default: 0
-        drop_path_rate (float): Stochastic depth rate. Default: 0.1
-        norm_layer (nn.Module): Normalization layer. Default: nn.LayerNorm.
-        ape (bool): If True, add absolute position embedding to the patch embedding. Default: False
-        patch_norm (bool): If True, add normalization after patch embedding. Default: True
-        use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False
-    """
-
-    def __init__(self, blur, proj_qkv, shortcut, logits, use_conv_mlp, conv_depth, transformer_depth, num_heads, blur_kernel, device, dpr, in_dims, out_dims, swin_abs_pos, window_size, img_size, rpe_mode=None, rpe_contextual_tensor='qkv',
-                 mlp_ratio=4., qkv_bias=True, qk_scale=None,
-                 drop_rate=0., attn_drop_rate=0.,
-                 norm_layer=nn.LayerNorm,
-                 use_checkpoint=False, **kwargs):
-        super().__init__()
-
-        self.num_stages = len(conv_depth) + len(transformer_depth)
-        self.mlp_ratio = mlp_ratio
-
-        self.pos_drop = nn.Dropout(p=drop_rate)
-
-        # build encoder layers
-        self.layers = nn.ModuleList()
-        self.downsample_layers = nn.ModuleList()
-        
-        for i_layer in range(self.num_stages):
-            input_resolution=(window_size[0], img_size//(2**i_layer), img_size//(2**i_layer))
-            if i_layer < len(conv_depth):
-                layer = ConvLayer3D(in_dim=in_dims[i_layer], out_dim=out_dims[i_layer], nb_blocks=conv_depth[i_layer], dpr=dpr[i_layer])
-                downsample_layer = PatchMergingConv3D(blur=blur, blur_kernel=blur_kernel, in_dim=out_dims[i_layer], out_dim=in_dims[i_layer+1], swin_abs_pos=swin_abs_pos if i_layer == len(conv_depth) - 1 else False, device=device)
-            else:
-                stride = (2, 2, 2) if logits and i_layer == self.num_stages - 1 else (1, 2, 2)
-                downsample_layer = PatchMergingSwin3D(blur=blur, blur_kernel=blur_kernel, in_dim=out_dims[i_layer], out_dim=2*out_dims[i_layer] if i_layer == self.num_stages - 1 else in_dims[i_layer+1], swin_abs_pos=swin_abs_pos, device=device, stride=stride)
-                #downsample_layer = PatchMergingConv(input_resolution=input_resolution, in_dim=in_dim, out_dim=2*in_dim)
-                transformer_index = i_layer-len(conv_depth)
-                layer = swin_transformer_3d.BasicLayer(dim=in_dims[i_layer],
-                                                        proj_qkv=proj_qkv,
-                                                        use_conv_mlp=use_conv_mlp,
-                                                        resolution=input_resolution,
-                                                        depth=transformer_depth[transformer_index],
-                                                        num_heads=num_heads[transformer_index],
-                                                        window_size=window_size,
-                                                        mlp_ratio=self.mlp_ratio,
-                                                        qkv_bias=qkv_bias, 
-                                                        qk_scale=qk_scale,
-                                                        drop=drop_rate, 
-                                                        attn_drop=attn_drop_rate,
-                                                        drop_path=dpr[i_layer],
-                                                        norm_layer=norm_layer,
-                                                        use_checkpoint=use_checkpoint)
-  
-            self.layers.append(layer)
-            self.downsample_layers.append(downsample_layer)
-
-        #self.norm = norm_layer(self.num_features)
-        #self.norm_after_conv = norm_layer(embed_dim)
-
-        self.apply(self._init_weights)
-
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            trunc_normal_(m.weight, std=.02)
-            if isinstance(m, nn.Linear) and m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
-
-    @torch.jit.ignore
-    def no_weight_decay(self):
-        return {'absolute_pos_embed'}
-
-    @torch.jit.ignore
-    def no_weight_decay_keywords(self):
-        return {'relative_position_bias_table'}
-
-    def forward(self, x):
-        skip_connections = []
-
-        for layer, downsample_layer in zip(self.layers, self.downsample_layers):
-            x = layer(x)
-            skip_connections.append(x)
-            x = downsample_layer(x)
-        
-        return x, skip_connections
-
-
+    
 
 class ReconstructionEncoder(nn.Module):
     r""" Swin Transformer
