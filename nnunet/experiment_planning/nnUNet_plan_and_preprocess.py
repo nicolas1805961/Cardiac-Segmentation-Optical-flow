@@ -16,7 +16,7 @@
 import nnunet
 from batchgenerators.utilities.file_and_folder_operations import *
 from nnunet.experiment_planning.DatasetAnalyzer import DatasetAnalyzer
-from nnunet.experiment_planning.utils import crop
+from nnunet.experiment_planning.utils import crop, crop_unlabeled
 from nnunet.paths import *
 import shutil
 from nnunet.utilities.task_name_id_conversion import convert_id_to_task_name
@@ -105,6 +105,8 @@ def main():
             verify_dataset_integrity(join(nnUNet_raw_data, task_name))
 
         crop(task_name, False, tf)
+        if '27' in task_name or '31' in task_name or '33' in task_name:
+            crop_unlabeled(task_name, False, tf)
 
         tasks.append(task_name)
 
@@ -168,4 +170,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

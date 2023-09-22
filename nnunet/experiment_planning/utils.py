@@ -149,6 +149,7 @@ def create_lists_from_splitted_dataset(base_folder_splitted):
 
 def create_lists_from_splitted_dataset_unlabeled(base_folder_splitted):
     lists = []
+    info_list = []
 
     json_file = join(base_folder_splitted, "dataset.json")
     with open(json_file) as jsn:
@@ -156,17 +157,15 @@ def create_lists_from_splitted_dataset_unlabeled(base_folder_splitted):
         training_files = d['unlabeled']
     num_modalities = len(d['modality'].keys())
 
-    info_list = []
     patient_name_list = []
     for tr in training_files:
         patient_name = ntpath.basename(tr['image']).split('_')[0]
         if patient_name not in patient_name_list:
             patient_name_list.append(patient_name)
-            info_list.append(tr)
-    assert len(info_list) == len(patient_name_list)
 
     for patient_name in patient_name_list:
         patient_list = []
+        patient_info_list = []
         for tr in training_files:
             current_patient_name = ntpath.basename(tr['image']).split('_')[0]
             if current_patient_name == patient_name:
@@ -175,7 +174,9 @@ def create_lists_from_splitted_dataset_unlabeled(base_folder_splitted):
                     cur_pat.append(join(base_folder_splitted, "imagesTr", tr['image'].split("/")[-1][:-7] +
                                         "_%04.0d.nii.gz" % mod))
                 patient_list.append(cur_pat)
+                patient_info_list.append(tr)
         lists.append(patient_list)
+        info_list.append(patient_info_list)
 
     assert len(lists) == len(info_list)
     return lists, {int(i): d['modality'][str(i)] for i in d['modality'].keys()}, info_list

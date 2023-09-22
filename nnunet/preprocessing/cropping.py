@@ -247,7 +247,7 @@ class ImageCropper(object):
             current_info_dict = info_dict[i]
             print(current_case_identifier)
                 
-            data, seg, properties = self.crop_from_list_of_files(current_case[:-1], current_case[-1], current_info_dict)
+            data, seg, properties = self.crop_from_list_of_files(current_case, None, current_info_dict)
             data_list.append(data)
             property_list.append(properties)
 
@@ -329,7 +329,7 @@ class ImageCropper(object):
         p.close()
         p.join()
     
-    def run_cropping_unlabeled(self, list_of_files, overwrite_existing=False, output_folder=None):
+    def run_cropping_unlabeled(self, list_of_files, overwrite_existing=False, output_folder=None, info_list=None):
         """
         also copied ground truth nifti segmentation into the preprocessed folder so that we can use them for evaluation
         on the cluster
@@ -342,12 +342,12 @@ class ImageCropper(object):
             self.output_folder = output_folder
 
         list_of_args = []
-        for p in list_of_files:
+        for p, patient_info in zip(list_of_files, info_list):
             case_identifier_list = []
             for case in p:
                 case_identifier = get_case_identifier(case)
                 case_identifier_list.append(case_identifier)
-            list_of_args.append((p, case_identifier_list, overwrite_existing, info_list))
+            list_of_args.append((p, case_identifier_list, overwrite_existing, patient_info))
 
         #for j, case in enumerate(list_of_files):
         #    case_identifier = get_case_identifier(case)
@@ -358,6 +358,7 @@ class ImageCropper(object):
 
         p = Pool(self.num_threads)
         p.starmap(self.load_crop_save_unlabeled, list_of_args)
+        #p.starmap(self.load_crop_save_unlabeled, list_of_args)
         p.close()
         p.join()
 
