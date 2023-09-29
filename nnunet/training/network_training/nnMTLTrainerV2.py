@@ -99,7 +99,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
             self.config = config
         
         self.image_size = self.config['patch_size'][0]
-        self.window_size = 7 if self.image_size == 224 else 9 if self.image_size == 288 else None
+        self.window_size = 7 if self.image_size == 224 else 9 if self.image_size == 288 else 8 if self.image_size == 384 else None
 
         self.max_num_epochs = self.config['max_num_epochs']
         self.log_images = self.config['log_images']
@@ -109,7 +109,6 @@ class nnMTLTrainerV2(nnUNetTrainer):
         self.deep_supervision_scales = None
         self.ds_loss_weights = None
         self.use_progress_bar=True
-        self.middle_classification = self.config['middle_classification']
         self.directional_field = self.config['directional_field']
         self.reconstruction = self.config['reconstruction']
         self.separability = self.config['separability']
@@ -132,8 +131,6 @@ class nnMTLTrainerV2(nnUNetTrainer):
 
         self.val_loss = []
         self.train_loss = []
-        
-        loss_weights = torch.tensor(self.config['224_loss_weights'], device=self.config['device'])
 
         timestr = strftime("%Y-%m-%d_%HH%M")
         self.log_dir = os.path.join(copy(self.output_folder), timestr)
@@ -151,7 +148,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
             self.output_folder = output_folder
         
 
-        self.setup_loss_functions(loss_weights)
+        self.setup_loss_functions(loss_weights=0)
         
         self.pin_memory = True
         self.similarity_downscale = self.config['similarity_down_scale']
@@ -242,9 +239,6 @@ class nnMTLTrainerV2(nnUNetTrainer):
         if self.classification:
             loss_data['classification'] = [self.config['classification_weight'], float('nan')]
         
-        if self.middle_classification:
-            loss_data['middle_classification'] = [self.config['middle_classification_weight'], float('nan')]
-        
         if self.directional_field:
             loss_data['directional_field'] = [self.config['directional_field_weight'], float('nan')]
         return loss_data
@@ -265,9 +259,6 @@ class nnMTLTrainerV2(nnUNetTrainer):
         
         if self.classification:
             self.classification_loss = nn.CrossEntropyLoss()
-        
-        if self.middle_classification:
-            self.middle_classification_loss = nn.BCELoss()
         
         if self.directional_field:
             self.directional_field_loss = DirectionalFieldLoss(weights=loss_weights, writer=self.writer)
@@ -789,20 +780,6 @@ class nnMTLTrainerV2(nnUNetTrainer):
         if self.classification:
             self.print_to_log_file("Classification accuracy:", torch.tensor(self.classification_accuracy_list).mean().item())
             self.writer.add_scalar('Epoch/Classification accuracy', torch.tensor(self.classification_accuracy_list).mean().item(), self.epoch)
-
-        if self.middle:
-            #self.vis.log_pseudo_label_images(colormap_seg=cmap, norm=norm, epoch=self.epoch)
-            if self.registered_seg:
-                global_dc_per_class_forward_motion = self.get_dc_per_class('forward_motion')
-                global_dc_per_class_backward_motion = self.get_dc_per_class('backward_motion')
-                motion_dice = [(x1 + x2) / 2 for (x1, x2) in zip(global_dc_per_class_forward_motion, global_dc_per_class_backward_motion)]
-                data_dict = {'forward': torch.tensor(global_dc_per_class_forward_motion).mean().item(),
-                            'backward': torch.tensor(global_dc_per_class_backward_motion).mean().item()}
-                self.writer.add_scalars('Epoch/Motion estimation dice', data_dict, self.epoch)
-                self.print_to_log_file("Registered seg dice:", [np.round(i, 4) for i in motion_dice])
-                if self.log_images:
-                    self.vis.log_motion_images(colormap_seg=cmap, colormap=cm.plasma, norm=norm, epoch=self.epoch, name='forward_motion')
-                    self.vis.log_motion_images(colormap_seg=cmap, colormap=cm.plasma, norm=norm, epoch=self.epoch, name='backward_motion')
 
         #if self.reconstruction:
         #    self.print_to_log_file("Average reconstruction ssim:", torch.tensor(self.reconstruction_ssim_list).mean().item())

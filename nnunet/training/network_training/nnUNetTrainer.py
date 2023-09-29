@@ -28,7 +28,7 @@ from numpy.lib.stride_tricks import sliding_window_view
 from math import ceil
 from glob import glob
 import nibabel as nib
-from skimage.measure import perimeter
+
 
 
 import matplotlib
@@ -46,7 +46,7 @@ from nnunet.inference.segmentation_export import save_segmentation_nifti_from_so
 from nnunet.network_architecture.generic_UNet import Generic_UNet
 from nnunet.network_architecture.initialization import InitWeights_He
 from nnunet.network_architecture.neural_network import SegmentationNetwork
-from nnunet.postprocessing.connected_components import determine_postprocessing
+from nnunet.postprocessing.connected_components import determine_postprocessing, determine_postprocessing_no_metric
 from nnunet.training.data_augmentation.default_data_augmentation import default_3D_augmentation_params, \
     default_2D_augmentation_params, get_default_augmentation, get_patch_size
 from nnunet.training.dataloading.dataset_loading import load_dataset, DataLoader3D, DataLoader2D, unpack_dataset
@@ -104,36 +104,6 @@ def move_gt_files(input_file_path, output_dir):
         print("Could not copy gt nifti file %s into folder %s" % (input_file_path, output_dir))
         if e is not None:
             raise e
-
-
-def get_strain(target):
-    rv_perim_list = []
-    endo_perim_list = []
-    epi_perim_list = []
-    for t in range(len(target)):
-        current_arr = target[t]
-        binarized_rv = current_arr == 1
-        binarized_endo = current_arr == 3
-        binarized_epi = np.logical_or(current_arr == 2, binarized_endo)
-        perim_rv = perimeter(binarized_rv)
-        perim_endo = perimeter(binarized_endo)
-        perim_epi = perimeter(binarized_epi)
-        rv_perim_list.append(perim_rv)
-        endo_perim_list.append(perim_endo)
-        epi_perim_list.append(perim_epi)
-    
-    rv_strain = [(rv_perim_list[i] - rv_perim_list[0]) / (rv_perim_list[0] + 1e-8) for i in range(len(rv_perim_list))]
-    endo_strain = [(endo_perim_list[i] - endo_perim_list[0]) / (endo_perim_list[0] + 1e-8) for i in range(len(endo_perim_list))]
-    epi_strain = [(epi_perim_list[i] - epi_perim_list[0]) / (epi_perim_list[0] + 1e-8) for i in range(len(epi_perim_list))]
-
-    rv_strain = np.array(rv_strain)
-    endo_strain = np.array(endo_strain)
-    epi_strain = np.array(epi_strain)
-
-    lv_strain = (endo_strain + epi_strain) / 2
-
-    return rv_strain, lv_strain
-
 
 
 def save_strain_compute_metric(patient_name, all_files, gt_folder_name, search_path):
@@ -2852,23 +2822,23 @@ class nnUNetTrainer(NetworkTrainer):
         #save_json(strain_results, os.path.join(newpath_strain, 'summary.json'))
 
         # evaluate raw predictions
-        self.print_to_log_file("evaluation of raw predictions")
-        task = self.dataset_directory.split(os.sep)[-1]
-        job_name = self.experiment_name
-        _ = aggregate_scores(pred_gt_tuples_register, labels=list(range(self.num_classes)),
-                             json_output_file=join(newpath_registered, "summary.json"),
-                             json_name=job_name + " val tiled %s" % (str(use_sliding_window)),
-                             json_author="Fabian",
-                             json_task=task, num_threads=default_num_threads,
-                             advanced=True,
-                             metadata_list=metadata_list_registered)
-        _ = aggregate_scores(pred_gt_tuples, labels=list(range(self.num_classes)),
-                             json_output_file=join(newpath_seg, "summary.json"),
-                             json_name=job_name + " val tiled %s" % (str(use_sliding_window)),
-                             json_author="Fabian",
-                             json_task=task, num_threads=default_num_threads,
-                             advanced=True,
-                             metadata_list=metadata_list)
+        #self.print_to_log_file("evaluation of raw predictions")
+        #task = self.dataset_directory.split(os.sep)[-1]
+        #job_name = self.experiment_name
+        #_ = aggregate_scores(pred_gt_tuples_register, labels=list(range(self.num_classes)),
+        #                     json_output_file=join(newpath_registered, "summary.json"),
+        #                     json_name=job_name + " val tiled %s" % (str(use_sliding_window)),
+        #                     json_author="Fabian",
+        #                     json_task=task, num_threads=default_num_threads,
+        #                     advanced=True,
+        #                     metadata_list=metadata_list_registered)
+        #_ = aggregate_scores(pred_gt_tuples, labels=list(range(self.num_classes)),
+        #                     json_output_file=join(newpath_seg, "summary.json"),
+        #                     json_name=job_name + " val tiled %s" % (str(use_sliding_window)),
+        #                     json_author="Fabian",
+        #                     json_task=task, num_threads=default_num_threads,
+        #                     advanced=True,
+        #                     metadata_list=metadata_list)
 
         if run_postprocessing_on_folds:
             # in the old nnunet we would stop here. Now we add a postprocessing. This postprocessing can remove everything
@@ -2877,28 +2847,16 @@ class nnUNetTrainer(NetworkTrainer):
             # have this applied during inference as well
             self.print_to_log_file("determining postprocessing")
             base_segmentation = join(self.output_folder, 'Segmentation')
-            determine_postprocessing(base_segmentation, self.gt_niftis_folder, validation_folder_name,
+            determine_postprocessing_no_metric(base_segmentation, self.gt_niftis_folder, validation_folder_name,
                                      final_subf_name=validation_folder_name + "_postprocessed", debug=debug, log_function=log_function,
                                      metadata_list=metadata_list, to_validate_list=None)
             
             base_registered = join(self.output_folder, 'Registered')
-            determine_postprocessing(base_registered, self.gt_niftis_folder, validation_folder_name,
+            determine_postprocessing_no_metric(base_registered, self.gt_niftis_folder, validation_folder_name,
                                      final_subf_name=validation_folder_name + "_postprocessed", debug=debug, log_function=log_function,
                                      metadata_list=metadata_list_registered, to_validate_list=to_validate_registered_list)
             # after this the final predictions for the vlaidation set can be found in validation_folder_name_base + "_postprocessed"
             # They are always in that folder, even if no postprocessing as applied!
-
-        self.print_to_log_file("Saving Bottleneck strain")
-        self.strain_compute_metric_bottleneck_threads(os.path.join(self.output_folder, 'Strain', 'LV', 'Tangential'))
-        self.print_to_log_file("Saving segmentation strain")
-        self.save_strain_compute_metric_threads(os.path.join(self.output_folder, 'Segmentation', 'temp_allClasses'))
-        #self.save_strain_compute_metric(os.path.join(self.output_folder, 'Segmentation', 'temp_allClasses'))
-        self.print_to_log_file("Saving Registered strain")
-        self.save_strain_compute_metric_threads(os.path.join(self.output_folder, 'Registered', 'temp_allClasses'))
-        #self.save_strain_compute_metric(os.path.join(self.output_folder, 'Registered', 'temp_allClasses'))
-        self.print_to_log_file("Logging flow error")
-        #self.compute_contour_metric(os.path.join(self.output_folder, 'Flow', 'validation_raw'))
-        self.compute_contour_metric_threads(os.path.join(self.output_folder, 'Flow', 'validation_raw'))
 
 
         # detemining postprocesing on a per-fold basis may be OK for this fold but what if another fold finds another

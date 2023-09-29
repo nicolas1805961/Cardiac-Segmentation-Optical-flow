@@ -83,7 +83,6 @@ class ModelWrap(SegmentationNetwork):
 
 class MTLmodel(SegmentationNetwork):
     def __init__(self,
-                attention_map,
                 shortcut,
                 patch_size, 
                 window_size,
@@ -103,7 +102,6 @@ class MTLmodel(SegmentationNetwork):
                 reconstruction,
                 reconstruction_skip,
                 middle,
-                middle_unlabeled,
                 classification,
                 log_function,
                 batch_size,
@@ -113,19 +111,13 @@ class MTLmodel(SegmentationNetwork):
                 directional_field,
                 conv_layer,
                 conv_depth,
-                middle_classification,
                 num_heads,
-                one_vs_all,
                 separability,
                 transformer_depth,
                 filter_skip_co_segmentation,
                 bottleneck_heads, 
                 adversarial_loss,
-                nb_repeat,
-                v1,
-                mix_residual,
                 transformer_bottleneck,
-                registered_seg,
                 affinity,
                 asymmetric_unet,
                 norm,
@@ -147,24 +139,17 @@ class MTLmodel(SegmentationNetwork):
         self.d_model = out_encoder_dims[-1] * 2
         self.bottleneck_size = [int(image_size / (2**self.num_stages)), int(image_size / (2**self.num_stages))]
         self.reconstruction = reconstruction
-        self.registered_seg = registered_seg
         self.image_size = image_size
         self.batch_size = batch_size
-        self.v1 = v1
-        self.middle_unlabeled = middle_unlabeled
         self.classification = classification
         self.do_ds = deep_supervision
         self.conv_op=nn.Conv2d
         self.middle = middle
-        self.one_vs_all = one_vs_all
         self.percent = None
-        self.nb_repeat = nb_repeat
-        self.middle_classification = middle_classification
         self.asymmetric_unet = asymmetric_unet
         self.log_function = log_function
         self.transformer_bottleneck = transformer_bottleneck
         self.affinity = affinity
-        self.mix_residual = mix_residual
         self.separability = separability
         self.add_extra_bottleneck_blocks = add_extra_bottleneck_blocks
         if uncertainty_weighting:
@@ -199,12 +184,14 @@ class MTLmodel(SegmentationNetwork):
             decoder_output_dims = in_dims[::-1]
             decoder_output_dims[-1] = self.num_classes
             H, W = (int(image_size / 2**(self.num_stages)), int(image_size / 2**(self.num_stages)))
-            self.decoder = decoder_alt.SegmentationDecoder(conv_layer=conv_layer, norm=norm, similarity_down_scale=similarity_down_scale, filter_skip_co_segmentation=filter_skip_co_segmentation, directional_field=directional_field, attention_map=attention_map, reconstruction=reconstruction, reconstruction_skip=reconstruction_skip, concat_spatial_cross_attention=concat_spatial_cross_attention, attention_type=encoder_attention_type, spatial_cross_attention_num_heads=spatial_cross_attention_num_heads[::-1], shortcut=shortcut, proj_qkv=proj, out_encoder_dims=out_encoder_dims[::-1], use_conv_mlp=use_conv_mlp, last_activation='identity', img_size=image_size, num_classes=self.num_classes, device=device, swin_abs_pos=swin_abs_pos, in_encoder_dims=decoder_output_dims, merge=merge, conv_depth=conv_depth_decoder, transformer_depth=transformer_depth[::-1], dpr=dpr_decoder, rpe_mode=rpe_mode, rpe_contextual_tensor=rpe_contextual_tensor, num_heads=num_heads, window_size=window_size, drop_path_rate=drop_path_rate, deep_supervision=self.do_ds)
+
+            self.decoder = decoder_alt.SegmentationDecoder(conv_layer=conv_layer, norm=norm, similarity_down_scale=similarity_down_scale, filter_skip_co_segmentation=filter_skip_co_segmentation, directional_field=directional_field, reconstruction=reconstruction, reconstruction_skip=reconstruction_skip, concat_spatial_cross_attention=concat_spatial_cross_attention, attention_type=encoder_attention_type, spatial_cross_attention_num_heads=spatial_cross_attention_num_heads[::-1], shortcut=shortcut, proj_qkv=proj, out_encoder_dims=out_encoder_dims[::-1], use_conv_mlp=use_conv_mlp, last_activation='identity', img_size=image_size, num_classes=self.num_classes, device=device, swin_abs_pos=swin_abs_pos, in_encoder_dims=decoder_output_dims, merge=merge, conv_depth=conv_depth_decoder, transformer_depth=transformer_depth[::-1], dpr=dpr_decoder, rpe_mode=rpe_mode, rpe_contextual_tensor=rpe_contextual_tensor, num_heads=num_heads, window_size=window_size, drop_path_rate=drop_path_rate, deep_supervision=self.do_ds)
             
             self.pos = PositionEmbeddingSine2d(num_pos_feats=self.d_model // 2, normalize=True)
             #self.spatial_pos = nn.Parameter(torch.randn(size=(self.bottleneck_size[0]**2, self.d_model)))
             
-            self.extra_bottleneck_block_1 = ConvBlocksLegacy(in_dim=self.d_model, out_dim=self.d_model, nb_blocks=1, dpr=dpr_bottleneck, norm=norm, kernel_size=3)
+            if add_extra_bottleneck_blocks:
+                self.extra_bottleneck_block_1 = ConvBlocksLegacy(in_dim=self.d_model, out_dim=self.d_model, nb_blocks=1, dpr=dpr_bottleneck, norm=norm, kernel_size=3)
             if transformer_bottleneck:
                 encoder_layer = TransformerEncoderLayer(d_model=int(self.d_model), nhead=bottleneck_heads, dim_feedforward=4 * int(self.d_model))
                 self.bottleneck = TransformerEncoder(encoder_layer=encoder_layer, num_layers=self.num_bottleneck_layers)
@@ -213,7 +200,8 @@ class MTLmodel(SegmentationNetwork):
                                                 norm(self.d_model),
                                                 nn.GELU())
                 #self.bottleneck = conv_layer(in_dim=self.d_model, out_dim=self.d_model, nb_blocks=1, dpr=dpr_bottleneck, norm=norm, kernel_size=3)
-            self.extra_bottleneck_block_2 = ConvBlocksLegacy(in_dim=self.d_model, out_dim=self.d_model, nb_blocks=1, dpr=dpr_bottleneck, norm=norm, kernel_size=3)
+            if add_extra_bottleneck_blocks:
+                self.extra_bottleneck_block_2 = ConvBlocksLegacy(in_dim=self.d_model, out_dim=self.d_model, nb_blocks=1, dpr=dpr_bottleneck, norm=norm, kernel_size=3)
 
             if classification:
                 #self.classification_conv = ConvBlock(in_dim=self.d_model, out_dim=1, kernel_size=1, norm=norm, stride=1)
@@ -437,7 +425,8 @@ class MTLmodel(SegmentationNetwork):
             
         else:
             x_encoded, encoder_skip_connections = self.encoder(x)
-            x_encoded = self.extra_bottleneck_block_1(x_encoded)
+            if self.add_extra_bottleneck_blocks:
+                x_encoded = self.extra_bottleneck_block_1(x_encoded)
             if self.transformer_bottleneck:
                 B, C, H, W = x_encoded.shape
                 pos = self.pos(shape_util=(B, H, W), device=x.device)
@@ -446,7 +435,8 @@ class MTLmodel(SegmentationNetwork):
                 x_encoded = self.bottleneck(x_encoded, pos=pos)
             else:
                 x_encoded = self.bottleneck(x_encoded)
-            x_encoded = self.extra_bottleneck_block_2(x_encoded)
+            if self.add_extra_bottleneck_blocks:
+                x_encoded = self.extra_bottleneck_block_2(x_encoded)
 
             seg = self.decoder(x_encoded, encoder_skip_connections)
             #seg, vis = self.decoder(x_encoded, encoder_skip_connections)

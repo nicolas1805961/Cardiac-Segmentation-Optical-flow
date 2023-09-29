@@ -37,6 +37,7 @@ from ..training.dataloading.dataset_loading import get_idx, select_idx
 from ..lib.position_embedding import PositionEmbeddingSine2d, PositionEmbeddingSine1d
 from torchvision.transforms.functional import gaussian_blur
 from torch.nn.functional import interpolate
+from ..lib import sfb
 
 class ModelWrap(SegmentationNetwork):
     def __init__(self, model1, model2, do_ds):
@@ -84,8 +85,7 @@ class OpticalFlowModelSimple(SegmentationNetwork):
                 log_function,
                 dot_multiplier,
                 inference_mode,
-                nb_iters,
-                padding,
+                use_sfb,
                 split,
                 one_to_all,
                 all_to_all,
@@ -130,9 +130,12 @@ class OpticalFlowModelSimple(SegmentationNetwork):
         decoder_in_dims[0] = self.num_classes
         conv_depth_decoder = conv_depth[::-1]
 
-        self.flow_decoder = decoder_alt.Decoder2D(dot_multiplier=dot_multiplier, deep_supervision=deep_supervision, conv_depth=conv_depth_decoder, in_encoder_dims=decoder_in_dims[::-1], out_encoder_dims=out_encoder_dims[::-1], num_classes=2, img_size=image_size)
-        #self.flow_decoder = decoder_alt.FlowDecoder3DInterp(dot_multiplier=dot_multiplier, deep_supervision=deep_supervision, conv_depth=conv_depth_decoder, dpr=dpr_decoder, in_encoder_dims=decoder_in_dims[::-1], out_encoder_dims=out_encoder_dims[::-1], num_classes=2, img_size=image_size, nb_interp_frame=nb_interp_frame)
-        #self.seg_decoder = decoder_alt.FlowDecoder3D(dot_multiplier=dot_multiplier, deep_supervision=deep_supervision, conv_depth=conv_depth_decoder, dpr=dpr_decoder, in_encoder_dims=decoder_in_dims[::-1], out_encoder_dims=out_encoder_dims[::-1], num_classes=self.num_classes, img_size=image_size)
+        if use_sfb:
+            self.flow_decoder = sfb.Decoder2D(dot_multiplier=dot_multiplier, deep_supervision=deep_supervision, conv_depth=conv_depth_decoder, in_encoder_dims=decoder_in_dims[::-1], out_encoder_dims=out_encoder_dims[::-1], num_classes=2, img_size=image_size)
+        else:
+            self.flow_decoder = decoder_alt.Decoder2D(dot_multiplier=dot_multiplier, deep_supervision=deep_supervision, conv_depth=conv_depth_decoder, in_encoder_dims=decoder_in_dims[::-1], out_encoder_dims=out_encoder_dims[::-1], num_classes=2, img_size=image_size)
+            #self.flow_decoder = decoder_alt.FlowDecoder3DInterp(dot_multiplier=dot_multiplier, deep_supervision=deep_supervision, conv_depth=conv_depth_decoder, dpr=dpr_decoder, in_encoder_dims=decoder_in_dims[::-1], out_encoder_dims=out_encoder_dims[::-1], num_classes=2, img_size=image_size, nb_interp_frame=nb_interp_frame)
+            #self.seg_decoder = decoder_alt.FlowDecoder3D(dot_multiplier=dot_multiplier, deep_supervision=deep_supervision, conv_depth=conv_depth_decoder, dpr=dpr_decoder, in_encoder_dims=decoder_in_dims[::-1], out_encoder_dims=out_encoder_dims[::-1], num_classes=self.num_classes, img_size=image_size)
 
         H, W = (int(image_size / 2**(self.num_stages)), int(image_size / 2**(self.num_stages)))
         #d_ffn = min(2048, self.d_model * 4)
@@ -716,6 +719,12 @@ class OpticalFlowModelSimple(SegmentationNetwork):
             all_motions = self.warp_linear_lib(flow, target)
         else:
             all_motions = self.warp_linear(flow, target, target_mask)
+
+        delta_list = []
+        for t in range(len(flow)):
+            delta = self.motion_estimation.get_delta(flow[t])
+            delta_list.append(delta)
+        flow = torch.stack(delta_list, dim=0)
 
         assert len(all_motions) == nb_frames
         #for t in range(indices[1].item(), indices[0].item(), -1):

@@ -14,7 +14,7 @@
 
 from nnunet.evaluation.evaluator import NiftiEvaluator, aggregate_scores
 from nnunet.inference.segmentation_export import save_segmentation_nifti_from_softmax
-from nnunet.postprocessing.connected_components import determine_postprocessing
+from nnunet.postprocessing.connected_components import determine_postprocessing, determine_postprocessing_no_metric
 
 from tqdm import tqdm
 from monai.transforms import KeepLargestConnectedComponent
@@ -70,7 +70,7 @@ from nnunet.network_architecture.initialization import InitWeights_He
 from nnunet.network_architecture.neural_network import SegmentationNetwork
 from nnunet.training.data_augmentation.default_data_augmentation import default_2D_augmentation_params, \
     get_patch_size, default_3D_augmentation_params
-from nnunet.training.dataloading.dataset_loading import DataLoaderFlowTrainPredictionVal, DataLoader2D, DataLoader2DMiddleUnlabeled, unpack_dataset, DataLoaderVideoUnlabeled
+from nnunet.training.dataloading.dataset_loading import DataLoaderFlowTrainPredictionValLib, DataLoaderFlowTrain5Lib, DataLoaderFlowTrainPredictionVal, DataLoader2D, DataLoader2DMiddleUnlabeled, unpack_dataset, DataLoaderVideoUnlabeled
 from nnunet.training.network_training.nnUNetTrainer import nnUNetTrainer
 from nnunet.utilities.nd_softmax import softmax_helper
 from sklearn.model_selection import KFold
@@ -94,6 +94,7 @@ from nnunet.training.data_augmentation.cutmix import cutmix, batched_rand_bbox
 import shutil
 from nnunet.visualization.visualization import Visualizer
 from nnunet.training.network_training.processor import Processor
+from nnunet.training.network_training.utils import save_strain
 
 class nnMTLTrainerV2FlowPrediction(nnUNetTrainer):
     """
@@ -164,7 +165,6 @@ class nnMTLTrainerV2FlowPrediction(nnUNetTrainer):
         self.val_loss = []
         self.train_loss = []
         
-        #loss_weights = torch.tensor(self.config['224_loss_weights'], device=self.config['device'])
         self.seg_to_seg_backward_loss_weight = self.config['seg_to_seg_backward_loss_weight']
         self.seg_to_seg_forward_loss_weight = self.config['seg_to_seg_forward_loss_weight']
         self.seg_registered_pred_loss_weight = self.config['seg_registered_pred_loss_weight']
@@ -176,6 +176,10 @@ class nnMTLTrainerV2FlowPrediction(nnUNetTrainer):
         self.seg_curvature_loss_weight = self.config['seg_curvature_loss_weight']
         self.flow_curvature_loss_weight = self.config['flow_curvature_loss_weight']
         self.interpolation_loss_weight = self.config['interpolation_loss_weight']
+        self.magnitude_loss_weight = self.config['magnitude_loss_weight']
+        self.local_motion_loss_weight = self.config['local_motion_loss_weight']
+        self.global_motion_forward_loss_weight = self.config['global_motion_forward_loss_weight']
+        self.global_motion_backward_loss_weight = self.config['global_motion_backward_loss_weight']
         self.semi_supervised_forward_loss_weight = self.config['semi_supervised_forward_loss_weight']
         self.semi_supervised_backward_loss_weight = self.config['semi_supervised_backward_loss_weight']
 
@@ -216,25 +220,23 @@ class nnMTLTrainerV2FlowPrediction(nnUNetTrainer):
 
     def setup_loss_data(self):
         loss_data = {'segmentation': [self.segmentation_loss_weight, float('nan')]}
-        if self.video_length > 2:
+        loss_data['image_flow'] = [self.image_flow_loss_weight, float('nan')]
+        loss_data['flow_regularization'] = [1.0, float('nan')]
+        #loss_data['seg_curvature'] = [self.seg_curvature_loss_weight, float('nan')]
+        if self.video_length > 3:
             loss_data['flow_curvature'] = [self.flow_curvature_loss_weight, float('nan')]
-        if self.video_length > 1:
-            loss_data['image_flow'] = [self.image_flow_loss_weight, float('nan')]
-            loss_data['flow_regularization'] = [1.0, float('nan')]
-            #loss_data['seg_curvature'] = [self.seg_curvature_loss_weight, float('nan')]
-            #loss_data['pred_registered_target'] = [self.pred_registered_target_loss_weight, float('nan')]
-            #loss_data['pred_registered_pred'] = [self.pred_registered_pred_loss_weight, float('nan')]
-            #loss_data['pred_registered_pred_2'] = [self.pred_registered_pred_loss_weight, float('nan')]
-            #loss_data['seg_registered_pred'] = [self.seg_registered_pred_loss_weight, float('nan')]
-            loss_data['semi_supervised_forward'] = [self.semi_supervised_forward_loss_weight, float('nan')]
-            loss_data['first_flow'] = [self.first_flow_loss_weight, float('nan')]
-            loss_data['seg_to_seg_forward'] = [self.seg_to_seg_forward_loss_weight, float('nan')]
-            loss_data['seg_to_seg_backward'] = [self.seg_to_seg_backward_loss_weight, float('nan')]
-            #loss_data['interpolation'] = [self.interpolation_loss_weight, float('nan')]
-            #if not self.one_to_all:
-            #    loss_data['pred_registered'] = [self.pred_registered_loss_weight, float('nan')]
-            if self.do_adv:
-                loss_data['adversarial'] = [self.adversarial_weight, float('nan')]
+        #loss_data['pred_registered_target'] = [self.pred_registered_target_loss_weight, float('nan')]
+        #loss_data['pred_registered_pred'] = [self.pred_registered_pred_loss_weight, float('nan')]
+        #loss_data['seg_registered_pred'] = [self.seg_registered_pred_loss_weight, float('nan')]
+        #loss_data['first_flow'] = [self.first_flow_loss_weight, float('nan')]
+        loss_data['first_flow'] = [self.first_flow_loss_weight, float('nan')]
+        loss_data['global_motion_forward'] = [self.global_motion_forward_loss_weight, float('nan')]
+        loss_data['global_motion_forward_semi_supervised'] = [self.semi_supervised_forward_loss_weight, float('nan')]
+        #loss_data['interpolation'] = [self.interpolation_loss_weight, float('nan')]
+        #if not self.one_to_all:
+        #    loss_data['pred_registered'] = [self.pred_registered_loss_weight, float('nan')]
+        if self.do_adv:
+            loss_data['adversarial'] = [self.adversarial_weight, float('nan')]
         return loss_data
     
     def setup_loss_functions(self):
@@ -343,7 +345,7 @@ class nnMTLTrainerV2FlowPrediction(nnUNetTrainer):
         self.was_initialized = True
 
     def choose_loss(self):
-        return self.compute_losses_all_to_all
+        return self.compute_losses_recursive
     
     def count_parameters(self, config, models):
         if not self.inference:
@@ -573,7 +575,7 @@ class nnMTLTrainerV2FlowPrediction(nnUNetTrainer):
         
         unlabeled = unlabeled.permute(1, 0, 2, 3, 4).contiguous() # B, T, 1, H, W
         target = target.permute(1, 0, 2, 3, 4).contiguous() # B, T, 1, H, W
-        forward_flow = out['forward_flow'].permute(1, 0, 2, 3, 4).contiguous() # B, T, 2, H, W
+        forward_flow = out['global_motion_forward'].permute(1, 0, 2, 3, 4).contiguous() # B, T, 2, H, W
         target_mask = target_mask.permute(1, 0).contiguous() # B, T
         seg_registered_forward = out['seg_registered_forward'].permute(1, 0, 2, 3).contiguous() # B, T, H, W
         #seg_registered_forward = seg_registered_forward[:, :self.video_length]
@@ -861,7 +863,7 @@ class nnMTLTrainerV2FlowPrediction(nnUNetTrainer):
         metadata_list = []
         metadata_list_registered = []
         #strain_results = {"all": [], "mean_lv_tangential": None}
-        for patient_id in tqdm(patient_id_list):
+        for patient_id in tqdm(patient_id_list[:1]):
             phase_list = [x for x in list_of_keys if patient_id in x]
             phase_list = np.array(sorted(phase_list, key=lambda x: int(x[16:18])))
             phase_list = np.array(phase_list)
@@ -870,8 +872,8 @@ class nnMTLTrainerV2FlowPrediction(nnUNetTrainer):
             #print(self.dataset[phase_list[0]])
             properties = load_pickle(self.dataset[phase_list[0]]['properties_file'])
 
-            ed_indices = np.array(properties['ed_number']) - 1
-            es_indices = np.array(properties['es_number']) - 1
+            ed_idx = np.rint(np.array(properties['ed_number'])).astype(np.uint8) % len(phase_list)
+            es_idx = np.rint(np.array(properties['es_number'])).astype(np.uint8) % len(phase_list)
 
             unlabeled = np.full(shape=((len(phase_list), 1) + properties['size_after_resampling']), fill_value=np.nan)
             target = np.full(shape=((len(phase_list), 1) + properties['size_after_resampling']), fill_value=np.nan)
@@ -883,23 +885,19 @@ class nnMTLTrainerV2FlowPrediction(nnUNetTrainer):
                     target[idx][target[idx] == -1] = 0
                     unlabeled[idx] = current_data[0] + 1e-8
 
-                all_where_list = []
-                assert len(ed_indices) == unlabeled.shape[2]
-                for d in range(unlabeled.shape[2]):
-                    frame_indices = np.arange(len(phase_list))
+                frame_indices = np.arange(len(phase_list))
 
-                    before_where = np.argwhere(frame_indices < ed_indices[d]).reshape(-1,)
-                    after_where = np.argwhere(frame_indices >= ed_indices[d]).reshape(-1,)
+                before_where = np.argwhere(frame_indices < ed_idx).reshape(-1,)
+                after_where = np.argwhere(frame_indices >= ed_idx).reshape(-1,)
 
-                    all_where = np.concatenate([after_where, before_where])
-                    all_where_list.append(all_where)
+                all_where = np.concatenate([after_where, before_where])
 
-                    frame_indices = frame_indices[all_where]
-                    unlabeled[:, :, d] = unlabeled[frame_indices, :, d]
+                frame_indices = frame_indices[all_where]
+                unlabeled = unlabeled[frame_indices]
 
 
                 #matplotlib.use('QtAgg')
-                #print(ed_indices)
+                #print(ed_idx)
                 #print(es_indices)
                 #fig, ax = plt.subplots(1, int(len(unlabeled) / 4))
                 #for i in range(0, len(unlabeled), 4):
@@ -924,13 +922,12 @@ class nnMTLTrainerV2FlowPrediction(nnUNetTrainer):
                 flow_pred = ret[2] # T, C, depth, H, W
                 registered_pred = ret[3] # T, C, depth, H, W
 
-                assert len(softmax_pred) == len(flow_pred) == len(registered_pred) == len(lv_strain_bottleneck_pred)
+                assert len(softmax_pred) == len(flow_pred) == len(registered_pred)
 
-                for d, all_where in enumerate(all_where_list):
-                    sorted_where = np.argsort(all_where)
-                    softmax_pred[:, :, d] = softmax_pred[sorted_where, :, d]
-                    flow_pred[:, :, d] = flow_pred[sorted_where, :, d]
-                    registered_pred[:, :, d] = registered_pred[sorted_where, :, d]
+                sorted_where = np.argsort(all_where)
+                softmax_pred = softmax_pred[sorted_where]
+                flow_pred = flow_pred[sorted_where]
+                registered_pred = registered_pred[sorted_where]
 
                 assert len(softmax_pred) == len(flow_pred) == len(phase_list)
 
@@ -996,39 +993,52 @@ class nnMTLTrainerV2FlowPrediction(nnUNetTrainer):
         #save_json(strain_results, os.path.join(newpath_strain, 'summary.json'))
 
         # evaluate raw predictions
-        self.print_to_log_file("evaluation of raw predictions")
-        task = self.dataset_directory.split(os.sep)[-1]
-        job_name = self.experiment_name
-        _ = aggregate_scores(pred_gt_tuples_register, labels=list(range(self.num_classes)),
-                             json_output_file=join(newpath_registered, "summary.json"),
-                             json_name=job_name + " val tiled %s" % (str(use_sliding_window)),
-                             json_author="Fabian",
-                             json_task=task, num_threads=default_num_threads,
-                             advanced=True,
-                             metadata_list=metadata_list_registered)
-        _ = aggregate_scores(pred_gt_tuples, labels=list(range(self.num_classes)),
-                             json_output_file=join(newpath_seg, "summary.json"),
-                             json_name=job_name + " val tiled %s" % (str(use_sliding_window)),
-                             json_author="Fabian",
-                             json_task=task, num_threads=default_num_threads,
-                             advanced=True,
-                             metadata_list=metadata_list)
+        #self.print_to_log_file("evaluation of raw predictions")
+        #task = self.dataset_directory.split(os.sep)[-1]
+        #job_name = self.experiment_name
+        #_ = aggregate_scores(pred_gt_tuples_register, labels=list(range(self.num_classes)),
+        #                     json_output_file=join(newpath_registered, "summary.json"),
+        #                     json_name=job_name + " val tiled %s" % (str(use_sliding_window)),
+        #                     json_author="Fabian",
+        #                     json_task=task, num_threads=default_num_threads,
+        #                     advanced=True,
+        #                     metadata_list=metadata_list_registered)
+        #_ = aggregate_scores(pred_gt_tuples, labels=list(range(self.num_classes)),
+        #                     json_output_file=join(newpath_seg, "summary.json"),
+        #                     json_name=job_name + " val tiled %s" % (str(use_sliding_window)),
+        #                     json_author="Fabian",
+        #                     json_task=task, num_threads=default_num_threads,
+        #                     advanced=True,
+        #                     metadata_list=metadata_list)
 
         if run_postprocessing_on_folds:
             # in the old nnunet we would stop here. Now we add a postprocessing. This postprocessing can remove everything
             # except the largest connected component for each class. To see if this improves results, we do this for all
             # classes and then rerun the evaluation. Those classes for which this resulted in an improved dice score will
             # have this applied during inference as well
+
             self.print_to_log_file("determining postprocessing")
+            
+            #base_segmentation = join(self.output_folder, 'Segmentation')
+            #determine_postprocessing(base_segmentation, self.gt_niftis_folder, validation_folder_name,
+            #                         final_subf_name=validation_folder_name + "_postprocessed", debug=debug, log_function=log_function,
+            #                         metadata_list=metadata_list, to_validate_list=None)
+            #
+            #base_registered = join(self.output_folder, 'Registered')
+            #determine_postprocessing(base_registered, self.gt_niftis_folder, validation_folder_name,
+            #                         final_subf_name=validation_folder_name + "_postprocessed", debug=debug, log_function=log_function,
+            #                         metadata_list=metadata_list_registered, to_validate_list=to_validate_registered_list)
+            
             base_segmentation = join(self.output_folder, 'Segmentation')
-            determine_postprocessing(base_segmentation, self.gt_niftis_folder, validation_folder_name,
+            determine_postprocessing_no_metric(base_segmentation, self.gt_niftis_folder, validation_folder_name,
                                      final_subf_name=validation_folder_name + "_postprocessed", debug=debug, log_function=log_function,
                                      metadata_list=metadata_list, to_validate_list=None)
             
             base_registered = join(self.output_folder, 'Registered')
-            determine_postprocessing(base_registered, self.gt_niftis_folder, validation_folder_name,
+            determine_postprocessing_no_metric(base_registered, self.gt_niftis_folder, validation_folder_name,
                                      final_subf_name=validation_folder_name + "_postprocessed", debug=debug, log_function=log_function,
                                      metadata_list=metadata_list_registered, to_validate_list=to_validate_registered_list)
+            
             # after this the final predictions for the vlaidation set can be found in validation_folder_name_base + "_postprocessed"
             # They are always in that folder, even if no postprocessing as applied!
 
@@ -1185,7 +1195,141 @@ class nnMTLTrainerV2FlowPrediction(nnUNetTrainer):
         gradient = spatial_gradient3d(x)
         return gradient[:, :, 2].pow(2).sum()
     
-    def compute_losses_all_to_all(self, target_mask, unlabeled, out, target):
+
+    def compute_losses_recursive(self, target_mask, unlabeled, out, target):
+        out['registered_input_forward'] = []
+        out['seg_registered_forward'] = []
+
+        t_indices, b_indices = torch.nonzero(target_mask, as_tuple=True)
+        seg_loss_l = self.segmentation_loss(out['seg'][t_indices, b_indices], target[t_indices, b_indices])
+        self.loss_data['segmentation'][1] = seg_loss_l
+
+        t_indices, b_indices = torch.nonzero(target_mask, as_tuple=True)
+        mask = t_indices != 0
+        t_indices = t_indices[mask]
+        b_indices = b_indices[mask]
+
+        initial_target = target[0]
+        initial_target = torch.nn.functional.one_hot(initial_target[:, 0].long(), num_classes=4).permute(0, 3, 1, 2).contiguous().float()
+        registered = self.motion_estimation(flow=out['global_motion_forward'][t_indices, b_indices], original=initial_target, mode='bilinear')
+
+        global_motion_loss = self.segmentation_loss(registered, target[t_indices, b_indices])
+        self.loss_data['global_motion_forward'][1] = global_motion_loss
+
+        seg_registered_list_global_forward = []
+        for t in range(len(out['global_motion_forward'])):
+            current_flow_forward = out['global_motion_forward'][t]
+            current_global_registered_forward = self.motion_estimation(flow=current_flow_forward, original=initial_target, mode='bilinear')
+            seg_registered_list_global_forward.append(current_global_registered_forward)
+        seg_registered_list_global_forward = torch.stack(seg_registered_list_global_forward, dim=0) # T, B, C, H, W
+
+        for_visualization = torch.argmax(seg_registered_list_global_forward, dim=2)
+        out['seg_registered_forward'] = for_visualization
+
+        if self.video_length > 3:
+            flow_curvature = self.get_curvature(seg_registered_list_global_forward)
+            #seg_curvature = self.get_curvature(out['seg'])
+            #self.loss_data['seg_curvature'][1] = seg_curvature
+            self.loss_data['flow_curvature'][1] = flow_curvature
+
+        forward_zero_loss = self.mse_loss(out['global_motion_forward'][0], torch.zeros_like(out['global_motion_forward'][0]))
+        self.loss_data['first_flow'][1] = forward_zero_loss
+
+        semi_supervised_target = torch.softmax(out['seg'], dim=2)
+        semi_supervised_target = torch.argmax(semi_supervised_target, dim=2, keepdim=True)
+
+        semi_supervised_forward_loss = self.segmentation_loss(seg_registered_list_global_forward.permute(1, 2, 3, 4, 0), semi_supervised_target.permute(1, 2, 3, 4, 0))
+        self.loss_data['global_motion_forward_semi_supervised'][1] = semi_supervised_forward_loss
+
+        #pred_registered_loss_target = self.segmentation_loss(pred_registered_list[t_indices, b_indices], target[t_indices, b_indices])
+        #self.loss_data['pred_registered_target'][1] = pred_registered_loss_target
+#
+        #target_pred = torch.softmax(out['seg'][1:], dim=2) # T - 1, B, 4, H, W
+#
+        #pred_registered_loss_pred = self.cross_entropy_loss(pred_registered_list.permute(1, 2, 3, 4, 0), target_pred.permute(1, 2, 3, 4, 0))
+        #self.loss_data['pred_registered_pred'][1] = pred_registered_loss_pred
+
+        
+
+        #t_list_backward = []
+        #for i in range(1, len(unlabeled)):
+        #    cumulated_seg = out['seg'][i] # B, 4, H, W
+        #    current_pred_registered = self.motion_estimation(flow=out['backward_flow'][i], original=cumulated_seg)
+        #    t_list_backward.append(current_pred_registered)
+        #t_list_backward = torch.stack(t_list_backward, dim=0) # T - 1, B, 4, H, W
+        #out['pred_registered_backward'] = t_list_backward
+#
+        #pred_registered_target = target[0][None].repeat(len(out['pred_registered_backward']), 1, 1, 1, 1)
+        #pred_registered_loss = self.segmentation_loss(out['pred_registered_backward'].permute(1, 2, 3, 4, 0), pred_registered_target.permute(1, 2, 3, 4, 0))
+        #self.loss_data['pred_registered'][1] = pred_registered_loss
+#
+        #out['pred_registered_backward'] = torch.softmax(out['pred_registered_backward'], dim=2)
+        #out['pred_registered_backward'] = torch.argmax(out['pred_registered_backward'], dim=2)
+
+        #matplotlib.use('QtAgg')
+        #fig, ax = plt.subplots(3, 4)
+        #for i in range(4):
+        #    ax[0, i].imshow(out['seg_registered_backward_long'][0, i].detach().cpu(), cmap='gray')
+        #    ax[1, i].imshow(b_list_backward_target[0, 0].detach().cpu(), cmap='gray')
+        #    ax[2, i].imshow(unlabeled[0, 0, 0].detach().cpu(), cmap='gray')
+        #plt.show()
+
+        for i in range(len(out['global_motion_forward'])):
+            registered = self.motion_estimation(flow=out['global_motion_forward'][i], original=unlabeled[0])
+            out['registered_input_forward'].append(registered)
+        
+        out['registered_input_forward'] = torch.stack(out['registered_input_forward'], dim=0)
+        #out['registered_input_forward'] = torch.roll(out['registered_input_forward'], shifts=1, dims=0)
+
+        forward_flow_loss = self.mse_loss(out['registered_input_forward'][-1], unlabeled[-1])
+        flow_regularization_loss_forward = self.image_flow_loss(flow=out['global_motion_forward'])
+        self.loss_data['image_flow'][1] = forward_flow_loss
+        self.loss_data['flow_regularization'][1] = flow_regularization_loss_forward
+        
+        
+        #print(new_target.shape)
+        #matplotlib.use('QtAgg')
+        #fig, ax = plt.subplots(1, len(new_target))
+        #for o in range(len(new_target)):
+        #    ax[o].imshow(new_target[o, 0, 0].detach().cpu(), cmap='gray')
+        #plt.show()
+
+        #b_list = []
+        #for b in range(self.batch_size):
+        #    index = torch.nonzero(target_mask[:, b])[0].item()
+        #    initial_target = target[index, b]
+        #    initial_target = torch.nn.functional.one_hot(initial_target[0].long(), num_classes=4).permute(2, 0, 1).contiguous().float()[None]
+#
+        #    #matplotlib.use('QtAgg')
+        #    #fig, ax = plt.subplots(1, 4)
+        #    #for o in range(4):
+        #    #    ax[o].imshow(initial_target[0, o].detach().cpu(), cmap='gray')
+        #    #plt.show()
+#
+        #    forward_hops = len(unlabeled) - 1 - index
+        #    backward_hops = index
+        #    t_list = []
+        #    current_target = initial_target
+        #    for i in range(backward_hops):
+        #        current_target = self.motion_estimation(flow=out['backward_flow'][index - i, b][None], original=current_target, mode='bilinear')
+        #        t_list.append(torch.argmax(current_target[0], dim=0, keepdim=True))
+        #    current_target = initial_target
+        #    for i in range(forward_hops):
+        #        current_target = self.motion_estimation(flow=out['forward_flow'][index + i, b][None], original=current_target, mode='bilinear')
+        #        t_list.append(torch.argmax(current_target[0], dim=0, keepdim=True))
+        #    t_list = torch.stack(t_list, dim=0)
+        #    b_list.append(t_list)
+        #out['seg_registered'] = torch.stack(b_list, dim=1)
+        #assert len(out['seg_registered']) == len(unlabeled) - 1
+
+        if self.do_adv:
+            loss_fake, output_fake = self.get_fake_loss(out, label=1, detach=False)
+            self.loss_data['adversarial'][1] = loss_fake.mean()
+
+        return out
+
+    
+    """ def compute_losses_all_to_all(self, target_mask, unlabeled, out, target):
         out['registered_input_backward'] = []
         out['registered_input_forward'] = []
         out['seg_registered_forward'] = []
@@ -1337,7 +1481,7 @@ class nnMTLTrainerV2FlowPrediction(nnUNetTrainer):
                 loss_fake, output_fake = self.get_fake_loss(out, label=1, detach=False)
                 self.loss_data['adversarial'][1] = loss_fake.mean()
 
-        return out
+        return out """
 
 
     def select_deep_supervision(self, x):
@@ -1508,7 +1652,7 @@ class nnMTLTrainerV2FlowPrediction(nnUNetTrainer):
         if self.deep_supervision:
             out['seg'] = out['seg'][0]
             #out['backward_flow'] = out['backward_flow'][0]
-            out['forward_flow'] = out['forward_flow'][0]
+            out['global_motion_forward'] = out['global_motion_forward'][0]
 
         #self.val_loss.append(l.mean().detach().cpu())
 
@@ -1527,7 +1671,7 @@ class nnMTLTrainerV2FlowPrediction(nnUNetTrainer):
             out['seg'] = out['seg'][:3]
             out['seg_registered_forward'] = out['seg_registered_forward'][:3]
             out['registered_input_forward'] = out['registered_input_forward'][:3]
-            out['forward_flow'] = out['forward_flow'][:3]
+            out['global_motion_forward'] = out['global_motion_forward'][:3]
             unlabeled = unlabeled[:3]
             target = target[:3]
             target_mask = target_mask[:3]
@@ -1631,7 +1775,7 @@ class nnMTLTrainerV2FlowPrediction(nnUNetTrainer):
         and_mask = mask.permute(1, 0).contiguous()
         seg = out['seg'].permute(1, 0, 2, 3, 4).contiguous() # B, T, 4, H, W
         target = target.permute(1, 0, 2, 3, 4).contiguous()
-        flow = out['forward_flow'].permute(1, 0, 2, 3, 4).contiguous() # B, T, 2, H, W
+        flow = out['global_motion_forward'].permute(1, 0, 2, 3, 4).contiguous() # B, T, 2, H, W
         num_classes = 4
 
         assert flow.shape[1] == target.shape[1]
@@ -2162,7 +2306,7 @@ class nnMTLTrainerV2FlowPrediction(nnUNetTrainer):
                     self.print_to_log_file("validation loss: %.4f" % self.all_val_losses[-1])
                     self.log_losses()
 
-                if self.config['log_stats'] and self.epoch % self.config['epoch_log'] == 0:
+                if self.config['log_stats'] and self.epoch % self.config['epoch_log'] == 0 and '32' not in self.task:
                     for b in range(self.num_val_batches_per_epoch):
                         self.epoch_iter_nb = b
                         with torch.no_grad():
@@ -2190,7 +2334,7 @@ class nnMTLTrainerV2FlowPrediction(nnUNetTrainer):
                         self.print_to_log_file("validation loss (train=True): %.4f" % self.all_val_losses_tr_mode[-1])
                         self.log_losses()
                         
-                    if self.config['log_stats'] and self.epoch % self.config['epoch_log'] == 0:
+                    if self.config['log_stats'] and self.epoch % self.config['epoch_log'] == 0 and '32' not in self.task:
                         for b in range(self.num_val_batches_per_epoch):
                             self.epoch_iter_nb = b
                             self.run_iteration_val(self.dl_val)
@@ -2258,23 +2402,26 @@ class nnMTLTrainerV2FlowPrediction(nnUNetTrainer):
         dl_un_val = None
         
         
-        if self.video_length == 1:
-            dl_tr = DataLoaderFlowTrainOneFrame(self.dataset_tr, self.basic_generator_patch_size, self.patch_size, self.batch_size, unlabeled_dataset=self.dataset_un_tr, video_length=self.video_length,
+        if '32' in self.task:
+            dl_val = DataLoaderFlowTrainPredictionValLib(self.dataset_val, self.patch_size, self.patch_size, self.batch_size, unlabeled_dataset=self.dataset_un_val, video_length=self.video_length,
+                                    crop_size=self.crop_size, processor=self.processor, is_val=True, oversample_foreground_percent=self.oversample_foreground_percent,
+                                    pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
+            dl_tr = DataLoaderFlowTrain5Lib(self.dataset_tr, self.basic_generator_patch_size, self.patch_size, self.batch_size, unlabeled_dataset=self.dataset_un_tr, video_length=self.video_length,
                                         crop_size=self.crop_size, processor=self.processor, is_val=False, oversample_foreground_percent=self.oversample_foreground_percent,
                                         pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
-            dl_val = DataLoaderFlowTrainPredictionVal(self.dataset_val, self.patch_size, self.patch_size, self.batch_size, unlabeled_dataset=self.dataset_un_val, video_length=self.video_length,
-                                        crop_size=self.crop_size, processor=self.processor, is_val=True, oversample_foreground_percent=self.oversample_foreground_percent,
-                                        pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
-            dl_overfitting = DataLoaderFlowTrainOneFrame(self.dataset_val, self.basic_generator_patch_size, self.patch_size, self.batch_size, unlabeled_dataset=self.dataset_un_val, video_length=self.video_length,
+            
+            dl_overfitting = DataLoaderFlowTrain5Lib(self.dataset_val, self.basic_generator_patch_size, self.patch_size, self.batch_size, unlabeled_dataset=self.dataset_un_val, video_length=self.video_length,
                                         crop_size=self.crop_size, processor=self.processor, is_val=True, oversample_foreground_percent=self.oversample_foreground_percent,
                                         pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
         else:
+            dl_val = DataLoaderFlowTrainPredictionVal(self.dataset_val, self.patch_size, self.patch_size, self.batch_size, unlabeled_dataset=self.dataset_un_val, video_length=self.video_length,
+                                    crop_size=self.crop_size, processor=self.processor, is_val=True, oversample_foreground_percent=self.oversample_foreground_percent,
+                                    pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
+            
             dl_tr = DataLoaderFlowTrain5(self.dataset_tr, self.basic_generator_patch_size, self.patch_size, self.batch_size, unlabeled_dataset=self.dataset_un_tr, video_length=self.video_length,
                                         crop_size=self.crop_size, processor=self.processor, is_val=False, oversample_foreground_percent=self.oversample_foreground_percent,
                                         pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
-            dl_val = DataLoaderFlowTrainPredictionVal(self.dataset_val, self.patch_size, self.patch_size, self.batch_size, unlabeled_dataset=self.dataset_un_val, video_length=self.video_length,
-                                        crop_size=self.crop_size, processor=self.processor, is_val=True, oversample_foreground_percent=self.oversample_foreground_percent,
-                                        pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
+            
             dl_overfitting = DataLoaderFlowTrain5(self.dataset_val, self.basic_generator_patch_size, self.patch_size, self.batch_size, unlabeled_dataset=self.dataset_un_val, video_length=self.video_length,
                                         crop_size=self.crop_size, processor=self.processor, is_val=True, oversample_foreground_percent=self.oversample_foreground_percent,
                                         pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')

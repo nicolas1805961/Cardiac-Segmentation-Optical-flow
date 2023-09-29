@@ -3,24 +3,6 @@ separability: False
 separability_loss_weight: 1.0
 convolutional_patch_embedding: True
 
-middle_loss_weight: 1.0
-seg_motion_estimation_loss_weight: 0.1
-alpha_ema: 0.01
-middle_classification: False
-middle_classification_weight: 0.1
-one_vs_all: True
-maximize_distance: False
-average_distance: False
-similarity_loss_weight: 10.0 #100.0
-#contrastive_loss_weight: 100.0
-mix_residual: True
-registered_seg: True
-nb_repeat: 4 #4, 2
-middle_unlabeled: False
-t1: 0.1
-t2: 0.5
-max_unlabeled_weight: 1
-v1: True
 
 log_images: True
 transformer_bottleneck: True
@@ -50,11 +32,11 @@ weight_decay: 0.0001 #0.0001
 warmup_percent: 0.1
 smoothing: 0.0
 max_num_epochs: 1000 #1000
-patch_size: [224, 224] # dynamic_mri=288, quorum=288
+patch_size: [384, 384] # dynamic_mri=384, quorum=288
 norm: 'BatchNorm2d' # 'InstanceNorm2d', 'BatchNorm2d', ''
 filter_skip_co_reconstruction: False
 filter_skip_co_segmentation: True
-bottleneck_heads: 8 # 16
+bottleneck_heads: 8 # 16, 8
 dim_feedforward: 3072
 activation: 'gelu'
 conv_layer: 'other'
@@ -64,7 +46,7 @@ conv_depth: [2, 2, 2]
 transformer_depth: [] #[2, 2, 2], [2]
 num_heads: [] #[3, 6, 12], [8] [12]
 spatial_cross_attention_num_heads: [2, 4, 8] #[2, 4, 6, 8, 12] [12, 8, 6, 4, 2] [bottom, ..., top] [3, 6, 12] [4, 4, 8, 8, 16]
-batch_size: 1 #6
+batch_size: 4 #6
 bottleneck: 'swin' # ['vit', 'swin', 'factorized', 'vit_3d', 'swin_3d']
 rpe_mode: 'bias' # ['contextual', 'bias', 'None']
 rpe_contextual_tensors: 'qkv'
@@ -158,38 +140,3 @@ reinforcement: False
 policy_net_learning_rate: 0.0001
 number_of_intervals: 20
 number_of_steps: 200
-
-nb_nets: 1
-
-second_conv_depth: [4, 4]
-second_transformer_depth: [2] #[2, 2, 2], [2]
-second_num_heads: [8] #[3, 6, 12], [8]
-second_in_dims: [1, 48, 192] #[1, 24, 96, 192, 384] [1, 96, 384] [1, 24, 96] [1, 32, 128]
-second_bottleneck_heads: 16
-second_net_loss_weight: 1.0
-
-third_conv_depth: [4, 4]
-third_transformer_depth: [2] #[2, 2, 2], [2]
-third_num_heads: [8] #[3, 6, 12], [8]
-third_in_dims: [1, 48, 192] #[1, 24, 96, 192, 384] [1, 96, 384] [1, 24, 96] [1, 32, 128]
-third_bottleneck_heads: 16
-third_net_loss_weight: 1.0
-
-loss_weights_binary: [0.0404778230051879, 0.959522176994812]
-
-small: False
-loss_weights_small: [0.02750239033581403, 0.6297990114118536, 0.1266837091920396, 0.21601488906029276]
-
-big: False
-loss_weights_big: [0.009622007580133, 0.34223122737765677, 0.32055540070262845, 0.3275913643395818]
-
-binary_resampled_loss_weights: [0.059967399088541644, 0.9400326009114582] # 224 = [0.03060070219494048, 0.9693992978050595]
-224_loss_weights: [0.0066582237764044325, 0.3385361280090397, 0.327149629210459, 0.32765601900409697]
-160_loss_weights: [0.009092481157748094, 0.33804275090754565, 0.3261811949429598, 0.32668357299174644]
-160_binary_loss_weights: [0.07630263784831759, 0.9236973621516824]
-128_loss_weights: [0.014816022021090905, 0.3359826005495696, 0.3243509091758728, 0.32485046825346664]
-128_loss_weights_125: [0.022908228964674742, 0.3329980403455186, 0.32179781244481237, 0.3222959182449944]
-128_transformed_loss_weights: [0.018200049361858688, 0.38031857478585657, 0.2682702694739415, 0.3332111063783432]
-352_loss_weights: [0.0026134481559843305, 0.33991460892062303, 0.3284817455838297, 0.32899019733956303]
-compute_overfitting: False
-attention_map: False

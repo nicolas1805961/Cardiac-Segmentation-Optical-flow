@@ -200,7 +200,7 @@ def main():
         output_folder_name = weight_folder
 
         
-    if '31' in task and network_trainer == 'nnMTLTrainerV2':
+    if network_trainer == 'nnMTLTrainerV2':
         trainer = trainer_class(plans_file, fold, output_folder=output_folder_name, dataset_directory=dataset_directory,
                             batch_dice=batch_dice, stage=stage, unpack_data=decompress_data,
                             deterministic=deterministic,

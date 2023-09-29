@@ -2280,10 +2280,10 @@ class TransformerFlowSegEncoderMutual(nn.Module):
         super().__init__()
         self.num_layers = num_layers
         bilateral_attention_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
-        multilateral_attention_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
+        #multilateral_attention_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
 
         self.bilateral_attention_layers = _get_clones(bilateral_attention_layer, num_layers)
-        self.multilateral_attention_layers = _get_clones(multilateral_attention_layer, num_layers)
+        #self.multilateral_attention_layers = _get_clones(multilateral_attention_layer, num_layers)
 
         self.pos_obj_2d = PositionEmbeddingSine2d(num_pos_feats=dim // 2, normalize=True)
     
@@ -2318,22 +2318,22 @@ class TransformerFlowSegEncoderMutual(nn.Module):
             
             frames, anchor = concat0.chunk(2, dim=0)
 
-            frames_mean = frames.view(T, B, H * W, C).mean(0)
-            frames_mean = frames_mean[None].repeat(T, 1, 1, 1)
-            frames_mean = frames_mean.view(T * B, H * W, C)
-
-            anchor_mean = anchor.view(T, B, H * W, C).mean(0)
-            anchor_mean = anchor_mean[None].repeat(T, 1, 1, 1)
-            anchor_mean = anchor_mean.view(T * B, H * W, C)
-
-            concat0 = torch.cat([frames, anchor], dim=0)
-            concat1 = torch.cat([frames_mean, anchor_mean], dim=0)
-
-            pos = pos_2d.repeat(2, 1, 1)
-
-            concat0 = self.multilateral_attention_layers[l](query=concat0, key=concat1, query_pos=pos, key_pos=pos)[0]
-
-            frames, anchor = concat0.chunk(2, dim=0)
+            #frames_mean = frames.view(T, B, H * W, C).mean(0)
+            #frames_mean = frames_mean[None].repeat(T, 1, 1, 1)
+            #frames_mean = frames_mean.view(T * B, H * W, C)
+#
+            #anchor_mean = anchor.view(T, B, H * W, C).mean(0)
+            #anchor_mean = anchor_mean[None].repeat(T, 1, 1, 1)
+            #anchor_mean = anchor_mean.view(T * B, H * W, C)
+#
+            #concat0 = torch.cat([frames, anchor], dim=0)
+            #concat1 = torch.cat([frames_mean, anchor_mean], dim=0)
+#
+            #pos = pos_2d.repeat(2, 1, 1)
+#
+            #concat0 = self.multilateral_attention_layers[l](query=concat0, key=concat1, query_pos=pos, key_pos=pos)[0]
+#
+            #frames, anchor = concat0.chunk(2, dim=0)
 
         frames = frames.view(T, B, H * W, C)
         frames = frames.permute(0, 1, 3, 2).contiguous()
@@ -2490,41 +2490,44 @@ class TransformerLib(nn.Module):
         pos_2d = self.pos_obj_2d(shape_util=(B, H, W), device=unlabeled.device)
         pos_2d = pos_2d.permute(0, 2, 3, 1).contiguous()
         pos_2d = pos_2d.view(B, H * W, C)
-        pos_2d = pos_2d[None].repeat(T - 1, 1, 1, 1)
-        pos_2d = pos_2d.view((T - 1) * B, H * W, C)
+        pos_2d = pos_2d[None].repeat(T, 1, 1, 1)
+        pos_2d = pos_2d.view(T * B, H * W, C)
 
-        strain = self.strain[None, None].repeat((T - 1) * B, 1, 1) # (T - 1) * B, 1, C
+        strain = self.strain[None, None].repeat(T * B, 1, 1) # T * B, 1, C
         lv_strain = strain
         rv_strain = strain
 
-        lv_strain_pos = self.lv_strain_pos[None, None].repeat((T - 1) * B, 1, 1) # (T - 1) * B, 1, C
-        rv_strain_pos = self.rv_strain_pos[None, None].repeat((T - 1) * B, 1, 1) # (T - 1) * B, 1, C
+        lv_strain_pos = self.lv_strain_pos[None, None].repeat(T * B, 1, 1) # T * B, 1, C
+        rv_strain_pos = self.rv_strain_pos[None, None].repeat(T * B, 1, 1) # T * B, 1, C
 
         forward = unlabeled[1:]
         backward = unlabeled[:-1]
 
-        backward = backward.view((T - 1) * B, H * W, C)
-        forward = forward.view((T - 1) * B, H * W, C)
+        forward = torch.cat([unlabeled[0][None], forward], dim=0)
+        backward = torch.cat([unlabeled[0][None], backward], dim=0)
+
+        backward = backward.view(T * B, H * W, C)
+        forward = forward.view(T * B, H * W, C)
 
         for l in range(self.num_layers):
-            forward = torch.cat([forward, lv_strain, rv_strain], dim=1) # (T - 1) * B, H * W + 2, C
-            pos = torch.cat([pos_2d, lv_strain_pos, rv_strain_pos], dim=1) # (T - 1) * B, H * W + 2, C
+            forward = torch.cat([forward, lv_strain, rv_strain], dim=1) # T * B, H * W + 2, C
+            pos = torch.cat([pos_2d, lv_strain_pos, rv_strain_pos], dim=1) # T * B, H * W + 2, C
             forward, weights = self.bilateral_attention_layers[l](query=forward, key=backward, query_pos=pos, key_pos=pos_2d)
             forward, lv_strain, rv_strain = torch.split(forward, [H*W, 1, 1], dim=1)
 
-            lv_strain = lv_strain.view((T - 1), B, 1, C).squeeze(2) # (T - 1), B, C
-            rv_strain = rv_strain.view((T - 1), B, 1, C).squeeze(2) # (T - 1), B, C
+            lv_strain = lv_strain.view(T, B, 1, C).squeeze(2) # T, B, C
+            rv_strain = rv_strain.view(T, B, 1, C).squeeze(2) # T, B, C
 
-            lv_strain = lv_strain.permute(1, 2, 0).contiguous() # B, C, (T - 1)
-            rv_strain = rv_strain.permute(1, 2, 0).contiguous() # B, C, (T - 1)
+            lv_strain = lv_strain.permute(1, 2, 0).contiguous() # B, C, T
+            rv_strain = rv_strain.permute(1, 2, 0).contiguous() # B, C, T
 
-            pos_lv = self.conv_1d_layers[l](lv_strain) # B, C, (T - 1)
-            pos_rv = self.conv_1d_layers[l](rv_strain) # B, C, (T - 1)
+            pos_lv = self.conv_1d_layers[l](lv_strain) # B, C, T
+            pos_rv = self.conv_1d_layers[l](rv_strain) # B, C, T
 
-            pos_lv = pos_lv.permute(0, 2, 1).contiguous() # B, (T - 1), C
-            pos_rv = pos_rv.permute(0, 2, 1).contiguous() # B, (T - 1), C
-            lv_strain = lv_strain.permute(0, 2, 1).contiguous() # B, (T - 1), C
-            rv_strain = rv_strain.permute(0, 2, 1).contiguous() # B, (T - 1), C
+            pos_lv = pos_lv.permute(0, 2, 1).contiguous() # B, T, C
+            pos_rv = pos_rv.permute(0, 2, 1).contiguous() # B, T, C
+            lv_strain = lv_strain.permute(0, 2, 1).contiguous() # B, T, C
+            rv_strain = rv_strain.permute(0, 2, 1).contiguous() # B, T, C
 
             concat0 = torch.cat([lv_strain, rv_strain], dim=0)
             pos = torch.cat([pos_lv, pos_rv], dim=0)
@@ -2532,41 +2535,29 @@ class TransformerLib(nn.Module):
             concat0 = self.strain_layers[l](concat0, pos=pos)[0]
             lv_strain, rv_strain = torch.chunk(concat0, 2, 0)
 
-            lv_strain = lv_strain.permute(1, 0, 2).contiguous() # (T - 1), B, C
-            rv_strain = rv_strain.permute(1, 0, 2).contiguous() # (T - 1), B, C
+            lv_strain = lv_strain.permute(1, 0, 2).contiguous() # T, B, C
+            rv_strain = rv_strain.permute(1, 0, 2).contiguous() # T, B, C
 
-            lv_strain = lv_strain.view((T - 1) * B, C)[:, None] # (T - 1) * B, 1, C
-            rv_strain = rv_strain.view((T - 1) * B, C)[:, None] # (T - 1) * B, 1, C
+            lv_strain = lv_strain.view(T * B, C)[:, None] # T * B, 1, C
+            rv_strain = rv_strain.view(T * B, C)[:, None] # T * B, 1, C
         
-        forward = forward.view(T - 1, B, H * W, C)
-        pos_2d = pos_2d.view(T - 1, B, H * W, C)
+        forward = forward.view(T, B, H * W, C)
 
-        global_motion_forward_list = []
-        key = forward[0]
-        for i in range(len(forward)):
-            attn_out = self.decoder_layers(query=forward[i], key=key, query_pos=pos_2d, key_pos=pos_2d)[0]
-            key = attn_out
-            global_motion_forward_list.append(key)
-        global_motion_forward = torch.stack(global_motion_forward_list, dim=0)
+        forward = forward.permute(0, 1, 3, 2).contiguous() # T, B, C, H * W
+        forward = forward.view(T, B, C, H, W)
 
-        global_motion_forward = global_motion_forward.permute(0, 1, 3, 2).contiguous()
-        global_motion_forward = global_motion_forward.view(T - 1, B, C, H, W)
+        lv_strain = lv_strain.permute(0, 2, 1).contiguous() # T * B, C, 1
+        lv_strain = lv_strain.view(T, B, C)
 
-        forward = forward.permute(0, 1, 3, 2).contiguous() # T - 1, B, C, H * W
-        forward = forward.view(T - 1, B, C, H, W)
+        rv_strain = rv_strain.permute(0, 2, 1).contiguous() # T * B, C, 1
+        rv_strain = rv_strain.view(T, B, C)
 
-        lv_strain = lv_strain.permute(0, 2, 1).contiguous() # (T - 1) * B, C, 1
-        lv_strain = lv_strain.view(T - 1, B, C)
+        lv_strain = self.mlp(lv_strain).squeeze(2) # T, B
+        rv_strain = self.mlp(rv_strain).squeeze(2) # T, B
 
-        rv_strain = rv_strain.permute(0, 2, 1).contiguous() # (T - 1) * B, C, 1
-        rv_strain = rv_strain.view(T - 1, B, C)
+        weights = weights[:, -2, :].view(T, B, H * W).view(T, B, H, W)
 
-        lv_strain = self.mlp(lv_strain).squeeze(2) # T - 1, B
-        rv_strain = self.mlp(rv_strain).squeeze(2) # T - 1, B
-
-        weights = weights[:, -2, :].view(T - 1, B, H * W).view(T - 1, B, H, W)
-
-        return forward, global_motion_forward, lv_strain, rv_strain, weights
+        return forward, lv_strain, rv_strain, weights
     
 
 

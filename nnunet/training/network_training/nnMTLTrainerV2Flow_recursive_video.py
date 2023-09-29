@@ -94,6 +94,7 @@ from nnunet.training.data_augmentation.cutmix import cutmix, batched_rand_bbox
 import shutil
 from nnunet.visualization.visualization import Visualizer
 from nnunet.training.network_training.processor import Processor
+from nnunet.training.network_training.utils import save_strain
 
 class nnMTLTrainerV2FlowRecursiveVideo(nnUNetTrainer):
     """
@@ -114,7 +115,7 @@ class nnMTLTrainerV2FlowRecursiveVideo(nnUNetTrainer):
         else:
             self.inference = True
             self.config = config
-        self.cropper_weights_folder_path = 'binary'
+        self.cropper_weights_folder_path = 'binary' if '32' not in self.task else 'binary_lib'
         self.video_length = self.config['video_length']
         self.crop = self.config['crop']
         self.feature_extractor = self.config['feature_extractor']
@@ -872,8 +873,8 @@ class nnMTLTrainerV2FlowRecursiveVideo(nnUNetTrainer):
             #print(self.dataset[phase_list[0]])
             properties = load_pickle(self.dataset[phase_list[0]]['properties_file'])
 
-            ed_indices = np.array(properties['ed_number']) - 1
-            es_indices = np.array(properties['es_number']) - 1
+            ed_idx = np.rint(np.array(properties['ed_number'])).astype(np.uint8) % len(phase_list)
+            es_idx = np.rint(np.array(properties['es_number'])).astype(np.uint8) % len(phase_list)
 
             unlabeled = np.full(shape=((len(phase_list), 1) + properties['size_after_resampling']), fill_value=np.nan)
             target = np.full(shape=((len(phase_list), 1) + properties['size_after_resampling']), fill_value=np.nan)
@@ -885,23 +886,19 @@ class nnMTLTrainerV2FlowRecursiveVideo(nnUNetTrainer):
                     target[idx][target[idx] == -1] = 0
                     unlabeled[idx] = current_data[0] + 1e-8
 
-                all_where_list = []
-                assert len(ed_indices) == unlabeled.shape[2]
-                for d in range(unlabeled.shape[2]):
-                    frame_indices = np.arange(len(phase_list))
+                frame_indices = np.arange(len(phase_list))
 
-                    before_where = np.argwhere(frame_indices < ed_indices[d]).reshape(-1,)
-                    after_where = np.argwhere(frame_indices >= ed_indices[d]).reshape(-1,)
+                before_where = np.argwhere(frame_indices < ed_idx).reshape(-1,)
+                after_where = np.argwhere(frame_indices >= ed_idx).reshape(-1,)
 
-                    all_where = np.concatenate([after_where, before_where])
-                    all_where_list.append(all_where)
+                all_where = np.concatenate([after_where, before_where])
 
-                    frame_indices = frame_indices[all_where]
-                    unlabeled[:, :, d] = unlabeled[frame_indices, :, d]
+                frame_indices = frame_indices[all_where]
+                unlabeled = unlabeled[frame_indices]
 
 
                 #matplotlib.use('QtAgg')
-                #print(ed_indices)
+                #print(ed_idx)
                 #print(es_indices)
                 #fig, ax = plt.subplots(1, int(len(unlabeled) / 4))
                 #for i in range(0, len(unlabeled), 4):
@@ -928,11 +925,10 @@ class nnMTLTrainerV2FlowRecursiveVideo(nnUNetTrainer):
 
                 assert len(softmax_pred) == len(flow_pred) == len(registered_pred)
 
-                for d, all_where in enumerate(all_where_list):
-                    sorted_where = np.argsort(all_where)
-                    softmax_pred[:, :, d] = softmax_pred[sorted_where, :, d]
-                    flow_pred[:, :, d] = flow_pred[sorted_where, :, d]
-                    registered_pred[:, :, d] = registered_pred[sorted_where, :, d]
+                sorted_where = np.argsort(all_where)
+                softmax_pred = softmax_pred[sorted_where]
+                flow_pred = flow_pred[sorted_where]
+                registered_pred = registered_pred[sorted_where]
 
                 assert len(softmax_pred) == len(flow_pred) == len(phase_list)
 

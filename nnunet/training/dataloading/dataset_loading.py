@@ -4092,14 +4092,16 @@ class DataLoaderFlowTrain5Lib(SlimDataLoaderBase):
                 properties = load_pickle(self._data[labeled_frame]['properties_file'])
             case_properties.append(properties)
 
-            ed_indices = np.array(properties['ed_number']) - 1
-            es_indices = np.array(properties['es_number']) - 1
+            #print(properties['ed_number'])
+            #print(np.rint(np.array(properties['ed_number'])))
+            #print('******************')
+
+            ed_idx = np.rint(np.array(properties['ed_number'])).astype(np.uint8) % len(frames)
+            es_idx = np.rint(np.array(properties['es_number'])).astype(np.uint8) % len(frames)
 
             depth = properties['size_after_resampling'][0]
             depth_idx = np.random.choice(depth)
 
-            ed_idx = ed_indices[depth_idx]
-            es_idx = es_indices[depth_idx]
             global_labeled_idx = np.array([ed_idx, es_idx])
 
             frames = sorted(frames, key=lambda x: int(x[16:18]))
@@ -5211,14 +5213,12 @@ class DataLoaderFlowTrainPredictionValLib(SlimDataLoaderBase):
                 properties = load_pickle(self._data[labeled_frame]['properties_file'])
             case_properties.append(properties)
 
-            ed_indices = np.array(properties['ed_number']) - 1
-            es_indices = np.array(properties['es_number']) - 1
+            ed_idx = np.rint(np.array(properties['ed_number'])).astype(np.uint8)
+            es_idx = np.rint(np.array(properties['es_number'])).astype(np.uint8)
 
             depth = properties['size_after_resampling'][0]
             depth_idx = np.random.choice(depth)
 
-            ed_idx = ed_indices[depth_idx]
-            es_idx = es_indices[depth_idx]
             global_labeled_idx = np.array([ed_idx, es_idx])
 
             frames = sorted(frames, key=lambda x: int(x[16:18]))

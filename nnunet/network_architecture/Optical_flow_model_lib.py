@@ -190,7 +190,7 @@ class OpticalFlowModelLib(SegmentationNetwork):
         unlabeled_features = torch.stack(unlabeled_feature_list, dim=0) # T, B, C, H, W
 
         T, B, C, H, W = unlabeled_features.shape
-        forward, global_forward, lv_strain, rv_strain, weights = self.bottleneck(unlabeled_features)
+        forward, lv_strain, rv_strain, weights = self.bottleneck(unlabeled_features)
 
         for t in range(len(forward)):
             current_seg = self.seg_decoder(forward[t], unlabeled_skip_co_list[t])

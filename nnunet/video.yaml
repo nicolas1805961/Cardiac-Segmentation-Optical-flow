@@ -1,15 +1,12 @@
-model: 'swin' #'swin'
-separability: False
-separability_loss_weight: 0.0
-convolutional_patch_embedding: True
+use_sfb: False
 
-strain_loss_weight: 0.0 # 100.0
-forward_flow_loss_weight: 0.0 #1.0
+strain_loss_weight: 100.0 # 100.0
+forward_flow_loss_weight: 1.0 #1.0
 
 local_motion_loss_weight: 0.0
-global_motion_forward_loss_weight: 1.0
+global_motion_forward_loss_weight: 0.0
 global_motion_backward_loss_weight: 0.0
-semi_supervised_forward_loss_weight: 1.0
+semi_supervised_forward_loss_weight: 0.0
 semi_supervised_backward_loss_weight: 0.0
 
 seg_to_seg_forward_loss_weight: 0.0
@@ -45,7 +42,7 @@ image_flow_loss_weight: 0.0 # 0.0
 long_image_flow_loss_weight: 0.0 # 0.0
 force_one_label: True
 feature_extractor: False
-video_length: 3
+video_length: 4
 crop: True
 cropper_weights_folder_path: 'binary'
 video_weights_folder_path: 'pretrained_3d_3d' #'pretrained_old', 'pretrained_3d', 'pretrained_3d_3d'
@@ -53,7 +50,7 @@ crop_size: 192
 nb_layers: 1
 
 labeled: False
-log_images: False
+log_images: True
 patch_size: [224, 224]
 device: 'cuda:0'
 deep_supervision: False
@@ -65,7 +62,7 @@ optimizer: 'adam'
 initial_lr: 0.0001 #0.0001
 weight_decay: 0.0001 #0.0001
 warmup_percent: 0.1
-max_num_epochs: 600 #400
+max_num_epochs: 1 #400
 #window_size: 7
 #image_size: 224
 norm: 'batchnorm' # 'instancenorm', 'batchnorm'
