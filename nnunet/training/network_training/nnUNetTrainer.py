@@ -46,7 +46,7 @@ from nnunet.inference.segmentation_export import save_segmentation_nifti_from_so
 from nnunet.network_architecture.generic_UNet import Generic_UNet
 from nnunet.network_architecture.initialization import InitWeights_He
 from nnunet.network_architecture.neural_network import SegmentationNetwork
-from nnunet.postprocessing.connected_components import determine_postprocessing, determine_postprocessing_no_metric
+from nnunet.postprocessing.connected_components import determine_postprocessing, determine_postprocessing_no_metric, determine_postprocessing_custom_with_metrics
 from nnunet.training.data_augmentation.default_data_augmentation import default_3D_augmentation_params, \
     default_2D_augmentation_params, get_default_augmentation, get_patch_size
 from nnunet.training.dataloading.dataset_loading import load_dataset, DataLoader3D, DataLoader2D, unpack_dataset
@@ -640,7 +640,7 @@ class nnUNetTrainer(NetworkTrainer):
                                                          use_gaussian: bool = True, pad_border_mode: str = 'constant',
                                                          pad_kwargs: dict = None, all_in_gpu: bool = False,
                                                          verbose: bool = True, mixed_precision: bool = True,
-                                                         get_flops=False, binary=False) -> Tuple[np.ndarray, np.ndarray]:
+                                                         get_flops=False, binary=False, normalize=False) -> Tuple[np.ndarray, np.ndarray]:
         """
         :param data:
         :param do_mirroring:
@@ -674,7 +674,7 @@ class nnUNetTrainer(NetworkTrainer):
                                       patch_size=self.patch_size, regions_class_order=self.regions_class_order,
                                       use_gaussian=use_gaussian, pad_border_mode=pad_border_mode,
                                       pad_kwargs=pad_kwargs, all_in_gpu=all_in_gpu, verbose=verbose,
-                                      mixed_precision=mixed_precision, get_flops=get_flops, binary=binary)
+                                      mixed_precision=mixed_precision, get_flops=get_flops, binary=binary, normalize=normalize)
         self.network.train(current_mode)
         return ret
 
@@ -733,10 +733,13 @@ class nnUNetTrainer(NetworkTrainer):
     def validate(self, log_function, do_mirroring: bool = True, use_sliding_window: bool = True, step_size: float = 0.5,
                  save_softmax: bool = True, use_gaussian: bool = True, overwrite: bool = True,
                  validation_folder_name: str = 'validation_raw', debug: bool = True, all_in_gpu: bool = False,
-                 segmentation_export_kwargs: dict = None, run_postprocessing_on_folds: bool = True, output_folder=None, binary=False):
+                 segmentation_export_kwargs: dict = None, run_postprocessing_on_folds: bool = True, output_folder=None, binary=False, patch_size=None, nb_threads=1, normalize=False, rv_rejection=False):
         """
         if debug=True then the temporary files generated for postprocessing determination will be kept
         """
+
+        if patch_size is not None:
+            self.patch_size = patch_size
 
         current_mode = self.network.training
         self.network.eval()
@@ -791,11 +794,11 @@ class nnUNetTrainer(NetworkTrainer):
 
         pred_gt_tuples = []
 
-        export_pool = Pool(default_num_threads)
+        export_pool = Pool(nb_threads)
         results = []
 
         metadata_list = []
-        for idx, k in enumerate(self.dataset_val.keys()):
+        for idx, k in enumerate(tqdm(self.dataset_val.keys())):
             properties = load_pickle(self.dataset[k]['properties_file'])
             metadata_list.append(self.create_metadata_dict(properties))
             fname = properties['list_of_data_files'][0].split(os.sep)[-1][:-12]
@@ -819,7 +822,8 @@ class nnUNetTrainer(NetworkTrainer):
                                                                             all_in_gpu=all_in_gpu,
                                                                             mixed_precision=self.fp16,
                                                                             get_flops=get_flops,
-                                                                            binary=binary)
+                                                                            binary=binary,
+                                                                            normalize=normalize)
 
                 softmax_pred = out[1]
                 
@@ -866,54 +870,56 @@ class nnUNetTrainer(NetworkTrainer):
         _ = [i.get() for i in results]
         self.print_to_log_file("finished prediction")
 
-        # evaluate raw predictions
-        self.print_to_log_file("evaluation of raw predictions")
-        task = self.dataset_directory.split(os.sep)[-1]
-        job_name = self.experiment_name
-        _ = aggregate_scores(pred_gt_tuples, labels=list(range(self.num_classes)),
-                             json_output_file=join(output_folder, "summary.json"),
-                             json_name=job_name + " val tiled %s" % (str(use_sliding_window)),
-                             json_author="Fabian",
-                             json_task=task, num_threads=default_num_threads,
-                             advanced=True,
-                             metadata_list=metadata_list,
-                             binary=binary)
+        determine_postprocessing_custom_with_metrics(self.output_folder, self.gt_niftis_folder, validation_folder_name,
+                                    final_subf_name=validation_folder_name + "_postprocessed", debug=True, metadata_list=metadata_list, nb_threads=nb_threads, rv_rejection=rv_rejection)
 
-        if run_postprocessing_on_folds:
-            # in the old nnunet we would stop here. Now we add a postprocessing. This postprocessing can remove everything
-            # except the largest connected component for each class. To see if this improves results, we do this for all
-            # classes and then rerun the evaluation. Those classes for which this resulted in an improved dice score will
-            # have this applied during inference as well
-            self.print_to_log_file("determining postprocessing")
-            determine_postprocessing(self.output_folder, self.gt_niftis_folder, validation_folder_name,
-                                     final_subf_name=validation_folder_name + "_postprocessed", debug=debug, log_function=log_function,
-                                     metadata_list=metadata_list, binary=binary)
-            # after this the final predictions for the vlaidation set can be found in validation_folder_name_base + "_postprocessed"
-            # They are always in that folder, even if no postprocessing as applied!
 
-        # detemining postprocesing on a per-fold basis may be OK for this fold but what if another fold finds another
-        # postprocesing to be better? In this case we need to consolidate. At the time the consolidation is going to be
-        # done we won't know what self.gt_niftis_folder was, so now we copy all the niftis into a separate folder to
-        # be used later
-        gt_nifti_folder = join(self.output_folder_base, "gt_niftis")
-        maybe_mkdir_p(gt_nifti_folder)
-        for f in subfiles(self.gt_niftis_folder, suffix=".nii.gz"):
-            success = False
-            attempts = 0
-            e = None
-            while not success and attempts < 10:
-                try:
-                    shutil.copy(f, gt_nifti_folder)
-                    success = True
-                except OSError as e:
-                    attempts += 1
-                    sleep(1)
-            if not success:
-                print("Could not copy gt nifti file %s into folder %s" % (f, gt_nifti_folder))
-                if e is not None:
-                    raise e
 
-        self.network.train(current_mode)
+
+    def validate_simple(self, log_function, do_mirroring: bool = True, use_sliding_window: bool = True, step_size: float = 0.5,
+                 save_softmax: bool = True, use_gaussian: bool = True, overwrite: bool = True,
+                 validation_folder_name: str = 'validation_raw', debug: bool = True, all_in_gpu: bool = False,
+                 segmentation_export_kwargs: dict = None, run_postprocessing_on_folds: bool = True, output_folder=None, binary=False, patch_size=None, nb_threads=1):
+        """
+        if debug=True then the temporary files generated for postprocessing determination will be kept
+        """
+
+        if patch_size is not None:
+            self.patch_size = patch_size
+
+        self.network.eval()
+
+        assert self.was_initialized, "must initialize, ideally with checkpoint (or train first)"
+        if self.dataset_val is None:
+            self.load_dataset()
+            self.do_split()
+
+        # predictions as they come from the network go here
+        if output_folder is not None:
+            self.output_folder = output_folder
+        output_folder = join(self.output_folder, validation_folder_name)
+        maybe_mkdir_p(output_folder)
+        # this is for debug purposes
+        my_input_args = {'do_mirroring': do_mirroring,
+                         'use_sliding_window': use_sliding_window,
+                         'step_size': step_size,
+                         'save_softmax': save_softmax,
+                         'use_gaussian': use_gaussian,
+                         'overwrite': overwrite,
+                         'validation_folder_name': validation_folder_name,
+                         'debug': debug,
+                         'all_in_gpu': all_in_gpu,
+                         'segmentation_export_kwargs': segmentation_export_kwargs,
+                         }
+        save_json(my_input_args, join(output_folder, "validation_args.json"))
+
+        metadata_list = []
+        for idx, k in enumerate(tqdm(self.dataset_val.keys())):
+            properties = load_pickle(self.dataset[k]['properties_file'])
+            metadata_list.append(self.create_metadata_dict(properties))
+        
+        determine_postprocessing_custom_with_metrics(self.output_folder, self.gt_niftis_folder, validation_folder_name,
+                                    final_subf_name=validation_folder_name + "_postprocessed", debug=True, metadata_list=metadata_list, nb_threads=nb_threads)
     
 
     def validate_video(self, processor, log_function, step, do_mirroring: bool = True, use_sliding_window: bool = True, step_size: float = 0.5,
@@ -1236,14 +1242,12 @@ class nnUNetTrainer(NetworkTrainer):
                     #    labeled_idx = idx
                     if '_u' in frame:
                         current_data = np.load(self.dataset_un_val[frame]['data_file'])['data']
-                        current_data = current_data + 1e-8
                         unlabeled[idx] = current_data
                     else:
                         current_data = np.load(self.dataset_val[frame]['data_file'])['data']
                         #current_data[-1][current_data[-1] == -1] = 0
                         target[idx] = current_data[1]
                         target[idx][target[idx] == -1] = 0
-                        unlabeled[idx] = current_data[0] + 1e-8
                         target_mask[idx] = True
                     #self.print_to_log_file(k, data.shape)
                 
@@ -1528,14 +1532,12 @@ class nnUNetTrainer(NetworkTrainer):
                     #    labeled_idx = idx
                     if '_u' in frame:
                         current_data = np.load(self.dataset_un_val[frame]['data_file'])['data']
-                        current_data = current_data + 1e-8
                         unlabeled[idx] = current_data
                     else:
                         current_data = np.load(self.dataset_val[frame]['data_file'])['data']
                         #current_data[-1][current_data[-1] == -1] = 0
                         target[idx] = current_data[1]
                         target[idx][target[idx] == -1] = 0
-                        unlabeled[idx] = current_data[0] + 1e-8
                         target_mask[idx] = True
                     #self.print_to_log_file(k, data.shape)
 
@@ -1887,14 +1889,12 @@ class nnUNetTrainer(NetworkTrainer):
                     #    labeled_idx = idx
                     if '_u' in frame:
                         current_data = np.load(self.dataset_un_val[frame]['data_file'])['data']
-                        current_data = current_data + 1e-8
                         unlabeled[idx] = current_data
                     else:
                         current_data = np.load(self.dataset_val[frame]['data_file'])['data']
                         #current_data[-1][current_data[-1] == -1] = 0
                         target[idx] = current_data[1]
                         target[idx][target[idx] == -1] = 0
-                        unlabeled[idx] = current_data[0] + 1e-8
                         target_mask[idx] = True
                     #self.print_to_log_file(k, data.shape)
                 
@@ -1915,6 +1915,7 @@ class nnUNetTrainer(NetworkTrainer):
                                                                                 verbose=False)
                 flow_pred = ret[0] # T, C, depth, H, W
                 registered_pred = ret[1] # T, C, depth, H, W
+                raw_flow = ret[2] # T, C, depth, H, W
 
                 assert len(flow_pred) == len(registered_pred)
 
@@ -1923,6 +1924,7 @@ class nnUNetTrainer(NetworkTrainer):
                 registered_pred = registered_pred[sorted_where]
                 target_mask = target_mask[sorted_where]
                 phase_list = phase_list[sorted_where]
+                raw_flow = raw_flow[sorted_where]
 
                 softmax_pred = np.zeros_like(registered_pred)
 
@@ -1956,6 +1958,9 @@ class nnUNetTrainer(NetworkTrainer):
                 assert len(gt_indices) == 2
 
                 for t in range(len(phase_list)):
+                    if t == gt_indices[0]:
+                        continue
+
                     if '_u' in phase_list[t]:
                         properties = load_pickle(self.unlabeled_dataset[phase_list[t]]['properties_file'])
                     else:
@@ -1965,15 +1970,19 @@ class nnUNetTrainer(NetworkTrainer):
                     current_softmax_pred = softmax_pred[t]
                     current_softmax_pred = current_softmax_pred.transpose([0] + [i + 1 for i in self.transpose_backward])
 
+                    current_raw_flow = raw_flow[t]
+                    current_raw_flow = current_raw_flow.transpose([0] + [i + 1 for i in self.transpose_backward])
+
                     if save_softmax:
                         softmax_fname = join(output_folder, fname + ".npz")
                     else:
                         softmax_fname = None
 
                     splitted = fname.split('frame')
-                    to_nb = int(splitted[-1].split('_')[0].split('.')[0])
-                    flow_name = splitted[0] + 'frame' + '01'.zfill(2) + '_to_' + str(to_nb).zfill(2)
-                    flow_path = join(newpath_flow, flow_name + ".nii.gz")
+                    from_nb = 0
+                    to_nb = t
+                    flow_name = splitted[0] + 'frame' + str(from_nb + 1).zfill(2) + '_to_' + str(to_nb + 1).zfill(2)
+                    flow_path = join(newpath_flow, flow_name + ".npz")
                     current_flow = flow_pred[t]
                     current_flow = current_flow.transpose([0] + [i + 1 for i in self.transpose_backward])
 
@@ -1998,17 +2007,16 @@ class nnUNetTrainer(NetworkTrainer):
                                                             None, None,
                                                             softmax_fname, None, force_separate_z,
                                                             interpolation_order_z, False, current_flow, flow_path,
-                                                            current_registered, registered_path),
+                                                            current_registered, registered_path, current_raw_flow),
                                                             )
                                                             )
                                 )
-                    
-                    
-                    if t == gt_indices[1]:
-                        to_validate_registered_list.append(fname + ".nii.gz")
-                        metadata_list_registered.append(self.create_metadata_dict(properties))
-                        pred_gt_tuples_register.append([registered_path,
-                                                join(self.gt_niftis_folder, fname + ".nii.gz")])
+                
+                
+                    to_validate_registered_list.append(fname + ".nii.gz")
+                    metadata_list_registered.append(self.create_metadata_dict(properties))
+                    pred_gt_tuples_register.append([registered_path,
+                                            join(self.gt_niftis_folder, fname + ".nii.gz")])
 
         _ = [i.get() for i in results]
         self.print_to_log_file("finished prediction")
@@ -2181,14 +2189,12 @@ class nnUNetTrainer(NetworkTrainer):
                     #    labeled_idx = idx
                     if '_u' in frame:
                         current_data = np.load(self.dataset_un_val[frame]['data_file'])['data']
-                        current_data = current_data + 1e-8
                         unlabeled[idx] = current_data
                     else:
                         current_data = np.load(self.dataset_val[frame]['data_file'])['data']
                         #current_data[-1][current_data[-1] == -1] = 0
                         target[idx] = current_data[1]
                         target[idx][target[idx] == -1] = 0
-                        unlabeled[idx] = current_data[0] + 1e-8
                         target_mask[idx] = True
                     #self.print_to_log_file(k, data.shape)
                 
@@ -2211,6 +2217,7 @@ class nnUNetTrainer(NetworkTrainer):
                 softmax_pred = ret[1] # T, C, depth, H, W
                 flow_pred = ret[2] # T, C, depth, H, W
                 registered_pred = ret[3] # T, C, depth, H, W
+                raw_flow = ret[4]
 
                 assert len(softmax_pred) == len(flow_pred) == len(registered_pred)
 
@@ -2221,6 +2228,7 @@ class nnUNetTrainer(NetworkTrainer):
                 registered_pred = registered_pred[sorted_where]
                 target_mask = target_mask[sorted_where]
                 phase_list = phase_list[sorted_where]
+                raw_flow = raw_flow[sorted_where]
 
                 #matplotlib.use('QtAgg')
                 #fig, ax = plt.subplots(1, 7)
@@ -2261,15 +2269,19 @@ class nnUNetTrainer(NetworkTrainer):
                     current_softmax_pred = softmax_pred[t]
                     current_softmax_pred = current_softmax_pred.transpose([0] + [i + 1 for i in self.transpose_backward])
 
+                    current_raw_flow = raw_flow[t]
+                    current_raw_flow = current_raw_flow.transpose([0] + [i + 1 for i in self.transpose_backward])
+
                     if save_softmax:
                         softmax_fname = join(output_folder, fname + ".npz")
                     else:
                         softmax_fname = None
 
                     splitted = fname.split('frame')
-                    to_nb = int(splitted[-1].split('_')[0].split('.')[0])
-                    flow_name = splitted[0] + 'frame' + '01'.zfill(2) + '_to_' + str(to_nb).zfill(2)
-                    flow_path = join(newpath_flow, flow_name + ".nii.gz")
+                    from_nb = 0
+                    to_nb = t
+                    flow_name = splitted[0] + 'frame' + str(from_nb + 1).zfill(2) + '_to_' + str(to_nb + 1).zfill(2)
+                    flow_path = join(newpath_flow, flow_name + ".npz")
                     current_flow = flow_pred[t]
                     current_flow = current_flow.transpose([0] + [i + 1 for i in self.transpose_backward])
 
@@ -2294,7 +2306,7 @@ class nnUNetTrainer(NetworkTrainer):
                                                             None, None,
                                                             softmax_fname, None, force_separate_z,
                                                             interpolation_order_z, False, current_flow, flow_path,
-                                                            current_registered, registered_path),
+                                                            current_registered, registered_path, current_raw_flow),
                                                             )
                                                             )
                                 )
@@ -2692,7 +2704,6 @@ class nnUNetTrainer(NetworkTrainer):
                     current_data = np.load(self.dataset_val[frame]['data_file'])['data']
                     target[idx] = current_data[1]
                     target[idx][target[idx] == -1] = 0
-                    unlabeled[idx] = current_data[0] + 1e-8
 
                 #all_where_list = []
                 #print(ed_indices)
@@ -2847,14 +2858,12 @@ class nnUNetTrainer(NetworkTrainer):
             # have this applied during inference as well
             self.print_to_log_file("determining postprocessing")
             base_segmentation = join(self.output_folder, 'Segmentation')
-            determine_postprocessing_no_metric(base_segmentation, self.gt_niftis_folder, validation_folder_name,
-                                     final_subf_name=validation_folder_name + "_postprocessed", debug=debug, log_function=log_function,
-                                     metadata_list=metadata_list, to_validate_list=None)
+            determine_postprocessing_no_metric(base_segmentation, validation_folder_name,
+                                     final_subf_name=validation_folder_name + "_postprocessed", debug=debug, log_function=log_function)
             
             base_registered = join(self.output_folder, 'Registered')
-            determine_postprocessing_no_metric(base_registered, self.gt_niftis_folder, validation_folder_name,
-                                     final_subf_name=validation_folder_name + "_postprocessed", debug=debug, log_function=log_function,
-                                     metadata_list=metadata_list_registered, to_validate_list=to_validate_registered_list)
+            determine_postprocessing_no_metric(base_registered, validation_folder_name,
+                                     final_subf_name=validation_folder_name + "_postprocessed", debug=debug, log_function=log_function)
             # after this the final predictions for the vlaidation set can be found in validation_folder_name_base + "_postprocessed"
             # They are always in that folder, even if no postprocessing as applied!
 
@@ -3008,14 +3017,12 @@ class nnUNetTrainer(NetworkTrainer):
                     #    labeled_idx = idx
                     if '_u' in frame:
                         current_data = np.load(self.dataset_un_val[frame]['data_file'])['data']
-                        current_data = current_data + 1e-8
                         unlabeled[idx] = current_data
                     else:
                         current_data = np.load(self.dataset_val[frame]['data_file'])['data']
                         #current_data[-1][current_data[-1] == -1] = 0
                         target[idx] = current_data[1]
                         target[idx][target[idx] == -1] = 0
-                        unlabeled[idx] = current_data[0] + 1e-8
                         target_mask[idx] = True
                     #self.print_to_log_file(k, data.shape)
                 
@@ -3339,14 +3346,12 @@ class nnUNetTrainer(NetworkTrainer):
                     #    labeled_idx = idx
                     if '_u' in frame:
                         current_data = np.load(self.dataset_un_val[frame]['data_file'])['data']
-                        current_data = current_data + 1e-8
                         unlabeled[idx] = current_data
                     else:
                         current_data = np.load(self.dataset_val[frame]['data_file'])['data']
                         #current_data[-1][current_data[-1] == -1] = 0
                         target[idx] = current_data[1]
                         target[idx][target[idx] == -1] = 0
-                        unlabeled[idx] = current_data[0] + 1e-8
                         target_mask[idx] = True
                     #self.print_to_log_file(k, data.shape)
 
@@ -3681,14 +3686,12 @@ class nnUNetTrainer(NetworkTrainer):
                     #    labeled_idx = idx
                     if '_u' in frame:
                         current_data = np.load(self.dataset_un_val[frame]['data_file'])['data']
-                        current_data = current_data + 1e-8
                         unlabeled[idx] = current_data
                     else:
                         current_data = np.load(self.dataset_val[frame]['data_file'])['data']
                         #current_data[-1][current_data[-1] == -1] = 0
                         target[idx] = current_data[1]
                         target[idx][target[idx] == -1] = 0
-                        unlabeled[idx] = current_data[0] + 1e-8
                         target_mask[idx] = True
                     #self.print_to_log_file(k, data.shape)
 
@@ -4026,14 +4029,12 @@ class nnUNetTrainer(NetworkTrainer):
                     #    labeled_idx = idx
                     if '_u' in frame:
                         current_data = np.load(self.dataset_un_val[frame]['data_file'])['data']
-                        current_data = current_data + 1e-8
                         unlabeled[idx] = current_data
                     else:
                         current_data = np.load(self.dataset_val[frame]['data_file'])['data']
                         #current_data[-1][current_data[-1] == -1] = 0
                         target[idx] = current_data[1]
                         target[idx][target[idx] == -1] = 0
-                        unlabeled[idx] = current_data[0] + 1e-8
                         target_mask[idx] = True
                     #self.print_to_log_file(k, data.shape)
 

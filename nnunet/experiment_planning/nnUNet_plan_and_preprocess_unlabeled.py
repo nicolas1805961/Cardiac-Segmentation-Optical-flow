@@ -129,7 +129,7 @@ def main():
             verify_dataset_integrity(join(nnUNet_raw_data, task_name))
 
         crop(task_name, False, tf)
-        if '27' in task_name or '31' in task_name:
+        if '27' in task_name or '31' in task_name or '35' in task_name:
             crop_unlabeled(task_name, False, tf)
 
         tasks.append(task_name)
@@ -201,11 +201,16 @@ def main():
         #    if not dont_run_preprocessing:  # double negative, yooo
         #        exp_planner.run_preprocessing(threads)
 
+        if '45' in task_ids[0] or '46' in task_ids[0]:
+            keep_spacing = True
+        else:
+            keep_spacing = False
+
         if planner_2d is not None:
             exp_planner = planner_2d(cropped_out_dir, preprocessing_output_dir_this_task)
             exp_planner.plan_experiment()
             if not dont_run_preprocessing:  # double negative, yooo
-                exp_planner.run_preprocessing(threads)
+                exp_planner.run_preprocessing(threads, keep_spacing=keep_spacing)
 
 
 if __name__ == "__main__":

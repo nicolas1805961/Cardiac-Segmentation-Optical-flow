@@ -721,9 +721,9 @@ def predict_from_folder(model: str, input_folder: str, output_folder: str, folds
         current_list_of_lists = [[join(current_input_folder, i) for i in current_all_files if i[:len(j)].startswith(j) and
                       len(i) == (len(j) + 12)] for j in case_ids]
 
-        current_list_of_lists, current_output_files = put_ed_first(current_list_of_lists, 
-                                                                    current_output_files,
-                                                                    csv_filepath)
+        #current_list_of_lists, current_output_files = put_ed_first(current_list_of_lists, 
+        #                                                            current_output_files,
+        #                                                            csv_filepath)
 
         if lowres_segmentations is not None:
             assert isdir(lowres_segmentations), "if lowres_segmentations is not None then it must point to a directory"

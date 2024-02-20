@@ -12,6 +12,7 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
+from monai.transforms import NormalizeIntensity
 from ruamel.yaml import YAML
 from nnunet.analysis import flop_count_operators
 from tqdm import tqdm
@@ -91,12 +92,27 @@ class nnMTLTrainerV2(nnUNetTrainer):
         super().__init__(plans_file, fold, output_folder, dataset_directory, batch_dice, stage, unpack_data,
                          deterministic, fp16)
         
+        self.task = os.path.basename(dataset_directory)
         if config is None:
             self.inference = False
             self.config = read_config(os.path.join(Path.cwd(), 'adversarial_acdc.yaml'), False, False)
         else:
             self.inference = True
             self.config = config
+
+        self.cropper = self.config['cropper']
+        if self.config['cropper']:
+            self.cropper_config = read_config(os.path.join(Path.cwd(), 'adversarial_acdc.yaml'), False, False)
+            if any([x in self.task for x in ['31', '35']]):
+                self.crop_size = 128
+                self.image_size = 224
+                self.window_size = 7
+                self.cropper_weights_folder_path = 'binary'
+            else:
+                self.crop_size = 192
+                self.image_size = 384
+                self.window_size = 8
+                self.cropper_weights_folder_path = 'binary_lib'
         
         self.image_size = self.config['patch_size'][0]
         self.window_size = 7 if self.image_size == 224 else 9 if self.image_size == 288 else 8 if self.image_size == 384 else None
@@ -115,6 +131,8 @@ class nnMTLTrainerV2(nnUNetTrainer):
         self.unlabeled = self.config['unlabeled']
         if self.unlabeled:
             self.unlabeled_loss_weight = self.config['unlabeled_loss_weight']
+        
+        self.normalizer = NormalizeIntensity()
 
         self.registered_x = False
         self.registered_seg = False
@@ -122,6 +140,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
         self.interpolate = False
         self.maximize_distance = False
         self.middle_unlabeled = False
+        self.filter_phase = self.config['filter_phase']
 
         self.deep_supervision = self.config['deep_supervision']
         self.classification = self.config['classification']
@@ -344,6 +363,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
                 self.load_plans_file()
 
             self.process_plans(self.plans)
+            self.patch_size = [self.image_size, self.image_size]
 
             self.setup_DA_params()
 
@@ -382,6 +402,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
 
             self.folder_with_preprocessed_data = join(self.dataset_directory, self.plans['data_identifier'] +
                                                       "_stage%d" % self.stage)
+            self.initialize_network()
             if training:
                 self.dl_tr, self.dl_val, self.dl_un_tr, self.dl_un_val = self.get_basic_generators()
                 if self.unpack_data:
@@ -401,7 +422,8 @@ class nnMTLTrainerV2(nnUNetTrainer):
                     params=self.data_aug_params,
                     deep_supervision_scales=self.deep_supervision_scales,
                     pin_memory=self.pin_memory,
-                    use_nondetMultiThreadedAugmenter=False
+                    use_nondetMultiThreadedAugmenter=False,
+                    processor=self.processor
                     )
 
                 self.print_to_log_file("TRAINING KEYS:\n %s" % (str(self.dataset_tr.keys())),
@@ -416,7 +438,6 @@ class nnMTLTrainerV2(nnUNetTrainer):
             else:
                 pass
 
-            self.initialize_network()
             self.initialize_optimizer_and_scheduler()
 
             assert isinstance(self.network, (SegmentationNetwork, nn.DataParallel))
@@ -554,22 +575,37 @@ class nnMTLTrainerV2(nnUNetTrainer):
                 #    self.rec_discriminator.cuda()
                 #discriminator_input = torch.randn(self.config['batch_size'], 1, self.image_size, self.image_size)
                 #models['rec_discriminator'] = (self.rec_discriminator, discriminator_input)
+            
+            if self.config['cropper']:
 
-            in_shape = torch.randn(self.config['batch_size'], 1, self.image_size, self.image_size)
-            self.network = build_2d_model(self.config, conv_layer=conv_layer, norm=getattr(torch.nn, self.config['norm']), log_function=self.print_to_log_file, image_size=self.image_size, window_size=self.window_size, middle=False, num_classes=num_classes)
+                in_shape_crop = torch.randn(self.config['batch_size'], 1, self.image_size, self.image_size)
+                cropping_conv_layer, _ = self.get_conv_layer(self.cropper_config)
+                cropping_network = build_2d_model(self.cropper_config, conv_layer=cropping_conv_layer, norm=getattr(torch.nn, self.cropper_config['norm']), log_function=self.print_to_log_file, image_size=self.image_size, window_size=self.window_size, middle=False, num_classes=2, processor=None)
+                cropping_network.load_state_dict(torch.load(os.path.join(self.cropper_weights_folder_path, 'model_final_checkpoint.model'))['state_dict'], strict=True)
+                cropping_network.eval()
+                cropping_network.do_ds = False
+                models['cropping_model'] = (cropping_network, in_shape_crop)
+
+                self.processor = Processor(crop_size=self.crop_size, image_size=self.image_size, cropping_network=cropping_network)
+            else:
+                self.processor = None
+
+            network_image_size = self.image_size if not self.cropper else self.crop_size
+            in_shape = torch.randn(self.config['batch_size'], 1, network_image_size, network_image_size)
+            self.network = build_2d_model(self.config, conv_layer=conv_layer, norm=getattr(torch.nn, self.config['norm']), log_function=self.print_to_log_file, image_size=network_image_size, window_size=self.window_size, middle=False, num_classes=num_classes, processor=self.processor)
 
             #path = r"C:\Users\Portal\Documents\ACDC_output_old\Baseline\fold_0\model_final_checkpoint.model"
             #loaded = torch.load(path)['state_dict']
             #self.network.load_state_dict(loaded)
             #self.network.eval()
 
-
             model_input_data = in_shape
             models['model'] = (self.network, model_input_data)
 
             do_ds = self.network.do_ds
             self.network.do_ds = False
-            self.count_parameters(self.config, models)
+            if not self.inference:
+                self.count_parameters(self.config, models)
             self.network.do_ds = do_ds
 
         #nb_inputs = 2 if self.middle else 1
@@ -927,25 +963,27 @@ class nnMTLTrainerV2(nnUNetTrainer):
     def validate(self, do_mirroring: bool = True, use_sliding_window: bool = True,
                  step_size: float = 0.5, save_softmax: bool = True, use_gaussian: bool = True, overwrite: bool = True,
                  validation_folder_name: str = 'validation_raw', debug: bool = False, all_in_gpu: bool = False,
-                 segmentation_export_kwargs: dict = None, run_postprocessing_on_folds: bool = True, output_folder=None):
+                 segmentation_export_kwargs: dict = None, run_postprocessing_on_folds: bool = True, output_folder=None, patch_size=None, nb_threads=1, simple=False, rv_rejection=False):
         """
         We need to wrap this because we need to enforce self.network.do_ds = False for prediction
         """ 
+        normalize = True if '27' not in self.task else False
         ds = self.network.do_ds
         self.network.do_ds = False
-        if self.middle_unlabeled and not self.v1:
-            ret = super().validate_middle_unlabeled(log_function=self.print_to_log_file, do_mirroring=do_mirroring, use_sliding_window=use_sliding_window, step_size=step_size,
-                               save_softmax=save_softmax, use_gaussian=use_gaussian,
-                               overwrite=overwrite, validation_folder_name=validation_folder_name,
-                               all_in_gpu=all_in_gpu, segmentation_export_kwargs=segmentation_export_kwargs,
-                               run_postprocessing_on_folds=run_postprocessing_on_folds, debug=True)
-        else:
-            ret = super().validate(log_function=self.print_to_log_file, do_mirroring=do_mirroring, use_sliding_window=use_sliding_window, step_size=step_size,
+        if simple:
+            ret = super().validate_simple(log_function=self.print_to_log_file, do_mirroring=do_mirroring, use_sliding_window=use_sliding_window, step_size=step_size,
                                 save_softmax=save_softmax, use_gaussian=use_gaussian,
                                 overwrite=overwrite, validation_folder_name=validation_folder_name,
                                 all_in_gpu=all_in_gpu, segmentation_export_kwargs=segmentation_export_kwargs,
                                 run_postprocessing_on_folds=run_postprocessing_on_folds,
-                                output_folder=output_folder, debug=True, binary=self.binary)
+                                output_folder=output_folder, debug=True, binary=self.binary, patch_size=patch_size, nb_threads=nb_threads)
+        else:
+            ret = super().validate(log_function=self.print_to_log_file, do_mirroring=do_mirroring, use_sliding_window=use_sliding_window, step_size=step_size,
+                                    save_softmax=save_softmax, use_gaussian=use_gaussian,
+                                    overwrite=overwrite, validation_folder_name=validation_folder_name,
+                                    all_in_gpu=all_in_gpu, segmentation_export_kwargs=segmentation_export_kwargs,
+                                    run_postprocessing_on_folds=run_postprocessing_on_folds,
+                                    output_folder=output_folder, debug=True, binary=self.binary, patch_size=patch_size, nb_threads=nb_threads, normalize=normalize, rv_rejection=rv_rejection)
 
         self.network.do_ds = ds
         return ret
@@ -956,7 +994,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
                                                          use_sliding_window: bool = True, step_size: float = 0.5,
                                                          use_gaussian: bool = True, pad_border_mode: str = 'constant',
                                                          pad_kwargs: dict = None, all_in_gpu: bool = False,
-                                                         verbose: bool = True, mixed_precision=True, get_flops=False, binary=False) -> Tuple[np.ndarray, np.ndarray]:
+                                                         verbose: bool = True, mixed_precision=True, get_flops=False, binary=False, normalize=False) -> Tuple[np.ndarray, np.ndarray]:
         """
         We need to wrap this because we need to enforce self.network.do_ds = False for prediction
         """
@@ -972,7 +1010,8 @@ class nnMTLTrainerV2(nnUNetTrainer):
                                                                        verbose=verbose,
                                                                        mixed_precision=mixed_precision,
                                                                        get_flops=get_flops,
-                                                                       binary=binary)
+                                                                       binary=binary,
+                                                                       normalize=normalize)
         self.network.do_ds = ds
         return ret
 
@@ -1190,100 +1229,6 @@ class nnMTLTrainerV2(nnUNetTrainer):
         else:
             return x
 
-    
-    def run_iteration_middle(self, data_generator, do_backprop=True, run_online_evaluation=False):
-        """
-        gradient clipping improves training stability
-
-        :param data_generator:
-        :param do_backprop:
-        :param run_online_evaluation:
-        :return:
-        """
-        data_dict = next(data_generator)
-        data_list = data_dict['data']
-        target_list = data_dict['target']
-
-        for i, data in enumerate(data_list):
-            data = maybe_to_torch(data)
-            if torch.cuda.is_available():
-                data = to_cuda(data)
-            data_list[i] = data
-        
-        for i, target in enumerate(target_list):
-            target = maybe_to_torch(target)
-            if torch.cuda.is_available():
-                target = to_cuda(target)
-            target_list[i] = target
-
-        #matplotlib.use('QtAgg')
-        #fig, ax = plt.subplots(len(data_list), 2)
-        #for i in range(len(data_list)):
-        #    ax[i, 0].imshow(data_list[i][0, 0].cpu(), cmap='gray')
-        #    if i < 2:
-        #        ax[i, 1].imshow(target_list[i][0, 0].cpu(), cmap='gray')
-        #plt.show()
-
-        self.optimizer.zero_grad()
-
-        if self.adversarial_loss and do_backprop:
-            self.discriminator.train()
-        elif self.adversarial_loss:
-            self.discriminator.eval()
-
-        data_list = [self.select_deep_supervision(d) for d in data_list]
-        network_input = {'labeled_data': [data_list[0], data_list[1]]}
-        if self.middle_unlabeled:
-            network_input = {'unlabeled_data': [data_list[2]]}
-            if self.v1:
-                network_input['unlabeled_data'].append(data_list[3])
-
-        output = self.network(network_input)
-        self.compute_losses_middle(output=output, target_list=target_list)
-
-        #if self.middle and do_backprop and not self.middle_unlabeled:
-        #    #self.cumulative_average = (self.loss_data['segmentation'][1].mean() + self.iter_nb * self.cumulative_average) / (self.iter_nb + 1)
-        #    self.cumulative_ema = self.alpha_ema * self.loss_data['segmentation'][1].mean().detach().cpu() + (1 - self.alpha_ema) * self.cumulative_ema
-        #    if self.one_vs_all:
-        #        for i in range(len(data_dict['slice_distance'])):
-        #            if data_dict['slice_distance'][i] not in self.past_percent:
-        #                s_0 = 0
-        #            else:
-        #                s_0 = self.past_percent[data_dict['slice_distance'][i]]
-        #            slice_loss = self.loss_data['segmentation'][1][i] / self.cumulative_ema
-        #            self.past_percent[data_dict['slice_distance'][i]] = self.alpha_ema * slice_loss.detach().cpu() + (1 - self.alpha_ema) * s_0
-        #    else:
-        #        for i in range(len(data_dict['middle_slice_percent'])):
-        #            if data_dict['middle_slice_percent'][i] not in self.past_percent:
-        #                s_0 = 0
-        #            else:
-        #                s_0 = self.past_percent[data_dict['middle_slice_percent'][i]]
-        #            slice_loss = self.loss_data['segmentation'][1][i]
-        #            self.past_percent[data_dict['middle_slice_percent'][i]] = self.alpha_ema * slice_loss.detach().cpu() + (1 - self.alpha_ema) * s_0
-        
-        l = self.consolidate_only_one_loss_data(self.loss_data, log=do_backprop)
-        #del loss_data
-
-        if not do_backprop:
-            self.val_loss.append(l.mean().detach().cpu())
-        else:
-            self.train_loss.append(l.mean().detach().cpu())
-            l.mean().backward()
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-            self.optimizer.step()
-
-            if self.adversarial_loss:
-                self.train_discriminator(target, output2['pseudo_label'])
-
-        if run_online_evaluation:
-            target_list = [self.select_deep_supervision(t) for t in target_list]
-            self.run_online_evaluation_middle(data=data_list, target=target_list, output=output)
-        del data_list, target_list, network_input
-
-        if do_backprop:
-            self.iter_nb += 1
-
-        return l.mean().detach().cpu().numpy()
 
     def run_iteration(self, data_generator, do_backprop=True, run_online_evaluation=False):
         """
@@ -1335,8 +1280,15 @@ class nnMTLTrainerV2(nnUNetTrainer):
             target = to_cuda(target)
 
         self.optimizer.zero_grad()
+
+        x_in = self.select_deep_supervision(data)
+        if '27' not in self.task:
+            temp_list = []
+            for b in range(len(x_in)):
+                temp_list.append(self.normalizer(x_in[b]))
+            x_in = torch.stack(temp_list, dim=0)
     
-        output = self.network(self.select_deep_supervision(data))
+        output = self.network(x_in)
         self.compute_losses(x=data, output=output, target=target, gt_df=gt_df, do_backprop=do_backprop, gt_classification=gt_classification)
         
         l = self.consolidate_only_one_loss_data(self.loss_data, log=do_backprop)
@@ -2385,10 +2337,10 @@ class nnMTLTrainerV2(nnUNetTrainer):
         else:
             dl_tr = DataLoader2D(self.dataset_tr, self.basic_generator_patch_size, self.patch_size, self.batch_size,
                                 oversample_foreground_percent=self.oversample_foreground_percent,
-                                pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
+                                pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r', filter_phase=self.filter_phase)
             dl_val = DataLoader2D(self.dataset_val, self.patch_size, self.patch_size, self.batch_size,
                                 oversample_foreground_percent=self.oversample_foreground_percent,
-                                pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
+                                pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r', filter_phase=False)
             if self.unlabeled:
                 dl_un_tr = DataLoader2DUnlabeled(self.dataset_un_tr, self.basic_generator_patch_size, self.patch_size, self.batch_size,
                                             oversample_foreground_percent=self.oversample_foreground_percent,

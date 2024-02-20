@@ -50,8 +50,14 @@ def get_default_configuration(network, task, network_trainer, config, plans_iden
     possible_stages = list(plans['plans_per_stage'].keys())
 
     if plans_identifier == 'custom_experiment_planner':
+        if any([x in task for x in ['31', '35']]):
+            patch_size = [224, 224]
+        elif any([x in task for x in ['29', '30']]):
+            patch_size = [288, 288]
+        else:
+            patch_size = [384, 384]
         plans['plans_per_stage'][possible_stages[-1]]['batch_size'] = config['batch_size']
-        plans['plans_per_stage'][possible_stages[-1]]['patch_size'] = np.array(config['patch_size'])
+        plans['plans_per_stage'][possible_stages[-1]]['patch_size'] = np.array(patch_size)
         pickle_file = open(plans_file,'wb')
         pickle.dump(plans, pickle_file)
         pickle_file.close()

@@ -16,6 +16,7 @@ import torch
 import ast
 from copy import deepcopy
 from multiprocessing.pool import Pool
+from tqdm import tqdm
 
 import numpy as np
 from nnunet.configuration import default_num_threads
@@ -128,7 +129,8 @@ def determine_postprocessing(base, gt_labels_folder, raw_subfolder_name="validat
                              log_function=print,
                              metadata_list=None,
                              binary=False,
-                             to_validate_list=None):
+                             to_validate_list=None,
+                             nb_threads=1):
     """
     :param base:
     :param gt_labels_folder: subfolder of base with niftis of ground truth labels
@@ -153,7 +155,7 @@ def determine_postprocessing(base, gt_labels_folder, raw_subfolder_name="validat
         shutil.rmtree(folder_per_class)
 
     # multiprocessing rules
-    p = Pool(processes)
+    p = Pool(nb_threads)
 
     assert isfile(join(base, raw_subfolder_name, "summary.json")), "join(base, raw_subfolder_name) does not " \
                                                                    "contain a summary.json"
@@ -239,7 +241,9 @@ def determine_postprocessing(base, gt_labels_folder, raw_subfolder_name="validat
     # evaluate postprocessed predictions
     _ = aggregate_scores(pred_gt_tuples, labels=classes,
                          json_output_file=join(folder_all_classes_as_fg, "summary.json"),
-                         json_author="Fabian", num_threads=processes, advanced=True, metadata_list=metadata_list, binary=binary)
+                         json_author="Fabian", num_threads=processes, advanced=True, metadata_list=metadata_list, binary=binary, nb_threads=nb_threads)
+    
+    log_function("33%")
 
     # now we need to figure out if doing this improved the dice scores. We will implement that defensively in so far
     # that if a single class got worse as a result we won't do this. We can change this in the future but right now I
@@ -350,7 +354,9 @@ def determine_postprocessing(base, gt_labels_folder, raw_subfolder_name="validat
         # evaluate postprocessed predictions
         _ = aggregate_scores(pred_gt_tuples, labels=classes,
                              json_output_file=join(folder_per_class, "summary.json"),
-                             json_author="Fabian", num_threads=processes, advanced=True, metadata_list=metadata_list, binary=binary)
+                             json_author="Fabian", num_threads=processes, advanced=True, metadata_list=metadata_list, binary=binary, nb_threads=nb_threads)
+        
+        log_function("66%")
 
         if do_fg_cc:
             old_res = deepcopy(validation_result_PP_test)
@@ -424,7 +430,7 @@ def determine_postprocessing(base, gt_labels_folder, raw_subfolder_name="validat
     # evaluate postprocessed predictions
     _ = aggregate_scores(pred_gt_tuples, labels=classes,
                          json_output_file=join(base, final_subf_name, "summary.json"),
-                         json_author="Fabian", num_threads=processes, advanced=True, metadata_list=metadata_list, binary=binary)
+                         json_author="Fabian", num_threads=processes, advanced=True, metadata_list=metadata_list, binary=binary, nb_threads=nb_threads)
 
     pp_results['min_valid_object_sizes'] = str(pp_results['min_valid_object_sizes'])
 
@@ -442,16 +448,13 @@ def determine_postprocessing(base, gt_labels_folder, raw_subfolder_name="validat
 
 
 
-def determine_postprocessing_no_metric(base, gt_labels_folder, raw_subfolder_name="validation_raw",
+def determine_postprocessing_no_metric(base, raw_subfolder_name="validation_raw",
                                         temp_folder="temp",
                                         final_subf_name="validation_final", processes=default_num_threads,
                                         dice_threshold=0, debug=True,
                                         advanced_postprocessing=False,
                                         pp_filename="postprocessing.json",
-                                        log_function=print,
-                                        metadata_list=None,
-                                        binary=False,
-                                        to_validate_list=None):
+                                        log_function=print):
     """
     :param base:
     :param gt_labels_folder: subfolder of base with niftis of ground truth labels
@@ -470,12 +473,9 @@ def determine_postprocessing_no_metric(base, gt_labels_folder, raw_subfolder_nam
     classes = [1, 2, 3]
 
     folder_all_classes_as_fg = join(base, temp_folder + "_allClasses")
-    folder_per_class = join(base, temp_folder + "_perClass")
 
     if isdir(folder_all_classes_as_fg):
         shutil.rmtree(folder_all_classes_as_fg)
-    if isdir(folder_per_class):
-        shutil.rmtree(folder_per_class)
 
     # multiprocessing rules
     p = Pool(processes)
@@ -485,8 +485,225 @@ def determine_postprocessing_no_metric(base, gt_labels_folder, raw_subfolder_nam
 
     # make output and temp dir
     maybe_mkdir_p(folder_all_classes_as_fg)
-    maybe_mkdir_p(folder_per_class)
-    maybe_mkdir_p(join(base, final_subf_name))
+
+    if advanced_postprocessing:
+        # first treat all foreground classes as one and remove all but the largest foreground connected component
+        results = []
+        for f in fnames:
+            predicted_segmentation = join(base, raw_subfolder_name, f)
+            # now remove all but the largest connected component for each class
+            output_file = join(folder_all_classes_as_fg, f)
+            results.append(p.starmap_async(load_remove_save, ((predicted_segmentation, output_file, (classes,)),)))
+
+        results = [i.get() for i in results]
+
+        # aggregate max_size_removed and min_size_kept
+        max_size_removed = {}
+        min_size_kept = {}
+        for tmp in results:
+            mx_rem, min_kept = tmp[0]
+            for k in mx_rem:
+                if mx_rem[k] is not None:
+                    if max_size_removed.get(k) is None:
+                        max_size_removed[k] = mx_rem[k]
+                    else:
+                        max_size_removed[k] = max(max_size_removed[k], mx_rem[k])
+            for k in min_kept:
+                if min_kept[k] is not None:
+                    if min_size_kept.get(k) is None:
+                        min_size_kept[k] = min_kept[k]
+                    else:
+                        min_size_kept[k] = min(min_size_kept[k], min_kept[k])
+
+        #print("foreground vs background, smallest valid object size was", min_size_kept[tuple(classes)])
+        #print("removing only objects smaller than that...")
+        log_function("foreground vs background, smallest valid object size was:", min_size_kept[tuple(classes)])
+        log_function("removing only objects smaller than that...")
+
+    else:
+        min_size_kept = None
+
+    # we need to rerun the step from above, now with the size constraint
+    pred_gt_tuples = []
+    results = []
+    # first treat all foreground classes as one and remove all but the largest foreground connected component
+    for f in fnames:
+        predicted_segmentation = join(base, raw_subfolder_name, f)
+        # now remove all but the largest connected component for each class
+        output_file = join(folder_all_classes_as_fg, f)
+        results.append(
+            p.starmap_async(load_remove_save, ((predicted_segmentation, output_file, (classes,), min_size_kept),)))
+
+    _ = [i.get() for i in results]
+
+    log_function("done")
+
+    p.close()
+    p.join()
+    #print("done")
+    log_function("done")
+
+
+
+
+def determine_postprocessing_custom(base, raw_subfolder_name="validation_raw",
+                                        temp_folder="temp",
+                                        final_subf_name="validation_final", processes=default_num_threads,
+                                        dice_threshold=0, debug=True,
+                                        advanced_postprocessing=False,
+                                        pp_filename="postprocessing.json",
+                                        nb_threads=1,
+                                        log_function=print):
+    """
+    :param base:
+    :param gt_labels_folder: subfolder of base with niftis of ground truth labels
+    :param raw_subfolder_name: subfolder of base with niftis of predicted (non-postprocessed) segmentations
+    :param temp_folder: used to store temporary data, will be deleted after we are done here undless debug=True
+    :param final_subf_name: final results will be stored here (subfolder of base)
+    :param processes:
+    :param dice_threshold: only apply postprocessing if results is better than old_result+dice_threshold (can be used as eps)
+    :param debug: if True then the temporary files will not be deleted
+    :return:
+    """
+    # lets see what classes are in the dataset
+    #classes = [int(i) for i in load_json(join(base, raw_subfolder_name, "summary.json"))['results']['mean'].keys() if
+    #           int(i) != 0]
+    
+    classes = [1, 2, 3]
+
+    folder_all_classes_as_fg = join(base, temp_folder + "_allClasses")
+
+    if isdir(folder_all_classes_as_fg):
+        shutil.rmtree(folder_all_classes_as_fg)
+
+    # multiprocessing rules
+    p = Pool(nb_threads)
+
+    # these are all the files we will be dealing with
+    fnames = subfiles(join(base, raw_subfolder_name), suffix=".nii.gz", join=False)
+
+    # make output and temp dir
+    maybe_mkdir_p(folder_all_classes_as_fg)
+
+    # first treat all foreground classes as one and remove all but the largest foreground connected component
+    results = []
+    for f in fnames:
+        predicted_segmentation = join(base, raw_subfolder_name, f)
+        # now remove all but the largest connected component for each class
+        output_file = join(folder_all_classes_as_fg, f)
+        results.append(p.starmap_async(load_remove_save, ((predicted_segmentation, output_file, classes),)))
+
+    results = [i.get() for i in results]
+
+    log_function("done")
+
+    p.close()
+    p.join()
+    #print("done")
+    log_function("done")
+
+
+
+
+def determine_postprocessing_custom_with_metrics(base, gt_labels_folder, raw_subfolder_name="validation_raw",
+                                        temp_folder="temp",
+                                        final_subf_name="validation_final", processes=default_num_threads,
+                                        dice_threshold=0, debug=True,
+                                        advanced_postprocessing=False,
+                                        pp_filename="postprocessing.json",
+                                        nb_threads=1,
+                                        metadata_list=None,
+                                        rv_rejection=False,
+                                        log_function=print):
+    """
+    :param base:
+    :param gt_labels_folder: subfolder of base with niftis of ground truth labels
+    :param raw_subfolder_name: subfolder of base with niftis of predicted (non-postprocessed) segmentations
+    :param temp_folder: used to store temporary data, will be deleted after we are done here undless debug=True
+    :param final_subf_name: final results will be stored here (subfolder of base)
+    :param processes:
+    :param dice_threshold: only apply postprocessing if results is better than old_result+dice_threshold (can be used as eps)
+    :param debug: if True then the temporary files will not be deleted
+    :return:
+    """
+    # lets see what classes are in the dataset
+    #classes = [int(i) for i in load_json(join(base, raw_subfolder_name, "summary.json"))['results']['mean'].keys() if
+    #           int(i) != 0]
+    
+    classes = [1, 2, 3]
+
+    folder_all_classes_as_fg = join(base, temp_folder + "_allClasses")
+
+    if isdir(folder_all_classes_as_fg):
+        shutil.rmtree(folder_all_classes_as_fg)
+
+    # multiprocessing rules
+    p = Pool(nb_threads)
+
+    # these are all the files we will be dealing with
+    fnames = subfiles(join(base, raw_subfolder_name), suffix=".nii.gz", join=False)
+
+    # make output and temp dir
+    maybe_mkdir_p(folder_all_classes_as_fg)
+
+    log_function("Doing postprocessing")
+
+    # first treat all foreground classes as one and remove all but the largest foreground connected component
+    results = []
+    pred_gt_tuples = []
+    for f in tqdm(fnames):
+        predicted_segmentation = join(base, raw_subfolder_name, f)
+        # now remove all but the largest connected component for each class
+        output_file = join(folder_all_classes_as_fg, f)
+        results.append(p.starmap_async(load_remove_save, ((predicted_segmentation, output_file, classes),)))
+        pred_gt_tuples.append([output_file, join(gt_labels_folder, f)])
+
+    results = [i.get() for i in results]
+
+    p.close()
+    p.join()
+
+    log_function("Computing metrics")
+
+    _ = aggregate_scores(pred_gt_tuples, labels=[1, 2, 3],
+                         json_output_file=join(folder_all_classes_as_fg, "summary.json"),
+                         json_author="Fabian", num_threads=processes, advanced=True, metadata_list=metadata_list, binary=False, nb_threads=nb_threads, rv_rejection=rv_rejection)
+
+    #print("done")
+    log_function("done")
+
+
+
+
+def postprocess_from_list(base, raw_subfolder_name="validation_raw",
+                                        temp_folder="temp",
+                                        final_subf_name="validation_final", processes=default_num_threads,
+                                        dice_threshold=0, debug=True,
+                                        advanced_postprocessing=False,
+                                        pp_filename="postprocessing.json",
+                                        log_function=print):
+    """
+    :param base:
+    :param gt_labels_folder: subfolder of base with niftis of ground truth labels
+    :param raw_subfolder_name: subfolder of base with niftis of predicted (non-postprocessed) segmentations
+    :param temp_folder: used to store temporary data, will be deleted after we are done here undless debug=True
+    :param final_subf_name: final results will be stored here (subfolder of base)
+    :param processes:
+    :param dice_threshold: only apply postprocessing if results is better than old_result+dice_threshold (can be used as eps)
+    :param debug: if True then the temporary files will not be deleted
+    :return:
+    """
+    # lets see what classes are in the dataset
+    #classes = [int(i) for i in load_json(join(base, raw_subfolder_name, "summary.json"))['results']['mean'].keys() if
+    #           int(i) != 0]
+    
+    classes = [1, 2, 3]
+
+    # multiprocessing rules
+    p = Pool(processes)
+
+    # these are all the files we will be dealing with
+    fnames = subfiles(join(base, raw_subfolder_name), suffix=".nii.gz", join=False)
 
     pp_results = {}
     pp_results['dc_per_class_raw'] = {}
@@ -543,12 +760,6 @@ def determine_postprocessing_no_metric(base, gt_labels_folder, raw_subfolder_nam
         output_file = join(folder_all_classes_as_fg, f)
         results.append(
             p.starmap_async(load_remove_save, ((predicted_segmentation, output_file, (classes,), min_size_kept),)))
-        if to_validate_list is not None:
-            if f in to_validate_list:
-                pred_gt_tuples.append([output_file, join(gt_labels_folder, f)])
-        else:
-            if '_u' not in f:
-                pred_gt_tuples.append([output_file, join(gt_labels_folder, f)])
 
     _ = [i.get() for i in results]
 

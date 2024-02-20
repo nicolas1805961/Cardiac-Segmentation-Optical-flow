@@ -320,72 +320,72 @@ class GenericPreprocessor(object):
                     data[c] = (data[c] - mn) / (std + 1e-8)
         return data, seg, properties
 
-    #def preprocess_test_case(self, data_files, target_spacing, seg_file=None, force_separate_z=None):
-    #    data, seg, properties = ImageCropper.crop_from_list_of_files(data_files, seg_file)
-#
-    #    data = data.transpose((0, *[i + 1 for i in self.transpose_forward]))
-    #    seg = seg.transpose((0, *[i + 1 for i in self.transpose_forward]))
-#
-    #    data, seg, properties = self.resample_and_normalize(data, target_spacing, properties, seg,
-    #                                                        force_separate_z=force_separate_z)
-    #    return data.astype(np.float32), seg, properties
-    
-    
     def preprocess_test_case(self, data_files, target_spacing, seg_file=None, force_separate_z=None):
-        data_list = []
-        property_list = []
-        seg_list = []
-        for data_file in data_files:
-            data, seg, properties = ImageCropper.crop_from_list_of_files(data_file, seg_file)
-            data_list.append(data)
-            property_list.append(properties)
-            seg_list.append(seg)
+        data, seg, properties = ImageCropper.crop_from_list_of_files(data_files, seg_file)
 
-        array_bbox_list = []
-        for i in range(len(data_list)):
-            crop_bbox = property_list[i]['crop_bbox']
-            array_bbox = np.stack([np.array(crop_bbox[i]) for i in range(len(crop_bbox))])
-            array_bbox_list.append(array_bbox)
-        array_bbox_list = np.stack(array_bbox_list)
-        max_after = np.max(array_bbox_list[:, :, 1], axis=0)[None]
-        min_before = np.min(array_bbox_list[:, :, 0], axis=0)[None]
-        pad_after = max_after - array_bbox_list[:, :, 1]
-        pad_before = array_bbox_list[:, :, 0] - min_before
+        data = data.transpose((0, *[i + 1 for i in self.transpose_forward]))
+        seg = seg.transpose((0, *[i + 1 for i in self.transpose_forward]))
 
-        new_crop_bbox = np.stack([min_before[0], max_after[0]], axis=-1)
-        new_crop_bbox = [list(x) for x in new_crop_bbox]
-
-        out_data_list = []
-        out_property_list = []
-        out_seg_list = []
-
-        for i in range(len(data_list)):
-            current_padding = np.stack([pad_before[i], pad_after[i]], axis=-1)
-            current_padding = np.concatenate([np.zeros(shape=(1, 2)).astype(int), current_padding])
-            current_data = np.pad(data_list[i], current_padding)
-            current_seg = np.pad(seg_list[i], current_padding)
-
-            print(f'current_padding: {current_padding}, after padding: {current_data.shape}')
-
-            current_property = property_list[i]
-            current_property['size_after_cropping'] = current_data[0].shape
-            current_property['crop_bbox'] = new_crop_bbox
-
-            current_data = current_data.transpose((0, *[i + 1 for i in self.transpose_forward]))
-            current_seg = current_seg.transpose((0, *[i + 1 for i in self.transpose_forward]))
-
-            current_data, current_seg, current_property = self.resample_and_normalize(current_data, target_spacing, current_property, current_seg,
-                                                                force_separate_z=force_separate_z)
-            current_data = current_data.astype(np.float32)
-            out_data_list.append(current_data)
-            out_property_list.append(current_property)
-            out_seg_list.append(current_seg)
-
-        return out_data_list, out_seg_list, out_property_list
-
+        data, seg, properties = self.resample_and_normalize(data, target_spacing, properties, seg,
+                                                            force_separate_z=force_separate_z)
+        return data.astype(np.float32), seg, properties
+    
+    
+    #def preprocess_test_case(self, data_files, target_spacing, seg_file=None, force_separate_z=None):
+    #    data_list = []
+    #    property_list = []
+    #    seg_list = []
+    #    for data_file in data_files:
+    #        data, seg, properties = ImageCropper.crop_from_list_of_files(data_file, seg_file)
+    #        data_list.append(data)
+    #        property_list.append(properties)
+    #        seg_list.append(seg)
+#
+    #    array_bbox_list = []
+    #    for i in range(len(data_list)):
+    #        crop_bbox = property_list[i]['crop_bbox']
+    #        array_bbox = np.stack([np.array(crop_bbox[i]) for i in range(len(crop_bbox))])
+    #        array_bbox_list.append(array_bbox)
+    #    array_bbox_list = np.stack(array_bbox_list)
+    #    max_after = np.max(array_bbox_list[:, :, 1], axis=0)[None]
+    #    min_before = np.min(array_bbox_list[:, :, 0], axis=0)[None]
+    #    pad_after = max_after - array_bbox_list[:, :, 1]
+    #    pad_before = array_bbox_list[:, :, 0] - min_before
+#
+    #    new_crop_bbox = np.stack([min_before[0], max_after[0]], axis=-1)
+    #    new_crop_bbox = [list(x) for x in new_crop_bbox]
+#
+    #    out_data_list = []
+    #    out_property_list = []
+    #    out_seg_list = []
+#
+    #    for i in range(len(data_list)):
+    #        current_padding = np.stack([pad_before[i], pad_after[i]], axis=-1)
+    #        current_padding = np.concatenate([np.zeros(shape=(1, 2)).astype(int), current_padding])
+    #        current_data = np.pad(data_list[i], current_padding)
+    #        current_seg = np.pad(seg_list[i], current_padding)
+#
+    #        print(f'current_padding: {current_padding}, after padding: {current_data.shape}')
+#
+    #        current_property = property_list[i]
+    #        current_property['size_after_cropping'] = current_data[0].shape
+    #        current_property['crop_bbox'] = new_crop_bbox
+#
+    #        current_data = current_data.transpose((0, *[i + 1 for i in self.transpose_forward]))
+    #        current_seg = current_seg.transpose((0, *[i + 1 for i in self.transpose_forward]))
+#
+    #        current_data, current_seg, current_property = self.resample_and_normalize(current_data, target_spacing, current_property, current_seg,
+    #                                                            force_separate_z=force_separate_z)
+    #        current_data = current_data.astype(np.float32)
+    #        out_data_list.append(current_data)
+    #        out_property_list.append(current_property)
+    #        out_seg_list.append(current_seg)
+#
+    #    return out_data_list, out_seg_list, out_property_list
+    
 
     def _run_internal(self, target_spacing, case_identifier, output_folder_stage, cropped_output_dir, force_separate_z,
-                      all_classes):
+                      all_classes, keep_spacing):
         if '_u' in case_identifier:
             data, properties = self.load_cropped_unlabeled(cropped_output_dir, case_identifier)
             data = data.transpose((0, *[i + 1 for i in self.transpose_forward]))
@@ -393,6 +393,8 @@ class GenericPreprocessor(object):
             all_data = data.astype(np.float32)
         else:
             data, seg, properties = self.load_cropped(cropped_output_dir, case_identifier)
+            if keep_spacing:
+                target_spacing = properties['original_spacing']
             seg = seg.transpose((0, *[i + 1 for i in self.transpose_forward]))
             data = data.transpose((0, *[i + 1 for i in self.transpose_forward]))
             data, seg, properties = self.resample_and_normalize(data, target_spacing, properties, seg, force_separate_z)
@@ -700,7 +702,7 @@ class PreprocessorFor2D(GenericPreprocessor):
                                                 transpose_forward, intensityproperties)
 
     def run(self, target_spacings, input_folder_with_cropped_npz, output_folder, data_identifier,
-            num_threads=default_num_threads, force_separate_z=None):
+            num_threads=default_num_threads, force_separate_z=None, keep_spacing=False):
         print("Initializing to run preprocessing")
         print("npz folder:", input_folder_with_cropped_npz)
         print("output_folder:", output_folder)
@@ -720,7 +722,7 @@ class PreprocessorFor2D(GenericPreprocessor):
             spacing = target_spacings[i]
             for j, case in enumerate(list_of_cropped_npz_files):
                 case_identifier = get_case_identifier_from_npz(case)
-                args = spacing, case_identifier, output_folder_stage, input_folder_with_cropped_npz, force_separate_z, all_classes
+                args = spacing, case_identifier, output_folder_stage, input_folder_with_cropped_npz, force_separate_z, all_classes, keep_spacing
                 all_args.append(args)
         p = Pool(num_threads)
         p.starmap(self._run_internal, all_args)

@@ -12,6 +12,9 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 from copy import copy
+import matplotlib.pyplot as plt
+import torch
+import matplotlib
 from batchgenerators.dataloading.multi_threaded_augmenter import MultiThreadedAugmenter
 from batchgenerators.dataloading.single_threaded_augmenter import SingleThreadedAugmenter
 from batchgenerators.transforms.abstract_transforms import Compose
@@ -39,6 +42,55 @@ try:
     from batchgenerators.dataloading.nondet_multi_threaded_augmenter import NonDetMultiThreadedAugmenter
 except ImportError as ie:
     NonDetMultiThreadedAugmenter = None
+
+from batchgenerators.transforms.abstract_transforms import AbstractTransform
+
+
+class CropperTransform(AbstractTransform):
+    """ Randomly mirrors data along specified axes. Mirroring is evenly distributed. Probability of mirroring along
+    each axis is 0.5
+
+    Args:
+        axes (tuple of int): axes along which to mirror
+
+    """
+
+    def __init__(self, processor, data_key="data", label_key="seg"):
+        self.data_key = data_key
+        self.label_key = label_key
+        self.processor = processor
+
+    def __call__(self, **data_dict):
+        data = data_dict.get(self.data_key)
+        seg = data_dict.get(self.label_key)
+
+        if self.processor is not None:
+
+            with torch.no_grad():
+                data = torch.from_numpy(data).to('cuda:0')
+                seg = torch.from_numpy(seg).to('cuda:0')
+
+                data_list = []
+                seg_list = []
+                for b in range(len(data)):
+                    mean_centroid, _ = self.processor.preprocess_no_registration(data=torch.clone(data[b][None])) # T, C(1), H, W
+                    current_data, padding_need = self.processor.crop_and_pad(data=data[b][None], mean_centroid=mean_centroid)
+                    current_seg, _ = self.processor.crop_and_pad(data=seg[b][None], mean_centroid=mean_centroid)
+                    data_list.append(current_data)
+                    seg_list.append(current_seg)
+                data = torch.cat(data_list, dim=0).cpu().numpy()
+                seg = torch.cat(seg_list, dim=0).cpu().numpy()
+
+        #matplotlib.use('QtAgg')
+        #fig, ax = plt.subplots(1, 2)
+        #ax[0].imshow(data[0, 0], cmap='gray')
+        #ax[1].imshow(seg[0, 0], cmap='gray')
+        #plt.show()
+
+        data_dict[self.data_key] = data
+        data_dict[self.label_key] = seg
+
+        return data_dict
 
 
 def get_moreDA_augmentation(dataloader_train, dataloader_val, patch_size, params=default_3D_augmentation_params,
@@ -218,7 +270,7 @@ def get_moreDA_augmentation_mtl(dataloader_train, dataloader_val, dataloader_tra
                             seeds_train=None, seeds_val=None, order_seg=1, order_data=3, deep_supervision_scales=None,
                             soft_ds=False,
                             classes=None, pin_memory=True, regions=None,
-                            use_nondetMultiThreadedAugmenter: bool = False):
+                            use_nondetMultiThreadedAugmenter: bool = False, processor=None):
     assert params.get('mirror') is None, "old version of params, use new keyword do_mirror"
 
     tr_transforms = []
@@ -268,6 +320,9 @@ def get_moreDA_augmentation_mtl(dataloader_train, dataloader_val, dataloader_tra
         p_scale_per_sample=params.get("p_scale"), p_rot_per_sample=params.get("p_rot"),
         independent_scale_for_each_axis=params.get("independent_scale_factor_for_each_axis")
     ))
+
+    tr_transforms.append(CropperTransform(processor=processor))
+    un_tr_transforms.append(CropperTransform(processor=processor))
 
     if params.get("dummy_2D"):
         tr_transforms.append(Convert2DTo3DTransform())
@@ -409,6 +464,9 @@ def get_moreDA_augmentation_mtl(dataloader_train, dataloader_val, dataloader_tra
         p_scale_per_sample=params.get("p_scale"), p_rot_per_sample=params.get("p_rot"),
         independent_scale_for_each_axis=params.get("independent_scale_factor_for_each_axis")
     ))
+
+    un_val_transforms.append(CropperTransform(processor=processor))
+    val_transforms.append(CropperTransform(processor=processor))
 
     if params.get("selected_seg_channels") is not None:
         val_transforms.append(SegChannelSelectionTransform(params.get("selected_seg_channels")))

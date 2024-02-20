@@ -64,7 +64,8 @@ class Evaluator:
                  labels=None,
                  metrics=None,
                  advanced_metrics=None,
-                 nan_for_nonexisting=True):
+                 nan_for_nonexisting=True,
+                 rv_rejection=False):
 
         self.test = None
         self.reference = None
@@ -72,6 +73,7 @@ class Evaluator:
         self.labels = None
         self.nan_for_nonexisting = nan_for_nonexisting
         self.result = None
+        self.rv_rejection = rv_rejection
 
         self.metrics = []
         if metrics is None:
@@ -216,8 +218,13 @@ class Evaluator:
             for i, l in enumerate(self.labels):
                 k = str(l)
                 self.result[k] = OrderedDict()
-                self.confusion_matrix.set_test(self.test == l)
-                self.confusion_matrix.set_reference(self.reference == l)
+                binary_test = self.test == l
+                binary_reference = self.reference == l
+                if self.rv_rejection and l == 1:
+                    binary_test = binary_test[2:]
+                    binary_reference = binary_reference[2:]
+                self.confusion_matrix.set_test(binary_test)
+                self.confusion_matrix.set_reference(binary_reference)
                 for metric in eval_metrics:
                     self.result[k][metric] = _funcs[metric](confusion_matrix=self.confusion_matrix,
                                                             nan_for_nonexisting=self.nan_for_nonexisting,
@@ -334,6 +341,8 @@ def aggregate_scores(test_ref_pairs,
                      json_task="",
                      num_threads=2,
                      metadata_list=None,
+                     rv_rejection=False,
+                     nb_threads=1,
                      binary=False,
                      **metric_kwargs):
     """
@@ -352,7 +361,7 @@ def aggregate_scores(test_ref_pairs,
     """
 
     if type(evaluator) == type:
-        evaluator = evaluator()
+        evaluator = evaluator(rv_rejection=rv_rejection)
 
     if labels is not None:
         evaluator.set_labels(labels)
@@ -363,7 +372,11 @@ def aggregate_scores(test_ref_pairs,
     
     test = [i[0] for i in test_ref_pairs]
     ref = [i[1] for i in test_ref_pairs]
-    p = Pool(num_threads)
+
+    if metadata_list is None:
+        metadata_list = [{}] * len(ref)
+
+    p = Pool(nb_threads)
     all_res = p.map(run_evaluation, zip(test, ref, [evaluator]*len(ref), [metric_kwargs]*len(ref), metadata_list, [binary]*len(ref)))
     p.close()
     p.join()
@@ -466,7 +479,7 @@ def evaluate_folder(folder_with_gts: str, folder_with_predictions: str, labels: 
     assert all([i in files_gt for i in files_pred]), "files missing in folder_with_gts"
     test_ref_pairs = [(join(folder_with_predictions, i), join(folder_with_gts, i)) for i in files_pred]
     res = aggregate_scores(test_ref_pairs, json_output_file=join(folder_with_predictions, "summary.json"),
-                           num_threads=8, labels=labels, **metric_kwargs)
+                           num_threads=8, labels=labels, advanced=True, **metric_kwargs)
     return res
 
 

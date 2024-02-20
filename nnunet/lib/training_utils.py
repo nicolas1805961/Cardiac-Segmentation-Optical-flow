@@ -2,17 +2,29 @@ from math import nan
 import torch
 import torch.nn as nn
 from nnunet.network_architecture.MTL_model import MTLmodel, PolicyNet
-from nnunet.network_architecture.temporal_model import VideoModel
-#from nnunet.network_architecture.Optical_flow_model import OpticalFlowModel
-#from nnunet.network_architecture.Optical_flow_model_2 import OpticalFlowModel
-from nnunet.network_architecture.Optical_flow_model_3 import OpticalFlowModel
-from nnunet.network_architecture.Optical_flow_model_4 import OpticalFlowModel4
 from nnunet.network_architecture.Optical_flow_model_label import OpticalFlowModelLabeled
 from nnunet.network_architecture.Optical_flow_model_prediction import OpticalFlowModelPrediction
-from nnunet.network_architecture.Optical_flow_model_simple import OpticalFlowModelSimple
 from nnunet.network_architecture.Optical_flow_model_recursive import OpticalFlowModelRecursive
 from nnunet.network_architecture.Optical_flow_model_variable_length import OpticalFlowModelVariableLength
 from nnunet.network_architecture.Optical_flow_model_recursive_video import OpticalFlowModelRecursiveVideo
+from nnunet.network_architecture.Optical_flow_model_successive import OpticalFlowModelSuccessive
+from nnunet.network_architecture.Optical_flow_model_successive_other import OpticalFlowModelSuccessiveOther
+from nnunet.network_architecture.Optical_flow_model_successive_embedding import OpticalFlowModelSuccessiveEmbedding
+from nnunet.network_architecture.Optical_flow_model_successive_prediction import OpticalFlowModelSuccessivePrediction
+from nnunet.network_architecture.Final import Final
+from nnunet.network_architecture.Final_flow import FinalFlow
+from nnunet.network_architecture.Start_End import StartEnd
+from nnunet.network_architecture.MTLEmbedding import MTLEmbedding
+from nnunet.network_architecture.Seg_simple import SegSimple
+from nnunet.network_architecture.temporal_model import TemporalModel
+from nnunet.network_architecture.Seg_flow_model import SegFlow
+from nnunet.network_architecture.flow_simple import FlowSimple
+from nnunet.network_architecture.interpolator import Interpolator
+from nnunet.network_architecture.GlobalModel import Aggregator
+from nnunet.network_architecture.Model1 import Model1
+from nnunet.network_architecture.Model2 import Model2
+from nnunet.network_architecture.Model3D import Model3D
+from nnunet.network_architecture.Optical_flow_model_video import OpticalFlowModelVideo
 from nnunet.network_architecture.Optical_flow_model_lib import OpticalFlowModelLib
 from nnunet.network_architecture.discriminator import Discriminator
 from tqdm import tqdm
@@ -971,33 +983,6 @@ def build_flow_model_prediction(config, image_size, log_function):
 
 
 
-def build_flow_model_simple(config, image_size, log_function):
-
-    model = OpticalFlowModelSimple(deep_supervision=config['deep_supervision'],
-             split=config['split'],
-             one_to_all=config['one_to_all'],
-             all_to_all=config['all_to_all'],
-             out_encoder_dims=config['out_encoder_dims'],
-             inference_mode=config['inference_mode'],
-             nb_iters=config['nb_iters'],
-             padding=config['padding'],
-             in_dims=config['in_encoder_dims'],
-             nb_layers=config['nb_layers'],
-             image_size=image_size,
-             conv_depth=config['conv_depth'],
-             bottleneck_heads=config['bottleneck_heads'],
-             drop_path_rate=config['drop_path_rate'],
-             log_function=log_function,
-             only_first=config['only_first'],
-             dot_multiplier=config['dot_multiplier'])
-        
-    model = model.to(config['device'])
-
-    return model
-
-
-
-
 def build_flow_model_recursive(config, image_size, log_function):
 
     model = OpticalFlowModelRecursive(deep_supervision=config['deep_supervision'],
@@ -1027,13 +1012,13 @@ def build_flow_model_recursive(config, image_size, log_function):
 def build_flow_model_recursive_video(config, image_size, log_function):
 
     model = OpticalFlowModelRecursiveVideo(deep_supervision=config['deep_supervision'],
-             split=config['split'],
+             norm=config['norm'],
              one_to_all=config['one_to_all'],
              all_to_all=config['all_to_all'],
+             final_stride=config['final_stride'],
              use_sfb=config['use_sfb'],
              out_encoder_dims=config['out_encoder_dims'],
              inference_mode=config['inference_mode'],
-             padding=config['padding'],
              in_dims=config['in_encoder_dims'],
              nb_interp_frame=config['nb_interp_frame'],
              nb_layers=config['nb_layers'],
@@ -1043,7 +1028,603 @@ def build_flow_model_recursive_video(config, image_size, log_function):
              drop_path_rate=config['drop_path_rate'],
              log_function=log_function,
              only_first=config['only_first'],
-             dot_multiplier=config['dot_multiplier'])
+             dot_multiplier=3)
+        
+    model = model.to(config['device'])
+
+    return model
+
+
+
+def build_flow_model_video(config, image_size, log_function, nb_channels):
+
+    model = OpticalFlowModelVideo(deep_supervision=config['deep_supervision'],
+             norm=config['norm'],
+             decoder_3d=config['decoder_3d'],
+             nb_channels=nb_channels,
+             iterative_bottleneck=config['iterative_bottleneck'],
+             simple_decoder=config['simple_decoder'],
+             one_to_all=config['one_to_all'],
+             all_to_all=config['all_to_all'],
+             final_stride=config['final_stride'],
+             distance_embedding=config['distance_embedding'],
+             use_sfb=config['use_sfb'],
+             out_encoder_dims=config['out_encoder_dims'],
+             inference_mode=config['inference_mode'],
+             in_dims=config['in_encoder_dims'],
+             nb_layers=config['nb_layers'],
+             image_size=image_size,
+             conv_depth=config['conv_depth'],
+             bottleneck_heads=config['bottleneck_heads'],
+             drop_path_rate=config['drop_path_rate'],
+             log_function=log_function,
+             only_first=config['only_first'],
+             dot_multiplier=3)
+        
+    model = model.to(config['device'])
+
+    return model
+
+
+
+def build_model_1(config, image_size, log_function, nb_channels):
+
+    model = Model1(deep_supervision=config['deep_supervision'],
+             norm=config['norm'],
+             legacy=config['legacy'],
+             nb_conv=config['nb_conv'],
+             nb_channels=nb_channels,
+             motion_from_ed=config['motion_from_ed'],
+             one_to_all=config['one_to_all'],
+             all_to_all=config['all_to_all'],
+             final_stride=config['final_stride'],
+             use_sfb=config['use_sfb'],
+             out_encoder_dims=config['out_encoder_dims'],
+             inference_mode=config['inference_mode'],
+             in_dims=config['in_encoder_dims'],
+             nb_layers=config['nb_layers'],
+             image_size=image_size,
+             conv_depth=config['conv_depth'],
+             bottleneck_heads=config['bottleneck_heads'],
+             drop_path_rate=config['drop_path_rate'],
+             log_function=log_function,
+             only_first=config['only_first'],
+             dot_multiplier=2)
+        
+    model = model.to(config['device'])
+
+    return model
+
+
+
+
+def build_flow_model_3d(config, image_size, log_function, nb_channels):
+
+    model = Model3D(deep_supervision=config['deep_supervision'],
+             norm=config['norm'],
+             legacy=config['legacy'],
+             kernel_size=config['kernel_size'],
+             nb_channels=nb_channels,
+             motion_from_ed=config['motion_from_ed'],
+             one_to_all=config['one_to_all'],
+             all_to_all=config['all_to_all'],
+             final_stride=config['final_stride'],
+             use_sfb=config['use_sfb'],
+             out_encoder_dims=config['out_encoder_dims'],
+             inference_mode=config['inference_mode'],
+             in_dims=config['in_encoder_dims'],
+             nb_layers=config['nb_layers'],
+             image_size=image_size,
+             conv_depth=config['conv_depth'],
+             bottleneck_heads=config['bottleneck_heads'],
+             drop_path_rate=config['drop_path_rate'],
+             log_function=log_function,
+             only_first=config['only_first'],
+             dot_multiplier=2)
+        
+    model = model.to(config['device'])
+
+    return model
+
+
+
+def build_model_2(config, image_size, log_function, nb_channels, backward, segmentation):
+
+    model = Model2(deep_supervision=config['deep_supervision'],
+             nb_conv=config['nb_conv'],
+             norm=config['norm'],
+             legacy=config['legacy'],
+             segmentation=segmentation,
+             nb_channels=nb_channels,
+             motion_from_ed=config['motion_from_ed'],
+             one_to_all=config['one_to_all'],
+             all_to_all=config['all_to_all'],
+             final_stride=config['final_stride'],
+             use_sfb=config['use_sfb'],
+             backward=backward,
+             out_encoder_dims=config['out_encoder_dims'],
+             inference_mode=config['inference_mode'],
+             in_dims=config['in_encoder_dims'],
+             nb_layers=config['nb_layers'],
+             image_size=image_size,
+             conv_depth=config['conv_depth'],
+             bottleneck_heads=config['bottleneck_heads'],
+             drop_path_rate=config['drop_path_rate'],
+             log_function=log_function,
+             only_first=config['only_first'],
+             dot_multiplier=2)
+        
+    model = model.to(config['device'])
+
+    return model
+
+
+
+def Build_interpolator(config, image_size, log_function, nb_channels):
+
+    model = Interpolator(deep_supervision=config['deep_supervision'],
+             norm=config['norm'],
+             legacy=config['legacy'],
+             nb_channels=nb_channels,
+             motion_from_ed=config['motion_from_ed'],
+             one_to_all=config['one_to_all'],
+             all_to_all=config['all_to_all'],
+             final_stride=config['final_stride'],
+             use_sfb=config['use_sfb'],
+             out_encoder_dims=config['out_encoder_dims'],
+             inference_mode=config['inference_mode'],
+             in_dims=config['in_encoder_dims'],
+             nb_layers=config['nb_layers'],
+             image_size=image_size,
+             conv_depth=config['conv_depth'],
+             bottleneck_heads=config['bottleneck_heads'],
+             drop_path_rate=config['drop_path_rate'],
+             log_function=log_function,
+             only_first=config['only_first'],
+             dot_multiplier=2)
+        
+    model = model.to(config['device'])
+
+    return model
+
+
+
+def Build_aggregator(config, image_size, log_function, nb_channels):
+
+    model = Aggregator(deep_supervision=config['deep_supervision'],
+             norm=config['norm'],
+             legacy=config['legacy'],
+             nb_channels=nb_channels,
+             motion_from_ed=config['motion_from_ed'],
+             one_to_all=config['one_to_all'],
+             all_to_all=config['all_to_all'],
+             final_stride=config['final_stride'],
+             use_sfb=config['use_sfb'],
+             out_encoder_dims=config['out_encoder_dims'],
+             inference_mode=config['inference_mode'],
+             in_dims=config['in_encoder_dims'],
+             nb_layers=config['nb_layers'],
+             image_size=image_size,
+             conv_depth=config['conv_depth'],
+             bottleneck_heads=config['bottleneck_heads'],
+             drop_path_rate=config['drop_path_rate'],
+             log_function=log_function,
+             only_first=config['only_first'],
+             dot_multiplier=2)
+        
+    model = model.to(config['device'])
+
+    return model
+
+
+
+def build_flow_model_simple(config, image_size, log_function, nb_channels):
+
+    model = FlowSimple(deep_supervision=config['deep_supervision'],
+             norm=config['norm'],
+             legacy=config['legacy'],
+             nb_channels=nb_channels,
+             motion_from_ed=config['motion_from_ed'],
+             one_to_all=config['one_to_all'],
+             all_to_all=config['all_to_all'],
+             final_stride=config['final_stride'],
+             use_sfb=config['use_sfb'],
+             out_encoder_dims=config['out_encoder_dims'],
+             inference_mode=config['inference_mode'],
+             in_dims=config['in_encoder_dims'],
+             nb_layers=config['nb_layers'],
+             image_size=image_size,
+             conv_depth=config['conv_depth'],
+             bottleneck_heads=config['bottleneck_heads'],
+             drop_path_rate=config['drop_path_rate'],
+             log_function=log_function,
+             only_first=config['only_first'],
+             dot_multiplier=2)
+        
+    model = model.to(config['device'])
+
+    return model
+
+
+
+
+def build_flow_model_successive(config, image_size, log_function, nb_channels, backward, segmentation):
+
+    model = OpticalFlowModelSuccessive(deep_supervision=config['deep_supervision'],
+             nb_conv=config['nb_conv'],
+             norm=config['norm'],
+             legacy=config['legacy'],
+             segmentation=segmentation,
+             nb_channels=nb_channels,
+             motion_from_ed=config['motion_from_ed'],
+             one_to_all=config['one_to_all'],
+             all_to_all=config['all_to_all'],
+             final_stride=config['final_stride'],
+             use_sfb=config['use_sfb'],
+             backward=backward,
+             conv_bottleneck=config['conv_bottleneck'],
+             out_encoder_dims=config['out_encoder_dims'],
+             inference_mode=config['inference_mode'],
+             in_dims=config['in_encoder_dims'],
+             nb_layers=config['nb_layers'],
+             image_size=image_size,
+             conv_depth=config['conv_depth'],
+             bottleneck_heads=config['bottleneck_heads'],
+             drop_path_rate=config['drop_path_rate'],
+             log_function=log_function,
+             only_first=config['only_first'],
+             dot_multiplier=2)
+        
+    model = model.to(config['device'])
+
+    return model
+
+
+
+def build_flow_model_start_end(config, image_size, log_function, nb_channels):
+
+    model = StartEnd(deep_supervision=config['deep_supervision'],
+             nb_conv=config['nb_conv'],
+             norm=config['norm'],
+             legacy=config['legacy'],
+             nb_channels=nb_channels,
+             motion_from_ed=config['motion_from_ed'],
+             one_to_all=config['one_to_all'],
+             all_to_all=config['all_to_all'],
+             final_stride=config['final_stride'],
+             use_sfb=config['use_sfb'],
+             out_encoder_dims=config['out_encoder_dims'],
+             inference_mode=config['inference_mode'],
+             in_dims=config['in_encoder_dims'],
+             nb_layers=config['nb_layers'],
+             image_size=image_size,
+             conv_depth=config['conv_depth'],
+             bottleneck_heads=config['bottleneck_heads'],
+             drop_path_rate=config['drop_path_rate'],
+             log_function=log_function,
+             only_first=config['only_first'],
+             dot_multiplier=2)
+        
+    model = model.to(config['device'])
+
+    return model
+
+
+
+def build_flow_model_successive_embedding(config, image_size, log_function, nb_channels, backward, segmentation):
+
+    model = OpticalFlowModelSuccessiveEmbedding(deep_supervision=config['deep_supervision'],
+             nb_conv=config['nb_conv'],
+             norm=config['norm'],
+             legacy=config['legacy'],
+             segmentation=segmentation,
+             nb_channels=nb_channels,
+             motion_from_ed=config['motion_from_ed'],
+             one_to_all=config['one_to_all'],
+             all_to_all=config['all_to_all'],
+             final_stride=config['final_stride'],
+             use_sfb=config['use_sfb'],
+             backward=backward,
+             out_encoder_dims=config['out_encoder_dims'],
+             inference_mode=config['inference_mode'],
+             in_dims=config['in_encoder_dims'],
+             nb_layers=config['nb_layers'],
+             image_size=image_size,
+             conv_depth=config['conv_depth'],
+             bottleneck_heads=config['bottleneck_heads'],
+             drop_path_rate=config['drop_path_rate'],
+             log_function=log_function,
+             only_first=config['only_first'],
+             dot_multiplier=2)
+        
+    model = model.to(config['device'])
+
+    return model
+
+
+
+def build_mtl_embedding_model(config, image_size, log_function, nb_channels):
+
+    model = MTLEmbedding(deep_supervision=config['deep_supervision'],
+             nb_conv=config['nb_conv'],
+             norm=config['norm'],
+             legacy=config['legacy'],
+             nb_channels=nb_channels,
+             motion_from_ed=config['motion_from_ed'],
+             one_to_all=config['one_to_all'],
+             all_to_all=config['all_to_all'],
+             final_stride=config['final_stride'],
+             use_sfb=config['use_sfb'],
+             out_encoder_dims=config['out_encoder_dims'],
+             inference_mode=config['inference_mode'],
+             in_dims=config['in_encoder_dims'],
+             nb_layers=config['nb_layers'],
+             image_size=image_size,
+             conv_depth=config['conv_depth'],
+             bottleneck_heads=config['bottleneck_heads'],
+             drop_path_rate=config['drop_path_rate'],
+             log_function=log_function,
+             only_first=config['only_first'],
+             dot_multiplier=2)
+        
+    model = model.to(config['device'])
+
+    return model
+
+
+
+def build_final_model(config, image_size, log_function, nb_channels):
+
+    model = Final(deep_supervision=config['deep_supervision'],
+             nb_conv=config['nb_conv'],
+             adjacent=config['adjacent'],
+             concat_nb=config['concat_nb'],
+             norm=config['norm'],
+             legacy=config['legacy'],
+             nb_channels=nb_channels,
+             motion_from_ed=config['motion_from_ed'],
+             one_to_all=config['one_to_all'],
+             all_to_all=config['all_to_all'],
+             final_stride=config['final_stride'],
+             use_sfb=config['use_sfb'],
+             out_encoder_dims=config['out_encoder_dims'],
+             inference_mode=config['inference_mode'],
+             in_dims=config['in_encoder_dims'],
+             nb_layers=config['nb_layers'],
+             image_size=image_size,
+             conv_depth=config['conv_depth'],
+             bottleneck_heads=config['bottleneck_heads'],
+             drop_path_rate=config['drop_path_rate'],
+             log_function=log_function,
+             only_first=config['only_first'],
+             dot_multiplier=2)
+        
+    model = model.to(config['device'])
+
+    return model
+
+
+
+def build_final_flow_model(config, image_size, log_function, nb_channels):
+
+    model = FinalFlow(deep_supervision=config['deep_supervision'],
+             nb_conv=config['nb_conv'],
+             bottleneck_type=config['bottleneck_type'],
+             topk=config['topk'],
+             pos_1d=config['pos_1d'],
+             distance=config['distance'],
+             norm=config['norm'],
+             legacy=config['legacy'],
+             nb_channels=nb_channels,
+             motion_from_ed=config['motion_from_ed'],
+             one_to_all=config['one_to_all'],
+             all_to_all=config['all_to_all'],
+             final_stride=config['final_stride'],
+             use_sfb=config['use_sfb'],
+             out_encoder_dims=config['out_encoder_dims'],
+             inference_mode=config['inference_mode'],
+             in_dims=config['in_encoder_dims'],
+             nb_layers=config['nb_layers'],
+             image_size=image_size,
+             conv_depth=config['conv_depth'],
+             bottleneck_heads=config['bottleneck_heads'],
+             drop_path_rate=config['drop_path_rate'],
+             log_function=log_function,
+             only_first=config['only_first'],
+             dot_multiplier=2)
+        
+    model = model.to(config['device'])
+
+    return model
+
+
+
+
+def build_SegFlow_model(config, image_size, log_function, nb_channels, backward, segmentation):
+
+    model = SegFlow(deep_supervision=config['deep_supervision'],
+             nb_conv=config['nb_conv'],
+             norm=config['norm'],
+             legacy=config['legacy'],
+             segmentation=segmentation,
+             nb_channels=nb_channels,
+             motion_from_ed=config['motion_from_ed'],
+             one_to_all=config['one_to_all'],
+             all_to_all=config['all_to_all'],
+             final_stride=config['final_stride'],
+             use_sfb=config['use_sfb'],
+             backward=backward,
+             out_encoder_dims=config['out_encoder_dims'],
+             inference_mode=config['inference_mode'],
+             in_dims=config['in_encoder_dims'],
+             nb_layers=config['nb_layers'],
+             image_size=image_size,
+             conv_depth=config['conv_depth'],
+             bottleneck_heads=config['bottleneck_heads'],
+             drop_path_rate=config['drop_path_rate'],
+             log_function=log_function,
+             only_first=config['only_first'],
+             dot_multiplier=2)
+        
+    model = model.to(config['device'])
+
+    return model
+
+
+def build_temporal_model(config, image_size, log_function, nb_channels, backward, segmentation):
+
+    model = TemporalModel(deep_supervision=config['deep_supervision'],
+             nb_conv=config['nb_conv'],
+             norm=config['norm'],
+             video_length=config['video_length'],
+             legacy=config['legacy'],
+             segmentation=segmentation,
+             nb_channels=nb_channels,
+             motion_from_ed=config['motion_from_ed'],
+             one_to_all=config['one_to_all'],
+             all_to_all=config['all_to_all'],
+             final_stride=config['final_stride'],
+             use_sfb=config['use_sfb'],
+             backward=backward,
+             out_encoder_dims=config['out_encoder_dims'],
+             inference_mode=config['inference_mode'],
+             in_dims=config['in_encoder_dims'],
+             nb_layers=config['nb_layers'],
+             image_size=image_size,
+             conv_depth=config['conv_depth'],
+             bottleneck_heads=config['bottleneck_heads'],
+             drop_path_rate=config['drop_path_rate'],
+             log_function=log_function,
+             only_first=config['only_first'],
+             dot_multiplier=2)
+        
+    model = model.to(config['device'])
+
+    return model
+
+
+def build_seg_model_simple(config, image_size, log_function, nb_channels, backward, segmentation):
+
+    model = SegSimple(deep_supervision=config['deep_supervision'],
+             nb_conv=config['nb_conv'],
+             norm=config['norm'],
+             legacy=config['legacy'],
+             segmentation=segmentation,
+             nb_channels=nb_channels,
+             motion_from_ed=config['motion_from_ed'],
+             one_to_all=config['one_to_all'],
+             all_to_all=config['all_to_all'],
+             final_stride=config['final_stride'],
+             use_sfb=config['use_sfb'],
+             backward=backward,
+             out_encoder_dims=config['out_encoder_dims'],
+             inference_mode=config['inference_mode'],
+             in_dims=config['in_encoder_dims'],
+             nb_layers=config['nb_layers'],
+             image_size=image_size,
+             conv_depth=config['conv_depth'],
+             bottleneck_heads=config['bottleneck_heads'],
+             drop_path_rate=config['drop_path_rate'],
+             log_function=log_function,
+             only_first=config['only_first'],
+             dot_multiplier=2)
+        
+    model = model.to(config['device'])
+
+    return model
+
+
+
+def build_flow_model_successive_prediction(config, image_size, log_function, nb_channels, backward, segmentation):
+
+    model = OpticalFlowModelSuccessivePrediction(deep_supervision=config['deep_supervision'],
+             nb_conv=config['nb_conv'],
+             norm=config['norm'],
+             legacy=config['legacy'],
+             segmentation=segmentation,
+             nb_channels=nb_channels,
+             motion_from_ed=config['motion_from_ed'],
+             one_to_all=config['one_to_all'],
+             all_to_all=config['all_to_all'],
+             final_stride=config['final_stride'],
+             use_sfb=config['use_sfb'],
+             backward=backward,
+             out_encoder_dims=config['out_encoder_dims'],
+             inference_mode=config['inference_mode'],
+             in_dims=config['in_encoder_dims'],
+             nb_layers=config['nb_layers'],
+             image_size=image_size,
+             conv_depth=config['conv_depth'],
+             bottleneck_heads=config['bottleneck_heads'],
+             drop_path_rate=config['drop_path_rate'],
+             log_function=log_function,
+             only_first=config['only_first'],
+             dot_multiplier=2)
+        
+    model = model.to(config['device'])
+
+    return model
+
+
+
+
+def build_flow_model_successive_other(config, image_size, log_function, nb_channels, backward, segmentation, distance_embedding):
+
+    model = OpticalFlowModelSuccessiveOther(deep_supervision=config['deep_supervision'],
+             norm=config['norm'],
+             legacy=config['legacy'],
+             segmentation=segmentation,
+             nb_channels=nb_channels,
+             distance_embedding=distance_embedding,
+             motion_from_ed=config['motion_from_ed'],
+             one_to_all=config['one_to_all'],
+             all_to_all=config['all_to_all'],
+             final_stride=config['final_stride'],
+             use_sfb=config['use_sfb'],
+             backward=backward,
+             out_encoder_dims=config['out_encoder_dims'],
+             inference_mode=config['inference_mode'],
+             in_dims=config['in_encoder_dims'],
+             nb_layers=config['nb_layers'],
+             image_size=image_size,
+             conv_depth=config['conv_depth'],
+             bottleneck_heads=config['bottleneck_heads'],
+             drop_path_rate=config['drop_path_rate'],
+             log_function=log_function,
+             only_first=config['only_first'],
+             dot_multiplier=2)
+        
+    model = model.to(config['device'])
+
+    return model
+
+
+
+
+def build_flow_model_successive_other_adjacent(config, image_size, log_function, nb_channels, backward, segmentation):
+
+    model = OpticalFlowModelSuccessiveOtherAdjacent(deep_supervision=config['deep_supervision'],
+             norm=config['norm'],
+             legacy=config['legacy'],
+             segmentation=segmentation,
+             nb_channels=nb_channels,
+             motion_from_ed=config['motion_from_ed'],
+             one_to_all=config['one_to_all'],
+             all_to_all=config['all_to_all'],
+             final_stride=config['final_stride'],
+             use_sfb=config['use_sfb'],
+             backward=backward,
+             out_encoder_dims=config['out_encoder_dims'],
+             inference_mode=config['inference_mode'],
+             in_dims=config['in_encoder_dims'],
+             nb_layers=config['nb_layers'],
+             image_size=image_size,
+             conv_depth=config['conv_depth'],
+             bottleneck_heads=config['bottleneck_heads'],
+             drop_path_rate=config['drop_path_rate'],
+             log_function=log_function,
+             only_first=config['only_first'],
+             dot_multiplier=2)
         
     model = model.to(config['device'])
 
@@ -1128,7 +1709,7 @@ def build_flow_model_2(config, conv_layer, norm, image_size, log_function):
     return model
 
 
-def build_2d_model(config, conv_layer, norm, log_function, image_size, window_size, middle, num_classes):
+def build_2d_model(config, conv_layer, norm, log_function, image_size, window_size, middle, num_classes, processor):
 
     #image_size = 128 if config['use_cropped_images'] else 224
     #window_size = 16 if config['use_cropped_images'] else 14
@@ -1156,6 +1737,7 @@ def build_2d_model(config, conv_layer, norm, log_function, image_size, window_si
                         reconstruction=config['reconstruction'],
                         reconstruction_skip=config['reconstruction_skip'],
                         proj=config['proj'],
+                        processor=processor,
                         shortcut=config['shortcut'],
                         use_conv_mlp=config['use_conv_mlp'],
                         similarity_down_scale=config['similarity_down_scale'],

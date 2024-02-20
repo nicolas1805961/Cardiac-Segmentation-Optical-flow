@@ -33,7 +33,6 @@ import torch
 
 #torch.autograd.set_detect_anomaly(True)
 #warnings.filterwarnings("always", category=UserWarning)
-#
 #os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 
 
@@ -156,12 +155,31 @@ def main():
                            'nnMTLTrainerV2FlowLabeled', 
                            'nnMTLTrainerV2FlowPrediction',
                            'nnMTLTrainerV2FlowSimple',
+                           'nnMTLTrainerV2FlowVideo',
                            'nnMTLTrainerV2StableDiffusion',
                            'nnMTLTrainerV2ControlNet',
                            'nnMTLTrainerV2FlowVariableLength',
                            'nnMTLTrainerV2FlowRecursiveVideo',
                            'nnMTLTrainerV2FlowRecursive',
                            'nnMTLTrainerV2FlowLib',
+                           'nnMTLTrainerV2FlowSuccessive',
+                           'nnMTLTrainerV2FlowSuccessiveSupervised',
+                           'nnMTLTrainerV2FlowSuccessiveEmbedding',
+                           'nnMTLTrainerV2FlowSuccessiveOther',
+                           'ErrorCorrection',
+                           'Final',
+                           'FinalFlow',
+                           'StartEnd',
+                           'Interpolator',
+                           'FlowSimple',
+                           'nnMTLTrainerV2SegFlow',
+                           'TemporalModel',
+                           'MTLembedding',
+                           'GlobalModel',
+                           'nnMTLTrainerV2Raft',
+                           'nnMTLTrainerV2Flow3D',
+                           'nnMTLTrainerV2Flow3DSupervised',
+                           'nnMTLTrainerV2FlowSuccessivePrediction',
                            'nnMTLTrainerV2Flow6']:
         if validation_only:
             config = read_config_video(os.path.join(weight_folder, 'config.yaml'))
@@ -201,10 +219,16 @@ def main():
 
         
     if network_trainer == 'nnMTLTrainerV2':
-        trainer = trainer_class(plans_file, fold, output_folder=output_folder_name, dataset_directory=dataset_directory,
-                            batch_dice=batch_dice, stage=stage, unpack_data=decompress_data,
-                            deterministic=deterministic,
-                            fp16=run_mixed_precision, binary=True, config=config)
+        if any([x in task for x in ['31', '35', '32', '36']]):
+            trainer = trainer_class(plans_file, fold, output_folder=output_folder_name, dataset_directory=dataset_directory,
+                                batch_dice=batch_dice, stage=stage, unpack_data=decompress_data,
+                                deterministic=deterministic,
+                                fp16=run_mixed_precision, binary=False, config=config)
+        else:
+            trainer = trainer_class(plans_file, fold, output_folder=output_folder_name, dataset_directory=dataset_directory,
+                                batch_dice=batch_dice, stage=stage, unpack_data=decompress_data,
+                                deterministic=deterministic,
+                                fp16=run_mixed_precision, config=config, binary=False)
     else:
         trainer = trainer_class(plans_file, fold, output_folder=output_folder_name, dataset_directory=dataset_directory,
                             batch_dice=batch_dice, stage=stage, unpack_data=decompress_data,
@@ -245,18 +269,20 @@ def main():
         trainer.network.eval()
 
         if not validation_only:
-            output_folder = os.path.join(trainer.log_dir, 'Validation', task, 'fold_' + str(fold))
+            output_folder = os.path.join(trainer.log_dir, task, 'fold_' + str(fold))
             if not os.path.exists(output_folder):
                 os.makedirs(output_folder)
         else:
-            output_folder = os.path.join(weight_folder, 'Validation', task, 'fold_' + str(fold))
+            output_folder = os.path.join(weight_folder, task, 'fold_' + str(fold))
             if not os.path.exists(output_folder):
                 os.makedirs(output_folder)
 
-        # predict validation
-        trainer.validate(save_softmax=args.npz, validation_folder_name=val_folder,
-                         run_postprocessing_on_folds=not disable_postprocessing_on_folds,
-                         overwrite=args.val_disable_overwrite, output_folder=output_folder)
+        if network_trainer in ['nnMTLTrainerV2']:
+
+            # predict validation
+            trainer.validate(save_softmax=args.npz, validation_folder_name=val_folder,
+                            run_postprocessing_on_folds=not disable_postprocessing_on_folds,
+                            overwrite=args.val_disable_overwrite, output_folder=output_folder)
 
         if network == '3d_lowres' and not args.disable_next_stage_pred:
             print("predicting segmentations for the next stage of the cascade")

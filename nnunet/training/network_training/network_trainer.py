@@ -63,9 +63,12 @@ class NetworkTrainer(object):
         if deterministic:
             random.seed(12345)
             np.random.seed(12345)
+            torch.cuda.manual_seed_all(12345)
             torch.manual_seed(12345)
-        cudnn.deterministic = False
-        torch.backends.cudnn.benchmark = True
+            cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cudnn.deterministic = True
+        #torch.use_deterministic_algorithms(True)
 
         #if deterministic:
         #    np.random.seed(12345)

@@ -507,9 +507,9 @@ def process_labeled_image_3d_logits(path, augmentations):
         assert logits_2d.max() <= 1.0 and logits_2d.min() >= 0.0, augmentations
         assert logits_3d.max() <= 1.0 and logits_3d.min() >= 0.0, augmentations
 
-    clahed_image = NormalizeIntensity(nonzero=True)(clahed_image)
-    logits_2d = NormalizeIntensity(nonzero=True)(logits_2d)
-    logits_3d = NormalizeIntensity(nonzero=True)(logits_3d)
+    clahed_image = NormalizeIntensity()(clahed_image)
+    logits_2d = NormalizeIntensity()(logits_2d)
+    logits_3d = NormalizeIntensity()(logits_3d)
 
     input_volume = torch.cat([clahed_image, logits_2d, logits_3d], dim=0).unsqueeze(0)
 
@@ -566,9 +566,9 @@ def process_labeled_image_2d_logits(path, img_size, augmentations):
     logits_2d = logits_2d.squeeze()
     logits_3d = logits_3d.squeeze()
 
-    clahed_image = NormalizeIntensity(nonzero=True)(clahed_image)
-    logits_2d = NormalizeIntensity(nonzero=True)(logits_2d)
-    logits_3d = NormalizeIntensity(nonzero=True)(logits_3d)
+    clahed_image = NormalizeIntensity()(clahed_image)
+    logits_2d = NormalizeIntensity()(logits_2d)
+    logits_3d = NormalizeIntensity()(logits_3d)
 
     input_2d = torch.cat([clahed_image, logits_2d], dim=0)
     input_3d = torch.cat([clahed_image, logits_3d], dim=0)
@@ -627,10 +627,10 @@ def process_2d_image_tool(path, augmentations, img_size, directional_field, appl
         df = get_distance_image(torch.argmax(label, dim=0).numpy(), norm=True)
         out['directional_field'] = df
     
-    #out_image = NormalizeIntensity(nonzero=True)(out_image)
+    #out_image = NormalizeIntensity()(out_image)
     img_min = out_image.min().item()
     img_max = out_image.max().item()
-    out_image = NormalizeIntensity(subtrahend=img_min, divisor=(img_max - img_min), nonzero=True)(out_image)
+    out_image = NormalizeIntensity(subtrahend=img_min, divisor=(img_max - img_min), )(out_image)
 
     #print(augmentations)
     #fig, ax = plt.subplots(1, 2)
@@ -689,7 +689,7 @@ def process_2d_image_crop_tool(path, augmentations, img_size, target_ratio, bina
         for augmentation in augmentations:
             out_image, label = augmentation.augment_labeled(out_image, label)
     
-    out_image = NormalizeIntensity(nonzero=True)(out_image)
+    out_image = NormalizeIntensity()(out_image)
 
     if directional_field:
         df = get_distance_image(torch.argmax(label, dim=0).numpy(), norm=True)
@@ -773,7 +773,7 @@ def process_2d_image_crop(path, img_size, augmentations, target_ratio, binary, l
 #                else:
 #                    clahed_image = augmentation.augment_unlabeled(clahed_image)
 #            assert clahed_image.max() <= 1.0 and clahed_image.min() >= 0.0, augmentations
-#        clahed_image = NormalizeIntensity(nonzero=True)(clahed_image)
+#        clahed_image = NormalizeIntensity()(clahed_image)
 #        image_list.append(clahed_image)
 #
 #    parameters = get_parameters(torch.argmax(label, dim=0).numpy())

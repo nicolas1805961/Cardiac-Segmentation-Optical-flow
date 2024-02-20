@@ -11,15 +11,77 @@ import sys
 from kornia.filters import spatial_gradient3d, spatial_gradient
 import matplotlib
 
-class ImageFlowLoss(nn.Module):
-    def __init__(self, writer, w_xy, w_z):
-        super(ImageFlowLoss, self).__init__()
-        self.epsilon = torch.Tensor([0.01]).float().to('cuda')
-        self.writer = writer
-        self.w_xy = w_xy
-        self.w_z = w_z
 
-    def forward(self, flow, iter_nb=None):
+class NCC(torch.nn.Module):
+    """
+    local (over window) normalized cross correlation
+    """
+    def __init__(self, win=9, eps=1e-3, reduction='mean'):
+        super(NCC, self).__init__()
+        self.win_raw = win
+        self.eps = eps
+        self.win = win
+        self.reduction = reduction
+
+    def forward(self, I, J):
+
+        if I.dim() > 4:
+            T, B, C, H, W = I.shape
+            I = I.view(T * B, C, H, W)
+            J = J.view(T * B, C, H, W)
+
+        ndims = 2
+        win_size = self.win_raw
+        self.win = [self.win_raw] * ndims
+
+        weight_win_size = self.win_raw
+        weight = torch.ones((1, 1, weight_win_size, weight_win_size), device=I.device, requires_grad=False)
+        # prepare conv kernel
+        conv_fn = getattr(F, 'conv%dd' % ndims)
+        # conv_fn = F.conv3d
+
+        # compute CC squares
+        I2 = I*I
+        J2 = J*J
+        IJ = I*J
+
+        # compute filters
+        # compute local sums via convolution
+        I_sum = conv_fn(I, weight, padding=int(win_size/2))
+        J_sum = conv_fn(J, weight, padding=int(win_size/2))
+        I2_sum = conv_fn(I2, weight, padding=int(win_size/2))
+        J2_sum = conv_fn(J2, weight, padding=int(win_size/2))
+        IJ_sum = conv_fn(IJ, weight, padding=int(win_size/2))
+
+        # compute cross correlation
+        # win_size = np.prod(self.win)
+        win_size = torch.from_numpy(np.array([np.prod(self.win)])).float()
+        win_size = win_size.cuda()
+        u_I = I_sum/win_size
+        u_J = J_sum/win_size
+
+        cross = IJ_sum - u_J*I_sum - u_I*J_sum + u_I*u_J*win_size
+        I_var = I2_sum - 2 * u_I * I_sum + u_I*u_I*win_size
+        J_var = J2_sum - 2 * u_J * J_sum + u_J*u_J*win_size
+
+        cc0 = cross * cross / (I_var * J_var + self.eps)
+        cc = torch.clamp(cc0, 0.001, 0.999)
+
+        # return negative cc.
+        if self.reduction == 'mean':
+            return 1-torch.mean(cc)
+        else:
+            return 1-cc
+
+    
+
+
+class SpatialSmoothingLoss(nn.Module):
+    def __init__(self):
+        super(SpatialSmoothingLoss, self).__init__()
+        self.epsilon = torch.Tensor([0.01]).float().to('cuda')
+
+    def forward(self, flow):
         if flow.dim() == 4:
             B, C, H, W = flow.shape
             flow = flow[None]
@@ -39,31 +101,68 @@ class ImageFlowLoss(nn.Module):
         gradient = spatial_gradient3d(flow)
         assert gradient.shape[2] == 3
         assert gradient.shape[1] == 2
-        huber_xy = torch.sqrt(self.epsilon + torch.sum(gradient[:, :, 0].pow(2) + gradient[:, :, 1].pow(2)))
-        #huber_xyz = torch.sqrt(self.epsilon + torch.sum(gradient[:, :, 0].pow(2) + gradient[:, :, 1].pow(2) + gradient[:, :, 2].pow(2)))
-        huber_z = torch.sqrt(self.epsilon + torch.sum(gradient[:, :, 2].pow(2)))
-        if iter_nb is not None:
-            #self.writer.add_scalar('Iteration/lambda', w, iter_nb)
-            self.writer.add_scalars('Iteration/flow_loss_components', {'regularization_xy': self.w_xy * huber_xy, 'regularization_z': self.w_z * huber_z}, iter_nb)
-        return self.w_xy * huber_xy + self.w_z * huber_z
 
-#class Approx_Huber_Loss(nn.Module):
-#    def __init__(self):
-#        super(Approx_Huber_Loss, self).__init__()
-#        self.device = torch.device('cuda')
-#        self.sobel_filter_X = np.array([[1, 0, -1], [2, 0, -2], [1, 0, -1]]).reshape((1, 1, 3, 3))
-#        self.sobel_filter_Y = np.array([[1, 2, 1], [0, 0, 0], [-1, -2, -1]]).reshape((1, 1, 3, 3))
-#        self.sobel_filter_X = torch.from_numpy(self.sobel_filter_X).float().to(self.device)
-#        self.sobel_filter_Y = torch.from_numpy(self.sobel_filter_Y).float().to(self.device)
-#        self.epsilon = torch.Tensor([0.01]).float().to(self.device)
-#
-#    def forward(self, flow):
-#        flow_X = flow[:, 0:1]
-#        flow_Y = flow[:, 1:]
-#        grad_X = F.conv2d(flow_X, self.sobel_filter_X, bias=None, stride=1, padding=1)
-#        grad_Y = F.conv2d(flow_Y, self.sobel_filter_Y, bias=None, stride=1, padding=1)
-#        huber = torch.sqrt(self.epsilon + torch.sum(grad_X.pow(2)+grad_Y.pow(2)))
-#        return huber
+        #if iter_nb > 240:
+        #    matplotlib.use('qtagg')
+        #    fig, ax = plt.subplots(1, 3)
+        #    ax[0].imshow(gradient[0, 0, 0, 0].detach().cpu(), cmap='gray')
+        #    ax[1].imshow(gradient[0, 0, 1, 0].detach().cpu(), cmap='gray')
+        #    ax[2].imshow(gradient[0, 0, 2, 0].detach().cpu(), cmap='gray')
+        #    plt.show()
+
+        gradient = gradient.pow(2)
+        gradient_xy = gradient[:, :, :2].mean()
+
+
+        #huber_xy = torch.sqrt(self.epsilon + torch.sum(gradient[:, :, 0].pow(2) + gradient[:, :, 1].pow(2)))
+        #huber_z = torch.sqrt(self.epsilon + torch.sum(gradient[:, :, 2].pow(2)))
+        #return self.w_xy * huber_xy + self.w_z * huber_z
+        
+        return gradient_xy
+
+class TemporalSmoothingLoss(nn.Module):
+    def __init__(self):
+        super(TemporalSmoothingLoss, self).__init__()
+        self.epsilon = torch.Tensor([0.01]).float().to('cuda')
+
+    def forward(self, flow):
+        if flow.dim() == 4:
+            B, C, H, W = flow.shape
+            flow = flow[None]
+        elif flow.dim() == 5:
+            T, B, C, H, W = flow.shape
+
+        #gradient_list = []
+        #for t in range(len(flow)):
+        #    current_flow = flow[t]
+        #    gradient = spatial_gradient(current_flow)
+        #    assert gradient.shape[1] == 2
+        #    assert gradient.shape[2] == 2
+        #    gradient_list.append(gradient)
+        #gradient = torch.stack(gradient_list, dim=0)
+
+        flow = flow.permute(1, 2, 0, 3, 4).contiguous() # B, C, T, H, W
+        gradient = spatial_gradient3d(flow)
+        assert gradient.shape[2] == 3
+        assert gradient.shape[1] == 2
+
+        #if iter_nb > 240:
+        #    matplotlib.use('qtagg')
+        #    fig, ax = plt.subplots(1, 3)
+        #    ax[0].imshow(gradient[0, 0, 0, 0].detach().cpu(), cmap='gray')
+        #    ax[1].imshow(gradient[0, 0, 1, 0].detach().cpu(), cmap='gray')
+        #    ax[2].imshow(gradient[0, 0, 2, 0].detach().cpu(), cmap='gray')
+        #    plt.show()
+
+        gradient = gradient.pow(2)
+        gradient_z = gradient[:, :, 2].mean()
+
+
+        #huber_xy = torch.sqrt(self.epsilon + torch.sum(gradient[:, :, 0].pow(2) + gradient[:, :, 1].pow(2)))
+        #huber_z = torch.sqrt(self.epsilon + torch.sum(gradient[:, :, 2].pow(2)))
+        #return self.w_xy * huber_xy + self.w_z * huber_z
+        
+        return gradient_z
 
 class ContrastiveLoss(nn.Module):
     def __init__(self, temp):

@@ -72,8 +72,8 @@ class Augmenter(object):
 
             mu = unlabeled_temporal.mean()
             sigma = unlabeled_temporal.std()
-            unlabeled_temporal = NormalizeIntensity(subtrahend=mu, divisor=sigma, nonzero=True)(unlabeled_temporal)
-            current_labeled = NormalizeIntensity(subtrahend=mu, divisor=sigma, nonzero=True)(current_labeled)
+            unlabeled_temporal = NormalizeIntensity(subtrahend=mu, divisor=sigma, )(unlabeled_temporal)
+            current_labeled = NormalizeIntensity(subtrahend=mu, divisor=sigma, )(current_labeled)
 
             batch_labeled_list.append(current_labeled)
             batch_target_list.append(current_target)
@@ -121,7 +121,7 @@ class Augmenter(object):
 
             mu = current_labeled.mean()
             sigma = current_labeled.std()
-            current_labeled = NormalizeIntensity(subtrahend=mu, divisor=sigma, nonzero=True)(current_labeled)
+            current_labeled = NormalizeIntensity(subtrahend=mu, divisor=sigma, )(current_labeled)
 
             resized_labeled_list = []
             resized_target_list = []

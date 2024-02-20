@@ -5,6 +5,7 @@
 # Written by Ze Liu
 # --------------------------------------------------------
 
+from torchvision.transforms.functional import resize
 from monai.transforms import NormalizeIntensity
 import psutil
 import os
@@ -16,25 +17,25 @@ import torch
 import sys
 import torch.nn as nn
 import matplotlib.pyplot as plt
-from ..lib.encoder import Encoder
-from ..lib.utils import ConvBlocks2D, ConvBlocksLegacy, Filter, ConvBlock, GetSeparability, GetCrossSimilarityMatrix, ReplicateChannels, To_image, From_image, rescale, CCA
-from ..lib import swin_transformer_2
-from ..lib import decoder_alt
+from nnunet.lib.encoder import Encoder
+from nnunet.lib.utils import ConvBlocks2DGroup, ConvBlocks2DBatch, ConvBlocksLegacy, Filter, ConvBlock, GetSeparability, GetCrossSimilarityMatrix, ReplicateChannels, To_image, From_image, rescale, CCA
+from nnunet.lib import swin_transformer_2
+from nnunet.lib import decoder_alt
 import torchvision.transforms.functional as TF
 import torch.nn.functional as F
 from nnunet.network_architecture.neural_network import SegmentationNetwork
 from nnunet.utilities.to_torch import to_cuda, maybe_to_torch
 import numpy as np
 from typing import Union
-from ..lib import swin_cross_attention
-from ..lib.vq_vae import VectorQuantizer, VectorQuantizerEMA, VanillaVAE, Quantize
+from nnunet.lib import swin_cross_attention
+from nnunet.lib.vq_vae import VectorQuantizer, VectorQuantizerEMA, VanillaVAE, Quantize
 from torch.cuda.amp import autocast
 from nnunet.utilities.random_stuff import no_op
 from typing import Union, Tuple
-from ..lib.vit_transformer import SpatialTransformerLayer, ChannelAttention, TransformerEncoderLayer, TransformerEncoder, CrossTransformerEncoderLayer, CrossTransformerEncoder, RelativeTransformerEncoderLayer
+from nnunet.lib.vit_transformer import SpatialTransformerLayer, ChannelAttention, TransformerEncoderLayer, TransformerEncoder, CrossTransformerEncoderLayer, CrossTransformerEncoder, RelativeTransformerEncoderLayer
 from batchgenerators.augmentations.utils import pad_nd_image
 from ..training.dataloading.dataset_loading import get_idx, select_idx
-from ..lib.position_embedding import PositionEmbeddingSine2d, PositionEmbeddingLearned
+from nnunet.lib.position_embedding import PositionEmbeddingSine2d, PositionEmbeddingLearned
 from torch.nn import init
 import random
 import string
@@ -115,6 +116,7 @@ class MTLmodel(SegmentationNetwork):
                 separability,
                 transformer_depth,
                 filter_skip_co_segmentation,
+                processor,
                 bottleneck_heads, 
                 adversarial_loss,
                 transformer_bottleneck,
@@ -160,6 +162,8 @@ class MTLmodel(SegmentationNetwork):
         self.num_classes = num_classes
 
         self.adversarial_loss = adversarial_loss
+
+        self.processor = processor
 
         # stochastic depth
         num_blocks = conv_depth + transformer_depth + [num_bottleneck_layers]
@@ -556,7 +560,7 @@ class MTLmodel(SegmentationNetwork):
                    step_size: float = 0.5, patch_size: Tuple[int, ...] = None, regions_class_order: Tuple[int, ...] = None,
                    use_gaussian: bool = False, pad_border_mode: str = "constant",
                    pad_kwargs: dict = None, all_in_gpu: bool = False,
-                   verbose: bool = True, mixed_precision: bool = True, get_flops=False, binary=False) -> Tuple[np.ndarray, np.ndarray]:
+                   verbose: bool = True, mixed_precision: bool = True, get_flops=False, binary=False, normalize=False) -> Tuple[np.ndarray, np.ndarray]:
         """
         Use this function to predict a 3D image. It does not matter whether the network is a 2D or 3D U-Net, it will
         detect that automatically and run the appropriate code.
@@ -641,7 +645,7 @@ class MTLmodel(SegmentationNetwork):
                         else:
                             res = self._internal_predict_3D_2Dconv_tiled(x, patch_size, do_mirroring, mirror_axes, step_size,
                                                                         regions_class_order, use_gaussian, pad_border_mode,
-                                                                        pad_kwargs, all_in_gpu, False, get_flops=get_flops, binary=binary)
+                                                                        pad_kwargs, all_in_gpu, False, get_flops=get_flops, binary=binary, normalize=normalize)
                     else:
                         res = self._internal_predict_3D_2Dconv(x, patch_size, do_mirroring, mirror_axes, regions_class_order,
                                                                pad_border_mode, pad_kwargs, all_in_gpu, False)
@@ -812,7 +816,8 @@ class MTLmodel(SegmentationNetwork):
                                             get_time_stats=False,
                                             binary=False,
                                             do_mirroring: bool = True,
-                                            mult: np.ndarray or torch.tensor = None):
+                                            mult: np.ndarray or torch.tensor = None, normalize=False):
+
         # if cuda available:
         #   everything in here takes place on the GPU. If x and mult are not yet on GPU this will be taken care of here
         #   we now return a cuda tensor! Not numpy array!
@@ -821,11 +826,13 @@ class MTLmodel(SegmentationNetwork):
         out_flop = inference_time = None
 
         x = maybe_to_torch(x)
-        result_torch = torch.zeros([x.shape[0], self.num_classes] + list(x.shape[2:]), dtype=torch.float)
+
+        #shape_before = x.shape[-2:]
+        #if list(shape_before) == [288, 288]:
+        #    x = resize(x, size=[224, 224])
 
         if torch.cuda.is_available():
             x = to_cuda(x, gpu_id=self.get_device())
-            result_torch = result_torch.cuda(self.get_device(), non_blocking=True)
 
         if mult is not None:
             mult = maybe_to_torch(mult)
@@ -852,7 +859,33 @@ class MTLmodel(SegmentationNetwork):
 
         if binary:
             assert x.shape[0] == 1
-            x[0] = NormalizeIntensity(nonzero=True)(x[0])
+            x[0] = NormalizeIntensity()(x[0])
+
+        if self.processor is not None:
+
+            with torch.no_grad():
+
+                data_list = []
+                for b in range(len(x)):
+                    mean_centroid, _ = self.processor.preprocess_no_registration(data=torch.clone(x[b][None])) # T, C(1), H, W
+                    current_x, padding_need = self.processor.crop_and_pad(data=x[b][None], mean_centroid=mean_centroid)
+                    if normalize:
+                        current_x = NormalizeIntensity()(current_x[0])[None]
+                    data_list.append(current_x)
+                x = torch.cat(data_list, dim=0)
+        
+            padding_need = padding_need[None]
+
+        result_torch = torch.zeros([x.shape[0], self.num_classes] + list(x.shape[2:]), dtype=torch.float)
+
+        if torch.cuda.is_available():
+            result_torch = result_torch.cuda(self.get_device(), non_blocking=True)
+
+        #matplotlib.use('QtAgg')
+        #fig, ax = plt.subplots(1, 1)
+        #ax.imshow(x[0, 0].cpu(), cmap='gray')
+        #plt.show()
+        
 
         for m in range(mirror_idx):
             if m == 0:
@@ -872,11 +905,25 @@ class MTLmodel(SegmentationNetwork):
                 result_torch += 1 / num_results * torch.flip(pred, (3, 2))
             
             del pred
+        
+
+        #if list(shape_before) == [288, 288]:
+        #    result_torch = resize(result_torch, size=shape_before)
+            
+        if self.processor is not None:
+            result_torch = self.processor.uncrop_no_registration(result_torch, padding_need=padding_need) # B, T, H, W
+            
+        #matplotlib.use('QtAgg')
+        #fig, ax = plt.subplots(1, 1)
+        #ax.imshow(torch.argmax(result_torch[0], dim=0).cpu(), cmap='gray')
+        #plt.show()
 
         if mult is not None:
             result_torch[:, :] *= mult
 
         return result_torch, out_flop, inference_time
+
+
 
     def _internal_predict_3D_2Dconv_tiled_middle(self, x: np.ndarray, patch_size: Tuple[int, int], do_mirroring: bool,
                                                 mirror_axes: tuple = (0, 1), step_size: float = 0.5,

@@ -7,11 +7,10 @@ from torch.nn.functional import pad
 from monai.transforms import NormalizeIntensity
 
 class Processor(object):
-    def __init__(self, crop_size, image_size, cropping_network, nb_layers) -> None:
+    def __init__(self, crop_size, image_size, cropping_network) -> None:
         self.crop_size = crop_size
         self.image_size = image_size
         self.cropping_network = cropping_network
-        self.nb_layers = nb_layers
     
     def get_coords(self, data):
         coords = masks_to_boxes(data.unsqueeze(0))
@@ -145,7 +144,7 @@ class Processor(object):
             if torch.count_nonzero(current_data) == 0:
                 softmaxed = torch.zeros_like(current_data)
             else:
-                current_data = NormalizeIntensity(nonzero=True)(current_data)
+                current_data = NormalizeIntensity()(current_data)
                 softmaxed = self.cropping_network(current_data)['pred']
                 softmaxed = torch.softmax(softmaxed, dim=1)
             out = torch.argmax(softmaxed, dim=1).squeeze(0) # H, W

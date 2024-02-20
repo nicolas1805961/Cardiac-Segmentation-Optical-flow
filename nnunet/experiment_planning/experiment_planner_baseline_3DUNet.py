@@ -423,7 +423,7 @@ class ExperimentPlanner(object):
             properties['use_nonzero_mask_for_norm'] = self.plans['use_mask_for_norm']
             self.save_properties_of_cropped(case_identifier, properties)
 
-    def run_preprocessing(self, num_threads):
+    def run_preprocessing(self, num_threads, keep_spacing=False):
         if os.path.isdir(join(self.preprocessed_output_folder, "gt_segmentations")):
             shutil.rmtree(join(self.preprocessed_output_folder, "gt_segmentations"))
         shutil.copytree(join(self.folder_with_cropped_data, "gt_segmentations"),
@@ -443,7 +443,7 @@ class ExperimentPlanner(object):
         elif self.plans['num_stages'] == 1 and isinstance(num_threads, (list, tuple)):
             num_threads = num_threads[-1]
         preprocessor.run(target_spacings, self.folder_with_cropped_data, self.preprocessed_output_folder,
-                         self.plans['data_identifier'], num_threads)
+                         self.plans['data_identifier'], num_threads, keep_spacing=keep_spacing)
 
 
 if __name__ == "__main__":

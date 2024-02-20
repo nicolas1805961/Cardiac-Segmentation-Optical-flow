@@ -26,57 +26,34 @@ import sys
 from torch.nn.functional import affine_grid
 from torch.nn.functional import grid_sample
 
-
 class MotionEstimation(nn.Module):
     def __init__(self):
         super().__init__()
     
-    def get_identity_grid(self, flow):
-        B, C, H, W = flow.shape
-        grid_w, grid_h = torch.meshgrid([torch.linspace(-1, 1, H), torch.linspace(-1, 1, W)])  # (h, w)
-        grid_h = grid_h.cuda().float()
+    def generate_grid(self, x, offset):
+        # x only provides shape parameters to the model
+        x_shape = x.size()
+        grid_w, grid_h = torch.meshgrid([torch.linspace(-1, 1, x_shape[2]), torch.linspace(-1, 1, x_shape[3])])  # (h, w)
         grid_w = grid_w.cuda().float()
+        grid_h = grid_h.cuda().float()
 
         grid_w = nn.Parameter(grid_w, requires_grad=False)
         grid_h = nn.Parameter(grid_h, requires_grad=False)
 
-        grid = torch.stack([grid_h, grid_w], dim=-1)[None].repeat(B, 1, 1, 1)
-        return grid
-    
-    def generate_grid(self, flow):
-        
-        grid = self.get_identity_grid(flow)
-        #matplotlib.use('QtAgg')
-        #fig, ax = plt.subplots(1, 2)
-        #ax[0].imshow(grid_h.cpu())
-        #ax[1].imshow(grid_w.cpu())
-        #plt.show()
+        offset_h, offset_w = torch.split(offset, 1, 1)
+        offset_w = offset_w.contiguous().view(-1, int(x_shape[2]), int(x_shape[3]))  # (b*c, h, w)
+        offset_h = offset_h.contiguous().view(-1, int(x_shape[2]), int(x_shape[3]))  # (b*c, h, w)
 
-        flow = flow.permute(0, 2, 3, 1).contiguous()
+        offset_w = grid_w + offset_w
+        offset_h = grid_h + offset_h
 
-        #offset_h, offset_w = torch.split(flow, 1, 1)
-        #offset_h = offset_h.contiguous().view(int(flow_shape[0]), int(flow_shape[2]), int(flow_shape[3]))  # (b, h, w)
-        #offset_w = offset_w.contiguous().view(int(flow_shape[0]), int(flow_shape[2]), int(flow_shape[3]))  # (b, h, w)
-#
-        #offset_h = grid_h + offset_h
-        #offset_w = grid_w + offset_w
-#
-        #offsets = torch.stack((offset_h, offset_w), 3)
-        #return offsets
-        return grid + flow
-    
-    def get_delta(self, flow):
-        B, C, H, W = flow.shape
-        grid = self.generate_grid(flow=flow)
-        identity_grid = self.get_identity_grid(flow=flow)
-        grid = ((grid + 1) / 2) * H
-        identity_grid = ((identity_grid + 1) / 2) * H
-        delta = (grid - identity_grid).permute(0, 3, 1, 2).contiguous()
-        return delta
+        offsets = torch.stack((offset_h, offset_w), 3) # 1 x img_size x img_size x2
+        # print(offsets.shape) 
+        return offsets
 
     def forward(self, flow, original, mode='bilinear'):
-        grid = self.generate_grid(flow=flow)
-        return grid_sample(original, grid, mode=mode, align_corners=True)
+        grid = self.generate_grid(original, flow)
+        return grid_sample(original, grid, mode=mode)
 
 
 def _get_activation_fn(activation):
@@ -912,9 +889,9 @@ class ConvBlocksLegacy(nn.Module):
 #            x = block(x)
 #        return x
 
-class ResnetBlock2D(nn.Module):
+class ResnetBlock2DGroup(nn.Module):
     def __init__(self, in_dim, out_dim, kernel_size=3):
-        super(ResnetBlock2D, self).__init__()
+        super(ResnetBlock2DGroup, self).__init__()
         self.conv1 = nn.Conv2d(in_channels=in_dim, out_channels=out_dim, kernel_size=kernel_size, padding='same')
         self.norm1 = nn.GroupNorm(8, out_dim)
         self.conv2 = nn.Conv2d(in_channels=out_dim, out_channels=out_dim, kernel_size=kernel_size, padding='same')
@@ -937,17 +914,404 @@ class ResnetBlock2D(nn.Module):
         x = self.gelu(x)
 
         return x
+
+
+class ResnetBlock3DGroup(nn.Module):
+    def __init__(self, in_dim, out_dim, kernel_size=3):
+        super(ResnetBlock3DGroup, self).__init__()
+        self.conv1 = nn.Conv3d(in_channels=in_dim, out_channels=out_dim, kernel_size=kernel_size, padding='same')
+        self.norm1 = nn.GroupNorm(8, out_dim)
+        self.conv2 = nn.Conv3d(in_channels=out_dim, out_channels=out_dim, kernel_size=kernel_size, padding='same')
+        self.norm2 = nn.GroupNorm(8, out_dim)
+        
+        self.res_conv = nn.Conv3d(in_dim, out_dim, 1) if in_dim != out_dim else nn.Identity()
+        self.gelu = nn.GELU()
+    
+    def forward(self, x):
+        """"dist_emb: T-1, B, C"""
+        identity = x
+        B, C, T, H, W = x.shape
+        
+        x = self.conv1(x)
+        x = self.norm1(x)
+        x = self.gelu(x)
+
+        x = self.conv2(x)
+        x = self.norm2(x)
+
+        x = x + self.res_conv(identity)
+        x = self.gelu(x)
+
+        return x
+
+
+
+class ResnetBlock3DEmbedding(nn.Module):
+    def __init__(self, in_dim, out_dim, d_model, kernel_size=3):
+        super(ResnetBlock3DEmbedding, self).__init__()
+        self.conv1 = nn.Conv3d(in_channels=in_dim, out_channels=out_dim, kernel_size=kernel_size, padding='same')
+        self.norm1 = nn.GroupNorm(8, out_dim)
+        self.conv2 = nn.Conv3d(in_channels=out_dim, out_channels=out_dim, kernel_size=kernel_size, padding='same')
+        self.norm2 = nn.GroupNorm(8, out_dim)
+        
+        self.res_conv = nn.Conv3d(in_dim, out_dim, 1) if in_dim != out_dim else nn.Identity()
+        self.gelu = nn.GELU()
+
+        self.modulate = nn.Linear(d_model, out_dim)
+    
+    def forward(self, x, dist_emb):
+        """"dist_emb: T, B, C"""
+        identity = x
+        B, C, T, H, W = x.shape
+        
+        x = self.conv1(x)
+        x = self.norm1(x)
+        x = self.gelu(x)
+
+        dist_emb = self.modulate(dist_emb)
+        dist_emb = dist_emb.permute(1, 2, 0).contiguous() # B, C, T
+        dist_emb = dist_emb[:, :, :, None, None].repeat(1, 1, 1, H, W)
+        x = x + dist_emb
+
+        x = self.conv2(x)
+        x = self.norm2(x)
+
+        x = x + self.res_conv(identity)
+        x = self.gelu(x)
+
+        return x
+
+
+
+class ResnetBlock2DEmbedding(nn.Module):
+    def __init__(self, in_dim, out_dim, d_model=None, kernel_size=3):
+        super(ResnetBlock2DEmbedding, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels=in_dim, out_channels=out_dim, kernel_size=kernel_size, padding='same')
+        self.norm1 = nn.GroupNorm(8, out_dim)
+        self.conv2 = nn.Conv2d(in_channels=out_dim, out_channels=out_dim, kernel_size=kernel_size, padding='same')
+        self.norm2 = nn.GroupNorm(8, out_dim)
+        
+        self.res_conv = nn.Conv2d(in_dim, out_dim, 1) if in_dim != out_dim else nn.Identity()
+        self.gelu = nn.GELU()
+        self.embedding = False
+
+        if d_model is not None:
+            self.embedding = True
+            self.modulate = nn.Linear(d_model, out_dim)
+    
+    def forward(self, x, dist_emb):
+        """"dist_emb: B, C"""
+        identity = x
+        B, C, H, W = x.shape
+        
+        x = self.conv1(x)
+        x = self.norm1(x)
+        x = self.gelu(x)
+
+        if self.embedding:
+            dist_emb = self.modulate(dist_emb)
+            dist_emb = dist_emb[:, :, None, None].repeat(1, 1, H, W)
+            x = x + dist_emb
+
+        x = self.conv2(x)
+        x = self.norm2(x)
+
+        x = x + self.res_conv(identity)
+        x = self.gelu(x)
+
+        return x
     
 
-class ConvBlocks2D(nn.Module):
+class ResnetBlock2DBatch(nn.Module):
+    def __init__(self, in_dim, out_dim, kernel_size=3):
+        super(ResnetBlock2DBatch, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels=in_dim, out_channels=out_dim, kernel_size=kernel_size, padding='same')
+        self.norm1 = nn.BatchNorm2d(out_dim)
+        self.conv2 = nn.Conv2d(in_channels=out_dim, out_channels=out_dim, kernel_size=kernel_size, padding='same')
+        self.norm2 = nn.BatchNorm2d(out_dim)
+        
+        self.res_conv = nn.Conv2d(in_dim, out_dim, 1) if in_dim != out_dim else nn.Identity()
+        self.gelu = nn.GELU()
+    
+    def forward(self, x):
+        identity = x
+        
+        x = self.conv1(x)
+        x = self.norm1(x)
+        x = self.gelu(x)
+
+        x = self.conv2(x)
+        x = self.norm2(x)
+
+        x = x + self.res_conv(identity)
+        x = self.gelu(x)
+
+        return x
+    
+
+class ConvBlocks2DGroup(nn.Module):
     def __init__(self, in_dim, out_dim, nb_blocks, kernel_size=3):
-        super(ConvBlocks2D, self).__init__()
+        super(ConvBlocks2DGroup, self).__init__()
+        dims = torch.linspace(in_dim, out_dim, nb_blocks+1).int()
+        dims[1:] = (torch.round(dims[1:] / 8) * 8).int()
+
+        self.blocks = nn.ModuleList()
+
+        for i in range(nb_blocks):
+            block = ResnetBlock2DGroup(in_dim=dims[i], out_dim=dims[i+1], kernel_size=kernel_size)
+            self.blocks.append(block)
+    
+    def forward(self, x):
+        for block in self.blocks:
+            x = block(x)
+        return x
+
+
+
+class DoubleConv(nn.Module):
+    def __init__(self, in_dim, out_dim, d_model=None, kernel_size=3):
+        super(DoubleConv, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels=in_dim, out_channels=out_dim, kernel_size=kernel_size, padding='same')
+        self.norm1 = nn.GroupNorm(8, out_dim)
+        self.conv2 = nn.Conv2d(in_channels=out_dim, out_channels=out_dim, kernel_size=kernel_size, padding='same')
+        self.norm2 = nn.GroupNorm(8, out_dim)
+        self.gelu = nn.GELU()
+        self.embedding = False
+
+        if d_model is not None:
+            self.embedding = True
+            self.modulate = nn.Linear(d_model, out_dim)
+    
+    def forward(self, x, dist_emb=None):
+        """"dist_emb: B, C"""
+        identity = x
+        B, C, H, W = x.shape
+        
+        x = self.conv1(x)
+        x = self.norm1(x)
+        x = self.gelu(x)
+
+        if self.embedding:
+            dist_emb = self.modulate(dist_emb)
+            dist_emb = dist_emb[:, :, None, None].repeat(1, 1, H, W)
+            x = x + dist_emb
+
+        x = self.conv2(x)
+        x = self.norm2(x)
+        x = self.gelu(x)
+
+        return x
+    
+
+
+class SingleConv(nn.Module):
+    def __init__(self, in_dim, out_dim, d_model=None, kernel_size=3):
+        super(SingleConv, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels=in_dim, out_channels=out_dim, kernel_size=kernel_size, padding='same')
+        self.norm1 = nn.GroupNorm(8, out_dim)
+        self.gelu = nn.GELU()
+        self.embedding = False
+
+        if d_model is not None:
+            self.embedding = True
+            self.modulate = nn.Linear(d_model, out_dim)
+    
+    def forward(self, x, dist_emb=None):
+        """"dist_emb: B, C"""
+        identity = x
+        B, C, H, W = x.shape
+        
+        x = self.conv1(x)
+        x = self.norm1(x)
+        x = self.gelu(x)
+
+        return x
+    
+
+class OneConv3D(nn.Module):
+    def __init__(self, in_dim, out_dim, kernel_size, dilation):
+        super(OneConv3D, self).__init__()
+        self.conv1 = nn.Conv3d(in_channels=in_dim, out_channels=out_dim, kernel_size=kernel_size, dilation=dilation, padding='same')
+        self.norm1 = nn.GroupNorm(8, out_dim)
+        self.gelu = nn.GELU()
+    
+    def forward(self, x):
+        """"dist_emb: B, C"""
+        B, C, T, H, W = x.shape
+        
+        x = self.conv1(x)
+        x = self.norm1(x)
+        x = self.gelu(x)
+
+        return x
+
+
+class Pooling3D(nn.Module):
+    def __init__(self, in_dim, out_dim):
+        super(Pooling3D, self).__init__()
+        self.pooling = nn.AdaptiveAvgPool3d(1)
+        self.conv1 = nn.Conv3d(in_channels=in_dim, out_channels=out_dim, kernel_size=1, dilation=1, padding='same')
+        self.norm1 = nn.GroupNorm(8, out_dim)
+        self.gelu = nn.GELU()
+    
+    def forward(self, x):
+        """"dist_emb: B, C"""
+        B, C, T, H, W = x.shape
+
+        size = x.shape[-3:]
+        
+        x = self.pooling(x)
+        x = self.conv1(x)
+        x = self.norm1(x)
+        x = self.gelu(x)
+
+        return nn.functional.interpolate(x, size=size, mode='trilinear', align_corners=False)
+
+    
+
+
+class DoubleConv3D(nn.Module):
+    def __init__(self, in_dim, out_dim, kernel_size):
+        super(DoubleConv3D, self).__init__()
+        self.conv1 = nn.Conv3d(in_channels=in_dim, out_channels=out_dim, kernel_size=kernel_size, padding='same')
+        self.norm1 = nn.GroupNorm(8, out_dim)
+        self.conv2 = nn.Conv3d(in_channels=out_dim, out_channels=out_dim, kernel_size=kernel_size, padding='same')
+        self.norm2 = nn.GroupNorm(8, out_dim)
+        self.gelu = nn.GELU()
+        self.embedding = False
+
+        #if d_model is not None:
+        #    self.embedding = True
+        #    self.modulate = nn.Linear(d_model, out_dim)
+    
+    def forward(self, x, dist_emb=None):
+        """"dist_emb: B, C"""
+        identity = x
+        B, C, T, H, W = x.shape
+        
+        x = self.conv1(x)
+        x = self.norm1(x)
+        x = self.gelu(x)
+
+        #if self.embedding:
+        #    dist_emb = self.modulate(dist_emb)
+        #    dist_emb = dist_emb[:, :, None, None].repeat(1, 1, H, W)
+        #    x = x + dist_emb
+
+        x = self.conv2(x)
+        x = self.norm2(x)
+        x = self.gelu(x)
+
+        return x
+    
+
+
+class ConvBlocks2DGroupLegacy(nn.Module):
+    def __init__(self, in_dim, out_dim, nb_blocks, kernel_size=3, d_model=None, nb_conv=2):
+        super(ConvBlocks2DGroupLegacy, self).__init__()
+        dims = torch.linspace(in_dim, out_dim, nb_blocks+1).int()
+        dims[1:] = (torch.round(dims[1:] / 8) * 8).int()
+
+        self.blocks = nn.ModuleList()
+
+        if nb_conv == 2:
+            blockfunction = DoubleConv
+        elif nb_conv == 1:
+            blockfunction = SingleConv
+
+        for i in range(nb_blocks):
+            block = blockfunction(in_dim=dims[i], out_dim=dims[i+1], d_model=d_model)
+            self.blocks.append(block)
+    
+    def forward(self, x, dist_emb=None):
+        for block in self.blocks:
+            x = block(x, dist_emb)
+        return x
+    
+
+
+
+class ConvBlocks3DGroupLegacy(nn.Module):
+    def __init__(self, in_dim, out_dim, nb_blocks, kernel_size):
+        super(ConvBlocks3DGroupLegacy, self).__init__()
+        dims = torch.linspace(in_dim, out_dim, nb_blocks+1).int()
+        dims[1:] = (torch.round(dims[1:] / 8) * 8).int()
+
+        self.blocks = nn.ModuleList()
+
+        for i in range(nb_blocks):
+            block = DoubleConv3D(in_dim=dims[i], out_dim=dims[i+1], kernel_size=kernel_size)
+            self.blocks.append(block)
+    
+    def forward(self, x, dist_emb=None):
+        for block in self.blocks:
+            x = block(x, dist_emb)
+        return x
+
+
+
+class ConvBlocks2DEmbedding(nn.Module):
+    def __init__(self, in_dim, out_dim, nb_blocks, kernel_size=3, d_model=None):
+        super(ConvBlocks2DEmbedding, self).__init__()
+        dims = torch.linspace(in_dim, out_dim, nb_blocks+1).int()
+        dims[1:] = (torch.round(dims[1:] / 8) * 8).int()
+
+        self.blocks = nn.ModuleList()
+
+        for i in range(nb_blocks):
+            block = ResnetBlock2DEmbedding(in_dim=dims[i], out_dim=dims[i+1], d_model=d_model, kernel_size=kernel_size)
+            self.blocks.append(block)
+    
+    def forward(self, x, dist_emb=None):
+        for block in self.blocks:
+            x = block(x, dist_emb)
+        return x
+
+
+class ConvBlocks3DEmbedding(nn.Module):
+    def __init__(self, in_dim, out_dim, nb_blocks, d_model, kernel_size=3):
+        super(ConvBlocks3DEmbedding, self).__init__()
         dims = torch.linspace(in_dim, out_dim, nb_blocks+1).int()
 
         self.blocks = nn.ModuleList()
 
         for i in range(nb_blocks):
-            block = ResnetBlock2D(in_dim=dims[i], out_dim=dims[i+1], kernel_size=kernel_size)
+            block = ResnetBlock3DEmbedding(in_dim=dims[i], out_dim=dims[i+1], d_model=d_model, kernel_size=kernel_size)
+            self.blocks.append(block)
+    
+    def forward(self, x, dist_emb):
+        for block in self.blocks:
+            x = block(x, dist_emb)
+        return x
+
+
+class ConvBlocks3DGroup(nn.Module):
+    def __init__(self, in_dim, out_dim, nb_blocks, kernel_size=3):
+        super(ConvBlocks3DGroup, self).__init__()
+        dims = torch.linspace(in_dim, out_dim, nb_blocks+1).int()
+
+        self.blocks = nn.ModuleList()
+
+        for i in range(nb_blocks):
+            block = ResnetBlock3DGroup(in_dim=dims[i], out_dim=dims[i+1], kernel_size=kernel_size)
+            self.blocks.append(block)
+    
+    def forward(self, x):
+        for block in self.blocks:
+            x = block(x)
+        return x
+
+
+
+class ConvBlocks2DBatch(nn.Module):
+    def __init__(self, in_dim, out_dim, nb_blocks, kernel_size=3):
+        super(ConvBlocks2DBatch, self).__init__()
+        dims = torch.linspace(in_dim, out_dim, nb_blocks+1).int()
+
+        self.blocks = nn.ModuleList()
+
+        for i in range(nb_blocks):
+            block = ResnetBlock2DBatch(in_dim=dims[i], out_dim=dims[i+1], kernel_size=kernel_size)
             self.blocks.append(block)
     
     def forward(self, x):
@@ -1472,10 +1836,25 @@ class PatchExpandLegacy(nn.Module):
             abs_pos = self.pos_object(shape_util=(x.shape[0], H * 2, W * 2), device=x.device)
             x = x + abs_pos
         return x
+
+
+
+class PatchExpand2DBatch(nn.Module):
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        self.out_dim = out_dim
+        self.up = nn.Sequential(
+            nn.ConvTranspose2d(in_dim, out_dim, 2, 2),
+            nn.BatchNorm2d(out_dim),
+            nn.GELU())
+
+    def forward(self, x):
+        x = self.up(x)
+        return x
     
 
 
-class PatchExpand2D(nn.Module):
+class PatchExpand2DGroup(nn.Module):
     def __init__(self, in_dim, out_dim):
         super().__init__()
         self.out_dim = out_dim
@@ -1490,12 +1869,12 @@ class PatchExpand2D(nn.Module):
 
 
 
-class PatchExpand3D(nn.Module):
-    def __init__(self, in_dim, out_dim, kernel_size, stride):
+class PatchExpand3DGroup(nn.Module):
+    def __init__(self, in_dim, out_dim):
         super().__init__()
         self.out_dim = out_dim
         self.up = nn.Sequential(
-            nn.ConvTranspose3d(in_dim, out_dim, kernel_size=kernel_size, stride=stride),
+            nn.ConvTranspose3d(in_dim, out_dim, (1, 2, 2), (1, 2, 2)),
             nn.GroupNorm(8, out_dim),
             nn.GELU())
 
@@ -1703,7 +2082,7 @@ class PatchMergingLegacy(nn.Module):
         return x
 
 
-class PatchMerging2D(nn.Module):
+class PatchMerging2DGroup(nn.Module):
     """ Patch Merging Layer
     Args:
         dim (int): Number of input channels.
@@ -1717,6 +2096,49 @@ class PatchMerging2D(nn.Module):
         self.reduction = nn.Sequential(
             nn.Conv2d(in_dim, out_dim, kernel_size=3, stride=2, padding=1),
             nn.GroupNorm(8, out_dim),
+            nn.GELU())
+
+    def forward(self, x):
+        x = self.reduction(x)
+        return x
+    
+
+
+class PatchMerging3DGroup(nn.Module):
+    """ Patch Merging Layer
+    Args:
+        dim (int): Number of input channels.
+        norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
+    """
+
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.reduction = nn.Sequential(
+            nn.Conv3d(in_dim, out_dim, kernel_size=(1, 3, 3), stride=(1, 2, 2), padding=(0, 1, 1)),
+            nn.GroupNorm(8, out_dim),
+            nn.GELU())
+
+    def forward(self, x):
+        x = self.reduction(x)
+        return x
+
+
+class PatchMerging2DBatch(nn.Module):
+    """ Patch Merging Layer
+    Args:
+        dim (int): Number of input channels.
+        norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
+    """
+
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.reduction = nn.Sequential(
+            nn.Conv2d(in_dim, out_dim, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(out_dim),
             nn.GELU())
 
     def forward(self, x):

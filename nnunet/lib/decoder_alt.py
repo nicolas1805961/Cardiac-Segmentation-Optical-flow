@@ -7,7 +7,7 @@ import os
 from timm.models.layers import trunc_normal_
 from . import swin_transformer_3d
 from .vit_transformer import SlotAttention, SpatioTemporalTransformer, TransformerEncoderLayer
-from .utils import TransformerDecoderBlock, ConvBlocks3DPos, ConvBlocks2D, PatchExpand2D, ConvBlocks3D, ConvBlocksLegacy, PatchExpand3D, ConvDecoderDeformableAttentionIdentity, DeformableAttention, SkipCoDeformableAttention, SpatialTransformerNetwork, CCA, ReplicateChannels, ConvBlock, GetCrossSimilarityMatrix, SelFuseFeature, From_image, To_image, DeepSupervision, PatchExpandLegacy, concat_merge_linear_rescale, concat_merge_conv_rescale, concat_merge_linear
+from .utils import ConvBlocks3DGroup, ConvBlocks3DGroupLegacy, ConvBlocks2DGroupLegacy, ConvBlocks2DEmbedding, ConvBlocks3DEmbedding, TransformerDecoderBlock, ConvBlocks3DPos, ConvBlocks2DBatch, ConvBlocks2DGroup, PatchExpand2DBatch, PatchExpand2DGroup, ConvBlocks3D, ConvBlocksLegacy, PatchExpand3DGroup, ConvDecoderDeformableAttentionIdentity, DeformableAttention, SkipCoDeformableAttention, SpatialTransformerNetwork, CCA, ReplicateChannels, ConvBlock, GetCrossSimilarityMatrix, SelFuseFeature, From_image, To_image, DeepSupervision, PatchExpandLegacy, concat_merge_linear_rescale, concat_merge_conv_rescale, concat_merge_linear
 from . import swin_transformer_2
 from . import swin_cross_attention
 import matplotlib.pyplot as plt
@@ -18,6 +18,8 @@ from torch.nn.functional import grid_sample
 from torchvision.transforms.functional import gaussian_blur
 from torch.nn.functional import interpolate
 import matplotlib
+from torch.distributions.normal import Normal
+from nnunet.lib.convlstm import ConvLSTM
 
 def show_attention_weights(attention_weights, res):
     print(attention_weights.std())
@@ -806,6 +808,9 @@ class Decoder2D(nn.Module):
                 img_size,
                 deep_supervision,
                 dot_multiplier,
+                nb_conv,
+                legacy,
+                norm,
                 skip_co=True,
                 last_activation='identity',
                 **kwargs):
@@ -827,36 +832,53 @@ class Decoder2D(nn.Module):
         for i_layer in range(self.num_stages):
             in_dim = out_encoder_dims[i_layer] * 2 if i_layer == 0 else in_encoder_dims[i_layer - 1]
 
-            upsample_layer = PatchExpand2D(in_dim=in_dim, out_dim=out_encoder_dims[i_layer])
-
             deep_supervision_layer = nn.Identity()
             if deep_supervision and i_layer < self.num_stages - 1:
                 deep_supervision_layer = nn.ConvTranspose2d(in_channels=in_encoder_dims[i_layer],
                                                             out_channels=self.num_classes,
                                                             stride=2**(self.num_stages - (i_layer + 1)),
                                                             kernel_size=2**(self.num_stages - (i_layer + 1)))
-            
 
-            #out_dim = out_encoder_dims[i_layer] * self.dot_multiplier if i_layer == self.num_stages - 1 else in_encoder_dims[i_layer]
-            out_dim = out_encoder_dims[i_layer]
-            in_dim = out_encoder_dims[i_layer] * self.dot_multiplier if skip_co else out_encoder_dims[i_layer]
-            layer_up = ConvBlocks2D(in_dim=in_dim, 
-                            out_dim=out_dim,
-                            nb_blocks=conv_depth[i_layer], 
-                            kernel_size=3)
+            if norm == 'batch':
+                upsample_layer = PatchExpand2DBatch(in_dim=in_dim, out_dim=out_encoder_dims[i_layer])
+
+                #out_dim = out_encoder_dims[i_layer] * self.dot_multiplier if i_layer == self.num_stages - 1 else in_encoder_dims[i_layer]
+                out_dim = out_encoder_dims[i_layer]
+                in_dim = out_encoder_dims[i_layer] * self.dot_multiplier if skip_co else out_encoder_dims[i_layer]
+                layer_up = ConvBlocks2DBatch(in_dim=in_dim, 
+                                out_dim=out_dim,
+                                nb_blocks=conv_depth[i_layer], 
+                                kernel_size=3)
+            elif norm == 'group':
+                upsample_layer = PatchExpand2DGroup(in_dim=in_dim, out_dim=out_encoder_dims[i_layer])
+
+                #out_dim = out_encoder_dims[i_layer] * self.dot_multiplier if i_layer == self.num_stages - 1 else in_encoder_dims[i_layer]
+                out_dim = out_encoder_dims[i_layer]
+                in_dim = out_encoder_dims[i_layer] * self.dot_multiplier if skip_co else out_encoder_dims[i_layer]
+                if legacy:
+                    layer_up = ConvBlocks2DGroupLegacy(in_dim=in_dim, 
+                                out_dim=out_dim,
+                                nb_blocks=conv_depth[i_layer],
+                                kernel_size=3,
+                                nb_conv=nb_conv)
+                else: 
+                    layer_up = ConvBlocks2DGroup(in_dim=in_dim, 
+                                    out_dim=out_dim,
+                                    nb_blocks=conv_depth[i_layer], 
+                                    kernel_size=3)
             self.layers.append(layer_up)
             self.upsample_layers.append(upsample_layer)
             self.deep_supervision_layers.append(deep_supervision_layer)
 
-        self.final_conv = nn.Conv2d(out_encoder_dims[i_layer], num_classes, kernel_size=1)
+        self.final_conv = nn.Conv2d(out_encoder_dims[i_layer], num_classes, kernel_size=3, padding=1)
+        self.final_conv.weight = nn.Parameter(Normal(0, 1e-5).sample(self.final_conv.weight.shape))
+        self.final_conv.bias = nn.Parameter(torch.zeros(self.final_conv.bias.shape))
 
-        if last_activation == 'tanh':
-            self.last_activation = torch.nn.Tanh()
-        else:
-            self.last_activation = nn.Identity()
+
+        self.last_activation = nn.Identity()
     
 
-    def forward(self, x, encoder_skip_connections):
+    def forward(self, x, encoder_skip_connections, dist_emb=None):
         out = []
 
         for i, (layer_up,
@@ -874,7 +896,6 @@ class Decoder2D(nn.Module):
                 x = torch.cat((encoder_skip_connection, x), dim=1)
             x = layer_up(x)
             if i < self.num_stages - 1:
-                x = self.last_activation(x)
                 out.append(deep_supervision_layer(x))
         
         x = self.final_conv(x)
@@ -885,6 +906,928 @@ class Decoder2D(nn.Module):
         #if not self.deep_supervision:
         #    out = out[0]
         return out
+    
+
+
+
+
+class Decoder3D(nn.Module):
+    r""" Swin Transformer
+        A PyTorch impl of : `Swin Transformer: Hierarchical Vision Transformer using Shifted Windows`  -
+          https://arxiv.org/pdf/2103.14030
+
+    Args:
+        img_size (int | tuple(int)): Input image size. Default 224
+        patch_size (int | tuple(int)): Patch size. Default: 4
+        in_chans (int): Number of input image channels. Default: 3
+        num_classes (int): Number of classes for classification head. Default: 1000
+        embed_dim (int): Patch embedding dimension. Default: 96
+        depths (tuple(int)): Depth of each Swin Transformer layer.
+        num_heads (tuple(int)): Number of attention heads in different layers.
+        window_size (int): Window size. Default: 7
+        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim. Default: 4
+        qkv_bias (bool): If True, add a learnable bias to query, key, value. Default: True
+        qk_scale (float): Override default qk scale of head_dim ** -0.5 if set. Default: None
+        drop_rate (float): Dropout rate. Default: 0
+        attn_drop_rate (float): Attention dropout rate. Default: 0
+        drop_path_rate (float): Stochastic depth rate. Default: 0.1
+        norm_layer (nn.Module): Normalization layer. Default: nn.LayerNorm.
+        ape (bool): If True, add absolute position embedding to the patch embedding. Default: False
+        patch_norm (bool): If True, add normalization after patch embedding. Default: True
+        use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False
+    """
+
+    def __init__(self,
+                conv_depth,
+                in_encoder_dims, 
+                out_encoder_dims,
+                num_classes,
+                img_size,
+                deep_supervision,
+                dot_multiplier,
+                kernel_size,
+                skip_co=True,
+                last_activation='identity',
+                **kwargs):
+        super().__init__()
+
+        self.num_stages = len(conv_depth)
+        self.img_size = img_size
+        self.num_classes = num_classes
+        self.deep_supervision = deep_supervision
+        self.skip_co = skip_co
+        self.dot_multiplier = dot_multiplier
+        self.deep_supervision = deep_supervision
+        
+        # build decoder layers
+        self.layers = nn.ModuleList()
+        self.upsample_layers = nn.ModuleList()
+        self.deep_supervision_layers = nn.ModuleList()
+
+        for i_layer in range(self.num_stages):
+            in_dim = out_encoder_dims[i_layer] * 2 if i_layer == 0 else in_encoder_dims[i_layer - 1]
+
+            deep_supervision_layer = nn.Identity()
+            if deep_supervision and i_layer < self.num_stages - 1:
+                deep_supervision_layer = nn.ConvTranspose3d(in_channels=in_encoder_dims[i_layer],
+                                                            out_channels=self.num_classes,
+                                                            stride=2**(self.num_stages - (i_layer + 1)),
+                                                            kernel_size=2**(self.num_stages - (i_layer + 1)))
+
+            upsample_layer = PatchExpand3DGroup(in_dim=in_dim, out_dim=out_encoder_dims[i_layer])
+
+            #out_dim = out_encoder_dims[i_layer] * self.dot_multiplier if i_layer == self.num_stages - 1 else in_encoder_dims[i_layer]
+            out_dim = out_encoder_dims[i_layer]
+            in_dim = out_encoder_dims[i_layer] * self.dot_multiplier if skip_co else out_encoder_dims[i_layer]
+            layer_up = ConvBlocks3DGroupLegacy(in_dim=in_dim, 
+                        out_dim=out_dim,
+                        nb_blocks=conv_depth[i_layer],
+                        kernel_size=kernel_size)
+            self.layers.append(layer_up)
+            self.upsample_layers.append(upsample_layer)
+            self.deep_supervision_layers.append(deep_supervision_layer)
+
+        self.final_conv = nn.Conv3d(out_encoder_dims[i_layer], num_classes, kernel_size=3, padding=1)
+        self.final_conv.weight = nn.Parameter(Normal(0, 1e-5).sample(self.final_conv.weight.shape))
+        self.final_conv.bias = nn.Parameter(torch.zeros(self.final_conv.bias.shape))
+
+
+        self.last_activation = nn.Identity()
+    
+
+    def forward(self, x, encoder_skip_connections, dist_emb=None):
+        out = []
+
+        for i, (layer_up,
+                upsample_layer,
+                encoder_skip_connection,
+                deep_supervision_layer,
+                ) in enumerate(zip(
+                    self.layers,
+                    self.upsample_layers,
+                    reversed(encoder_skip_connections),
+                    self.deep_supervision_layers
+                    )):
+            x = upsample_layer(x)
+            if self.skip_co:
+                x = torch.cat((encoder_skip_connection, x), dim=1)
+            x = layer_up(x)
+            if i < self.num_stages - 1:
+                out.append(deep_supervision_layer(x))
+        
+        x = self.final_conv(x)
+        x = self.last_activation(x)
+        out.append(deep_supervision_layer(x))
+
+        out = out[::-1]
+        #if not self.deep_supervision:
+        #    out = out[0]
+        return out
+    
+
+
+
+
+class Decoder2DDistEmb(nn.Module):
+    r""" Swin Transformer
+        A PyTorch impl of : `Swin Transformer: Hierarchical Vision Transformer using Shifted Windows`  -
+          https://arxiv.org/pdf/2103.14030
+
+    Args:
+        img_size (int | tuple(int)): Input image size. Default 224
+        patch_size (int | tuple(int)): Patch size. Default: 4
+        in_chans (int): Number of input image channels. Default: 3
+        num_classes (int): Number of classes for classification head. Default: 1000
+        embed_dim (int): Patch embedding dimension. Default: 96
+        depths (tuple(int)): Depth of each Swin Transformer layer.
+        num_heads (tuple(int)): Number of attention heads in different layers.
+        window_size (int): Window size. Default: 7
+        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim. Default: 4
+        qkv_bias (bool): If True, add a learnable bias to query, key, value. Default: True
+        qk_scale (float): Override default qk scale of head_dim ** -0.5 if set. Default: None
+        drop_rate (float): Dropout rate. Default: 0
+        attn_drop_rate (float): Attention dropout rate. Default: 0
+        drop_path_rate (float): Stochastic depth rate. Default: 0.1
+        norm_layer (nn.Module): Normalization layer. Default: nn.LayerNorm.
+        ape (bool): If True, add absolute position embedding to the patch embedding. Default: False
+        patch_norm (bool): If True, add normalization after patch embedding. Default: True
+        use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False
+    """
+
+    def __init__(self,
+                conv_depth,
+                in_encoder_dims, 
+                out_encoder_dims,
+                num_classes,
+                img_size,
+                deep_supervision,
+                dot_multiplier,
+                norm,
+                skip_co=True,
+                last_activation='identity',
+                **kwargs):
+        super().__init__()
+
+        self.num_stages = len(conv_depth)
+        self.img_size = img_size
+        self.num_classes = num_classes
+        self.deep_supervision = deep_supervision
+        self.skip_co = skip_co
+        self.dot_multiplier = dot_multiplier
+        self.deep_supervision = deep_supervision
+        
+        # build decoder layers
+        self.layers = nn.ModuleList()
+        self.upsample_layers = nn.ModuleList()
+        self.deep_supervision_layers = nn.ModuleList()
+
+        for i_layer in range(self.num_stages):
+            in_dim = out_encoder_dims[i_layer] * 2 if i_layer == 0 else in_encoder_dims[i_layer - 1]
+
+            deep_supervision_layer = nn.Identity()
+            if deep_supervision and i_layer < self.num_stages - 1:
+                deep_supervision_layer = nn.ConvTranspose2d(in_channels=in_encoder_dims[i_layer],
+                                                            out_channels=self.num_classes,
+                                                            stride=2**(self.num_stages - (i_layer + 1)),
+                                                            kernel_size=2**(self.num_stages - (i_layer + 1)))
+
+            upsample_layer = PatchExpand2DGroup(in_dim=in_dim, out_dim=out_encoder_dims[i_layer])
+
+            #out_dim = out_encoder_dims[i_layer] * self.dot_multiplier if i_layer == self.num_stages - 1 else in_encoder_dims[i_layer]
+            out_dim = out_encoder_dims[i_layer]
+            in_dim = out_encoder_dims[i_layer] * self.dot_multiplier if skip_co else out_encoder_dims[i_layer]
+            layer_up = ConvBlocks2DEmbedding(in_dim=in_dim, 
+                            out_dim=out_dim,
+                            nb_blocks=conv_depth[i_layer], 
+                            d_model=(out_encoder_dims[0] * 2) * 2,
+                            kernel_size=3)
+            self.layers.append(layer_up)
+            self.upsample_layers.append(upsample_layer)
+            self.deep_supervision_layers.append(deep_supervision_layer)
+
+        self.final_conv = nn.Conv2d(out_encoder_dims[i_layer], num_classes, kernel_size=3, padding=1)
+        self.final_conv.weight = nn.Parameter(Normal(0, 1e-5).sample(self.final_conv.weight.shape))
+        self.final_conv.bias = nn.Parameter(torch.zeros(self.final_conv.bias.shape))
+
+        if last_activation == 'tanh':
+            self.last_activation = torch.nn.Tanh()
+        else:
+            self.last_activation = nn.Identity()
+    
+
+    def forward(self, x, encoder_skip_connections, dist_emb):
+        ''''dist_emb: B, 2C'''
+        out = []
+
+        for i, (layer_up,
+                upsample_layer,
+                encoder_skip_connection,
+                deep_supervision_layer,
+                ) in enumerate(zip(
+                    self.layers,
+                    self.upsample_layers,
+                    reversed(encoder_skip_connections),
+                    self.deep_supervision_layers
+                    )):
+            x = upsample_layer(x)
+            if self.skip_co:
+                x = torch.cat((encoder_skip_connection, x), dim=1)
+            x = layer_up(x, dist_emb)
+            if i < self.num_stages - 1:
+                out.append(deep_supervision_layer(x))
+        
+        x = self.final_conv(x)
+        x = self.last_activation(x)
+        out.append(deep_supervision_layer(x))
+
+        out = out[::-1]
+        #if not self.deep_supervision:
+        #    out = out[0]
+        return out
+
+
+
+
+class Decoder2DIterative(nn.Module):
+    r""" Swin Transformer
+        A PyTorch impl of : `Swin Transformer: Hierarchical Vision Transformer using Shifted Windows`  -
+          https://arxiv.org/pdf/2103.14030
+
+    Args:
+        img_size (int | tuple(int)): Input image size. Default 224
+        patch_size (int | tuple(int)): Patch size. Default: 4
+        in_chans (int): Number of input image channels. Default: 3
+        num_classes (int): Number of classes for classification head. Default: 1000
+        embed_dim (int): Patch embedding dimension. Default: 96
+        depths (tuple(int)): Depth of each Swin Transformer layer.
+        num_heads (tuple(int)): Number of attention heads in different layers.
+        window_size (int): Window size. Default: 7
+        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim. Default: 4
+        qkv_bias (bool): If True, add a learnable bias to query, key, value. Default: True
+        qk_scale (float): Override default qk scale of head_dim ** -0.5 if set. Default: None
+        drop_rate (float): Dropout rate. Default: 0
+        attn_drop_rate (float): Attention dropout rate. Default: 0
+        drop_path_rate (float): Stochastic depth rate. Default: 0.1
+        norm_layer (nn.Module): Normalization layer. Default: nn.LayerNorm.
+        ape (bool): If True, add absolute position embedding to the patch embedding. Default: False
+        patch_norm (bool): If True, add normalization after patch embedding. Default: True
+        use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False
+    """
+
+    def __init__(self,
+                conv_depth,
+                in_encoder_dims, 
+                out_encoder_dims,
+                num_classes,
+                img_size,
+                deep_supervision,
+                dot_multiplier,
+                dist_emb,
+                norm,
+                skip_co=True,
+                last_activation='identity',
+                **kwargs):
+        super().__init__()
+
+        self.num_stages = len(conv_depth)
+        self.img_size = img_size
+        self.num_classes = num_classes
+        self.deep_supervision = deep_supervision
+        self.skip_co = skip_co
+        self.dot_multiplier = dot_multiplier
+        self.deep_supervision = deep_supervision
+        self.dist_emb = dist_emb
+        
+        # build decoder layers
+        self.layers = nn.ModuleList()
+        self.upsample_layers = nn.ModuleList()
+        self.deep_supervision_layers = nn.ModuleList()
+
+        for i_layer in range(self.num_stages):
+            in_dim = out_encoder_dims[i_layer] * 2 if i_layer == 0 else in_encoder_dims[i_layer - 1]
+
+            deep_supervision_layer = nn.Identity()
+            if deep_supervision and i_layer < self.num_stages - 1:
+                deep_supervision_layer = nn.ConvTranspose2d(in_channels=in_encoder_dims[i_layer],
+                                                            out_channels=self.num_classes,
+                                                            stride=2**(self.num_stages - (i_layer + 1)),
+                                                            kernel_size=2**(self.num_stages - (i_layer + 1)))
+
+            upsample_layer = PatchExpand2DGroup(in_dim=in_dim, out_dim=out_encoder_dims[i_layer])
+
+            #out_dim = out_encoder_dims[i_layer] * self.dot_multiplier if i_layer == self.num_stages - 1 else in_encoder_dims[i_layer]
+            out_dim = out_encoder_dims[i_layer]
+            if self.dist_emb:
+                conv3 = ConvBlocks2DEmbedding(in_dim=out_encoder_dims[i_layer] * 2, 
+                                out_dim=out_dim,
+                                nb_blocks=1,
+                                d_model=out_encoder_dims[0] * 2,
+                                kernel_size=3)
+                conv4 = ConvBlocks2DEmbedding(in_dim=out_encoder_dims[i_layer] * 2, 
+                                out_dim=out_dim,
+                                nb_blocks=1,
+                                d_model=(out_encoder_dims[0] * 2) * 2,
+                                kernel_size=3)
+            else:
+                conv3 = ConvBlocks2DGroup(in_dim=out_encoder_dims[i_layer] * 2, 
+                                out_dim=out_dim,
+                                nb_blocks=1,
+                                kernel_size=3)
+                conv4 = ConvBlocks2DGroup(in_dim=out_encoder_dims[i_layer] * 2, 
+                                out_dim=out_dim,
+                                nb_blocks=1,
+                                kernel_size=3)
+            conv_list = nn.ModuleList([conv3, conv4])
+            self.layers.append(conv_list)
+            self.upsample_layers.append(upsample_layer)
+            self.deep_supervision_layers.append(deep_supervision_layer)
+
+        self.final_conv = nn.Conv3d(out_encoder_dims[i_layer], num_classes, kernel_size=3, padding=1)
+        self.final_conv.weight = nn.Parameter(Normal(0, 1e-5).sample(self.final_conv.weight.shape))
+        self.final_conv.bias = nn.Parameter(torch.zeros(self.final_conv.bias.shape))
+    
+
+    def forward(self, x, skip_connections, dist_emb=None):
+        if self.dist_emb:
+            return self.forward_emb(x, skip_connections, dist_emb)
+        else:
+            return self.forward_no_emb(x, skip_connections)
+    
+
+    def forward_emb(self, x, skip_connections, dist_emb):
+        """x: T, B, C, H, W
+        skip_connections: [T, B, C, H, W]
+        dist_emb: T, B, C"""
+
+        skip_connections = skip_connections[::-1]
+        assert len(x) == len(dist_emb)
+
+        for s in range(self.num_stages):
+
+            #upsampled_list = []
+            #for t in range(len(x)):
+            #    upsampled = self.upsample_layers[s](x[t])
+            #    upsampled_list.append(upsampled)
+            #x = torch.stack(upsampled_list, dim=0)
+            #print(x.shape)
+
+            current_list = []
+            for t in range(len(x)):
+                upsampled = self.upsample_layers[s](x[t])
+                concatenated = torch.cat([skip_connections[s][t], upsampled], dim=1)
+                concatenated = self.layers[s][0](concatenated, dist_emb[t])
+                current_list.append(concatenated)
+            reduced = torch.stack(current_list, dim=0)
+
+            cumulated = reduced[0]
+            current_list = [cumulated]
+            for t in range(1, len(x)):
+                cumulated = torch.cat([cumulated, reduced[t]], dim=1)
+                current_dist_emb = torch.cat([dist_emb[t - 1], dist_emb[t]], dim=1)
+                cumulated = self.layers[s][1](cumulated, current_dist_emb)
+                current_list.append(cumulated)
+            x = torch.stack(current_list, dim=0)
+        
+        #out = []
+        #for t in range(len(x)):
+        #    current_out = self.final_conv(x[t])
+        #    out.append(current_out)
+        #out = torch.stack(out, dim=0)
+
+        x = x.permute(1, 2, 0, 3, 4).contiguous()
+        out = self.final_conv(x)
+        out = out.permute(2, 0, 1, 3, 4).contiguous()
+
+        return out
+
+
+    def forward_no_emb(self, x, skip_connections):
+        """x: T, B, C, H, W
+        skip_connections: [T, B, C, H, W]"""
+
+        skip_connections = skip_connections[::-1]
+
+        for s in range(self.num_stages):
+
+            #upsampled_list = []
+            #for t in range(len(x)):
+            #    upsampled = self.upsample_layers[s](x[t])
+            #    upsampled_list.append(upsampled)
+            #x = torch.stack(upsampled_list, dim=0)
+            #print(x.shape)
+
+            current_list = []
+            for t in range(len(x)):
+                upsampled = self.upsample_layers[s](x[t])
+                concatenated = torch.cat([skip_connections[s][t], upsampled], dim=1)
+                concatenated = self.layers[s][0](concatenated)
+                current_list.append(concatenated)
+            reduced = torch.stack(current_list, dim=0)
+
+            cumulated = reduced[0]
+            current_list = [cumulated]
+            for t in range(1, len(x)):
+                cumulated = torch.cat([cumulated, reduced[t]], dim=1)
+                cumulated = self.layers[s][1](cumulated)
+                current_list.append(cumulated)
+            x = torch.stack(current_list, dim=0)
+        
+        #out = []
+        #for t in range(len(x)):
+        #    current_out = self.final_conv(x[t])
+        #    out.append(current_out)
+        #out = torch.stack(out, dim=0)
+
+        x = x.permute(1, 2, 0, 3, 4).contiguous()
+        out = self.final_conv(x)
+        out = out.permute(2, 0, 1, 3, 4).contiguous()
+
+        return out
+
+
+
+
+class Decoder3DIterative(nn.Module):
+    r""" Swin Transformer
+        A PyTorch impl of : `Swin Transformer: Hierarchical Vision Transformer using Shifted Windows`  -
+          https://arxiv.org/pdf/2103.14030
+
+    Args:
+        img_size (int | tuple(int)): Input image size. Default 224
+        patch_size (int | tuple(int)): Patch size. Default: 4
+        in_chans (int): Number of input image channels. Default: 3
+        num_classes (int): Number of classes for classification head. Default: 1000
+        embed_dim (int): Patch embedding dimension. Default: 96
+        depths (tuple(int)): Depth of each Swin Transformer layer.
+        num_heads (tuple(int)): Number of attention heads in different layers.
+        window_size (int): Window size. Default: 7
+        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim. Default: 4
+        qkv_bias (bool): If True, add a learnable bias to query, key, value. Default: True
+        qk_scale (float): Override default qk scale of head_dim ** -0.5 if set. Default: None
+        drop_rate (float): Dropout rate. Default: 0
+        attn_drop_rate (float): Attention dropout rate. Default: 0
+        drop_path_rate (float): Stochastic depth rate. Default: 0.1
+        norm_layer (nn.Module): Normalization layer. Default: nn.LayerNorm.
+        ape (bool): If True, add absolute position embedding to the patch embedding. Default: False
+        patch_norm (bool): If True, add normalization after patch embedding. Default: True
+        use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False
+    """
+
+    def __init__(self,
+                conv_depth,
+                in_encoder_dims, 
+                out_encoder_dims,
+                num_classes,
+                img_size,
+                deep_supervision,
+                dot_multiplier,
+                dist_emb,
+                norm,
+                skip_co=True,
+                last_activation='identity',
+                **kwargs):
+        super().__init__()
+
+        self.num_stages = len(conv_depth)
+        self.img_size = img_size
+        self.num_classes = num_classes
+        self.deep_supervision = deep_supervision
+        self.skip_co = skip_co
+        self.dot_multiplier = dot_multiplier
+        self.deep_supervision = deep_supervision
+        self.dist_emb = dist_emb
+        
+        # build decoder layers
+        self.layers = nn.ModuleList()
+        self.upsample_layers = nn.ModuleList()
+        self.deep_supervision_layers = nn.ModuleList()
+
+        for i_layer in range(self.num_stages):
+            in_dim = out_encoder_dims[i_layer] * 2 if i_layer == 0 else in_encoder_dims[i_layer - 1]
+
+            deep_supervision_layer = nn.Identity()
+            if deep_supervision and i_layer < self.num_stages - 1:
+                deep_supervision_layer = nn.ConvTranspose2d(in_channels=in_encoder_dims[i_layer],
+                                                            out_channels=self.num_classes,
+                                                            stride=2**(self.num_stages - (i_layer + 1)),
+                                                            kernel_size=2**(self.num_stages - (i_layer + 1)))
+
+            upsample_layer = PatchExpand3DGroup(in_dim=in_dim, out_dim=out_encoder_dims[i_layer], kernel_size=(1, 2, 2), stride=(1, 2, 2))
+
+            #out_dim = out_encoder_dims[i_layer] * self.dot_multiplier if i_layer == self.num_stages - 1 else in_encoder_dims[i_layer]
+            out_dim = out_encoder_dims[i_layer]
+            if self.dist_emb:
+                conv3 = ConvBlocks3DEmbedding(in_dim=out_encoder_dims[i_layer] * 2, 
+                                out_dim=out_dim,
+                                nb_blocks=1,
+                                d_model=out_encoder_dims[0] * 2,
+                                kernel_size=3)
+                conv4 = ConvBlocks3DEmbedding(in_dim=out_encoder_dims[i_layer], 
+                                out_dim=out_dim,
+                                nb_blocks=1,
+                                d_model=out_encoder_dims[0] * 2,
+                                kernel_size=3)
+            else:
+                conv3 = ConvBlocks3DGroup(in_dim=out_encoder_dims[i_layer] * 2, 
+                                out_dim=out_dim,
+                                nb_blocks=1,
+                                kernel_size=3)
+                conv4 = ConvBlocks3DGroup(in_dim=out_encoder_dims[i_layer], 
+                                out_dim=out_dim,
+                                nb_blocks=1,
+                                kernel_size=3)
+            conv_list = nn.ModuleList([conv3, conv4])
+            self.layers.append(conv_list)
+            self.upsample_layers.append(upsample_layer)
+            self.deep_supervision_layers.append(deep_supervision_layer)
+
+        self.final_conv = nn.Conv3d(out_encoder_dims[i_layer], num_classes, kernel_size=3, padding=1)
+        self.final_conv.weight = nn.Parameter(Normal(0, 1e-5).sample(self.final_conv.weight.shape))
+        self.final_conv.bias = nn.Parameter(torch.zeros(self.final_conv.bias.shape))
+    
+
+    def forward(self, x, skip_connections, dist_emb=None):
+        if self.dist_emb:
+            return self.forward_emb(x, skip_connections, dist_emb)
+        else:
+            return self.forward_no_emb(x, skip_connections)
+    
+
+    def forward_emb(self, x, skip_connections, dist_emb):
+        """x: T, B, C, H, W
+        skip_connections: [T, B, C, H, W]
+        dist_emb: T, B, C"""
+
+        skip_connections = skip_connections[::-1]
+        assert len(x) == len(dist_emb)
+
+        x = x.permute(1, 2, 0, 3, 4).contiguous()
+        for s in range(self.num_stages):
+
+            x = self.upsample_layers[s](x)
+            skip_co = skip_connections[s].permute(1, 2, 0, 3, 4).contiguous()
+            x = torch.cat([skip_co, x], dim=1)
+            x = self.layers[s][0](x, dist_emb)
+            x = self.layers[s][1](x, dist_emb)
+        
+        #out = []
+        #for t in range(len(x)):
+        #    current_out = self.final_conv(x[t])
+        #    out.append(current_out)
+        #out = torch.stack(out, dim=0)
+
+        out = self.final_conv(x)
+        out = out.permute(2, 0, 1, 3, 4).contiguous()
+
+        return out
+
+
+    def forward_no_emb(self, x, skip_connections):
+        """x: T, B, C, H, W
+        skip_connections: [T, B, C, H, W]"""
+
+        skip_connections = skip_connections[::-1]
+
+        x = x.permute(1, 2, 0, 3, 4).contiguous()
+        for s in range(self.num_stages):
+
+            x = self.upsample_layers[s](x)
+            skip_co = skip_connections[s].permute(1, 2, 0, 3, 4).contiguous()
+            x = torch.cat([skip_co, x], dim=1)
+            x = self.layers[s][0](x)
+            x = self.layers[s][1](x)
+        
+        #out = []
+        #for t in range(len(x)):
+        #    current_out = self.final_conv(x[t])
+        #    out.append(current_out)
+        #out = torch.stack(out, dim=0)
+
+        out = self.final_conv(x)
+        out = out.permute(2, 0, 1, 3, 4).contiguous()
+
+        return out
+    
+
+
+
+class Decoder2DIterativeNoEmb(nn.Module):
+    r""" Swin Transformer
+        A PyTorch impl of : `Swin Transformer: Hierarchical Vision Transformer using Shifted Windows`  -
+          https://arxiv.org/pdf/2103.14030
+
+    Args:
+        img_size (int | tuple(int)): Input image size. Default 224
+        patch_size (int | tuple(int)): Patch size. Default: 4
+        in_chans (int): Number of input image channels. Default: 3
+        num_classes (int): Number of classes for classification head. Default: 1000
+        embed_dim (int): Patch embedding dimension. Default: 96
+        depths (tuple(int)): Depth of each Swin Transformer layer.
+        num_heads (tuple(int)): Number of attention heads in different layers.
+        window_size (int): Window size. Default: 7
+        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim. Default: 4
+        qkv_bias (bool): If True, add a learnable bias to query, key, value. Default: True
+        qk_scale (float): Override default qk scale of head_dim ** -0.5 if set. Default: None
+        drop_rate (float): Dropout rate. Default: 0
+        attn_drop_rate (float): Attention dropout rate. Default: 0
+        drop_path_rate (float): Stochastic depth rate. Default: 0.1
+        norm_layer (nn.Module): Normalization layer. Default: nn.LayerNorm.
+        ape (bool): If True, add absolute position embedding to the patch embedding. Default: False
+        patch_norm (bool): If True, add normalization after patch embedding. Default: True
+        use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False
+    """
+
+    def __init__(self,
+                conv_depth,
+                in_encoder_dims, 
+                out_encoder_dims,
+                num_classes,
+                img_size,
+                deep_supervision,
+                dot_multiplier,
+                norm,
+                skip_co=True,
+                last_activation='identity',
+                **kwargs):
+        super().__init__()
+
+        self.num_stages = len(conv_depth)
+        self.img_size = img_size
+        self.num_classes = num_classes
+        self.deep_supervision = deep_supervision
+        self.skip_co = skip_co
+        self.dot_multiplier = dot_multiplier
+        self.deep_supervision = deep_supervision
+        
+        # build decoder layers
+        self.layers = nn.ModuleList()
+        self.upsample_layers = nn.ModuleList()
+        self.deep_supervision_layers = nn.ModuleList()
+
+        for i_layer in range(self.num_stages):
+            conv_list = nn.ModuleList()
+            in_dim = out_encoder_dims[i_layer] * 2 if i_layer == 0 else in_encoder_dims[i_layer - 1]
+
+            deep_supervision_layer = nn.Identity()
+            if deep_supervision and i_layer < self.num_stages - 1:
+                deep_supervision_layer = nn.ConvTranspose2d(in_channels=in_encoder_dims[i_layer],
+                                                            out_channels=self.num_classes,
+                                                            stride=2**(self.num_stages - (i_layer + 1)),
+                                                            kernel_size=2**(self.num_stages - (i_layer + 1)))
+
+            upsample_layer = PatchExpand2DGroup(in_dim=in_dim, out_dim=out_encoder_dims[i_layer])
+
+            #out_dim = out_encoder_dims[i_layer] * self.dot_multiplier if i_layer == self.num_stages - 1 else in_encoder_dims[i_layer]
+            out_dim = out_encoder_dims[i_layer]
+            conv1 = ConvBlocks2DGroup(in_dim=out_encoder_dims[i_layer] * 2, 
+                            out_dim=out_dim,
+                            nb_blocks=1,
+                            kernel_size=3)
+            conv_list.append(conv1)
+            conv2 = ConvBlocks2DGroup(in_dim=out_encoder_dims[i_layer] * 2, 
+                            out_dim=out_dim,
+                            nb_blocks=1,
+                            kernel_size=3)
+            conv_list.append(conv2)
+            conv3 = ConvBlocks2DGroup(in_dim=out_encoder_dims[i_layer] * 2, 
+                            out_dim=out_dim,
+                            nb_blocks=1,
+                            kernel_size=3)
+            conv_list.append(conv3)
+            conv4 = ConvBlocks2DGroup(in_dim=out_encoder_dims[i_layer] * 2, 
+                            out_dim=out_dim,
+                            nb_blocks=1,
+                            kernel_size=3)
+            conv_list.append(conv4)
+            self.layers.append(conv_list)
+            self.upsample_layers.append(upsample_layer)
+            self.deep_supervision_layers.append(deep_supervision_layer)
+
+        self.final_conv = nn.Conv3d(out_encoder_dims[i_layer], num_classes, kernel_size=3, padding=1)
+        self.final_conv.weight = nn.Parameter(Normal(0, 1e-5).sample(self.final_conv.weight.shape))
+        self.final_conv.bias = nn.Parameter(torch.zeros(self.final_conv.bias.shape))
+    
+
+    def forward(self, x, skip_connections):
+        """x: T - 1, B, C, H, W
+        skip_connections: [T, B, C, H, W]
+        dist_emb: B, T-1, C"""
+
+        skip_connections = skip_connections[::-1]
+
+        for s in range(self.num_stages):
+
+            #upsampled_list = []
+            #for t in range(len(x)):
+            #    upsampled = self.upsample_layers[s](x[t])
+            #    upsampled_list.append(upsampled)
+            #x = torch.stack(upsampled_list, dim=0)
+            #print(x.shape)
+
+            current_list = []
+            for t in range(len(x)):
+                current_skip_co = torch.cat([skip_connections[s][t], skip_connections[s][t + 1]], dim=1)
+                current_skip_co = self.layers[s][0](current_skip_co)
+                current_list.append(current_skip_co)
+            skip_co = torch.stack(current_list, dim=0)
+
+            cumulated = skip_co[0]
+            current_list = [cumulated]
+            for t in range(1, len(skip_co)):
+                cumulated = torch.cat([cumulated, skip_co[t]], dim=1)
+                cumulated = self.layers[s][1](cumulated)
+                current_list.append(cumulated)
+            skip_co = torch.stack(current_list, dim=0)
+
+            current_list = []
+            for t in range(len(x)):
+                upsampled = self.upsample_layers[s](x[t])
+                concatenated = torch.cat([skip_co[t], upsampled], dim=1)
+                concatenated = self.layers[s][2](concatenated)
+                current_list.append(concatenated)
+            reduced = torch.stack(current_list, dim=0)
+
+            cumulated = reduced[0]
+            current_list = [cumulated]
+            for t in range(1, len(x)):
+                cumulated = torch.cat([cumulated, reduced[t]], dim=1)
+                cumulated = self.layers[s][3](cumulated)
+                current_list.append(cumulated)
+            x = torch.stack(current_list, dim=0)
+        
+        #out = []
+        #for t in range(len(x)):
+        #    current_out = self.final_conv(x[t])
+        #    out.append(current_out)
+        #out = torch.stack(out, dim=0)
+
+        x = x.permute(1, 2, 0, 3, 4).contiguous()
+        out = self.final_conv(x)
+        out = out.permute(2, 0, 1, 3, 4).contiguous()
+
+        return out
+
+
+
+class Decoder2DIterativeSimple(nn.Module):
+    r""" Swin Transformer
+        A PyTorch impl of : `Swin Transformer: Hierarchical Vision Transformer using Shifted Windows`  -
+          https://arxiv.org/pdf/2103.14030
+
+    Args:
+        img_size (int | tuple(int)): Input image size. Default 224
+        patch_size (int | tuple(int)): Patch size. Default: 4
+        in_chans (int): Number of input image channels. Default: 3
+        num_classes (int): Number of classes for classification head. Default: 1000
+        embed_dim (int): Patch embedding dimension. Default: 96
+        depths (tuple(int)): Depth of each Swin Transformer layer.
+        num_heads (tuple(int)): Number of attention heads in different layers.
+        window_size (int): Window size. Default: 7
+        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim. Default: 4
+        qkv_bias (bool): If True, add a learnable bias to query, key, value. Default: True
+        qk_scale (float): Override default qk scale of head_dim ** -0.5 if set. Default: None
+        drop_rate (float): Dropout rate. Default: 0
+        attn_drop_rate (float): Attention dropout rate. Default: 0
+        drop_path_rate (float): Stochastic depth rate. Default: 0.1
+        norm_layer (nn.Module): Normalization layer. Default: nn.LayerNorm.
+        ape (bool): If True, add absolute position embedding to the patch embedding. Default: False
+        patch_norm (bool): If True, add normalization after patch embedding. Default: True
+        use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False
+    """
+
+    def __init__(self,
+                conv_depth,
+                in_encoder_dims, 
+                out_encoder_dims,
+                num_classes,
+                img_size,
+                deep_supervision,
+                dot_multiplier,
+                use_convlstm,
+                norm,
+                skip_co=True,
+                last_activation='identity',
+                **kwargs):
+        super().__init__()
+
+        self.num_stages = len(conv_depth)
+        self.img_size = img_size
+        self.num_classes = num_classes
+        self.deep_supervision = deep_supervision
+        self.skip_co = skip_co
+        self.dot_multiplier = dot_multiplier
+        self.deep_supervision = deep_supervision
+        self.use_convlstm = use_convlstm
+        
+        # build decoder layers
+        self.layers = nn.ModuleList()
+        self.upsample_layers = nn.ModuleList()
+        self.deep_supervision_layers = nn.ModuleList()
+
+        for i_layer in range(self.num_stages):
+            conv_list = nn.ModuleList()
+            in_dim = out_encoder_dims[i_layer] * 2 if i_layer == 0 else in_encoder_dims[i_layer - 1]
+
+            deep_supervision_layer = nn.Identity()
+            if deep_supervision and i_layer < self.num_stages - 1:
+                deep_supervision_layer = nn.ConvTranspose2d(in_channels=in_encoder_dims[i_layer],
+                                                            out_channels=self.num_classes,
+                                                            stride=2**(self.num_stages - (i_layer + 1)),
+                                                            kernel_size=2**(self.num_stages - (i_layer + 1)))
+
+            upsample_layer = PatchExpand2DGroup(in_dim=in_dim, out_dim=out_encoder_dims[i_layer])
+
+            #out_dim = out_encoder_dims[i_layer] * self.dot_multiplier if i_layer == self.num_stages - 1 else in_encoder_dims[i_layer]
+            out_dim = out_encoder_dims[i_layer]
+            conv1 = ConvBlocks2DGroup(in_dim=out_encoder_dims[i_layer] * 2, 
+                            out_dim=out_dim,
+                            nb_blocks=1,
+                            kernel_size=3)
+            conv_list.append(conv1)
+            conv2 = ConvBlocks2DGroup(in_dim=out_encoder_dims[i_layer] * 2, 
+                            out_dim=out_dim,
+                            nb_blocks=1,
+                            kernel_size=3)
+            conv_list.append(conv2)
+            if use_convlstm:
+                convlstm = ConvLSTM(input_dim=out_encoder_dims[i_layer],
+                                    hidden_dim=out_encoder_dims[i_layer],
+                                    kernel_size=(3, 3),
+                                    num_layers=1,
+                                    batch_first=False,
+                                    bias=True,
+                                    return_all_layers=True)
+                conv_list.append(convlstm)
+            else:
+                conv3 = ConvBlocks2DGroup(in_dim=out_encoder_dims[i_layer] * 2, 
+                                out_dim=out_dim,
+                                nb_blocks=1,
+                                kernel_size=3)
+                conv_list.append(conv3)
+            self.layers.append(conv_list)
+            self.upsample_layers.append(upsample_layer)
+            self.deep_supervision_layers.append(deep_supervision_layer)
+
+        self.final_conv = nn.Conv2d(out_encoder_dims[i_layer], num_classes, kernel_size=3, padding=1)
+        self.final_conv.weight = nn.Parameter(Normal(0, 1e-5).sample(self.final_conv.weight.shape))
+        self.final_conv.bias = nn.Parameter(torch.zeros(self.final_conv.bias.shape))
+    
+
+    def forward(self, x, skip_connections):
+        """x: T - 1, B, C, H, W
+        skip_connections: [T, B, C, H, W]
+        dist_emb: B, T-1, C"""
+
+        skip_connections = skip_connections[::-1]
+
+        for s in range(self.num_stages):
+
+            #upsampled_list = []
+            #for t in range(len(x)):
+            #    upsampled = self.upsample_layers[s](x[t])
+            #    upsampled_list.append(upsampled)
+            #x = torch.stack(upsampled_list, dim=0)
+            #print(x.shape)
+
+            current_list = []
+            for t in range(1, len(skip_connections[s])):
+                current_skip_co = torch.cat([skip_connections[s][0], skip_connections[s][t]], dim=1)
+                current_skip_co = self.layers[s][0](current_skip_co)
+                current_list.append(current_skip_co)
+            skip_co = torch.stack(current_list, dim=0)
+
+            current_list = []
+            for t in range(len(x)):
+                upsampled = self.upsample_layers[s](x[t])
+                concatenated = torch.cat([skip_co[t], upsampled], dim=1)
+                concatenated = self.layers[s][1](concatenated)
+                current_list.append(concatenated)
+            reduced = torch.stack(current_list, dim=0)
+
+            if self.use_convlstm:
+                x = self.layers[s][2](reduced)[0][0]
+                x = x.permute(1, 0, 2, 3, 4).contiguous()
+            else:
+                cumulated = reduced[0]
+                current_list = [cumulated]
+                for t in range(1, len(x)):
+                    cumulated = torch.cat([cumulated, reduced[t]], dim=1)
+                    cumulated = self.layers[s][2](cumulated)
+                    current_list.append(cumulated)
+                x = torch.stack(current_list, dim=0)
+        
+        out = []
+        for t in range(len(x)):
+            current_out = self.final_conv(x[t])
+            out.append(current_out)
+        out = torch.stack(out, dim=0)
+
+        #x = x.permute(1, 2, 0, 3, 4).contiguous()
+        #out = self.final_conv(x)
+        #out = out.permute(2, 0, 1, 3, 4).contiguous()
+
+        return out
+
 
 
 class FlowDecoder3D(nn.Module):
@@ -915,11 +1858,11 @@ class FlowDecoder3D(nn.Module):
 
     def __init__(self,
                 conv_depth,
-                dpr,
                 in_encoder_dims, 
                 out_encoder_dims,
                 num_classes,
                 img_size,
+                final_stride,
                 deep_supervision,
                 dot_multiplier,
                 skip_co=True,
@@ -966,7 +1909,14 @@ class FlowDecoder3D(nn.Module):
             self.upsample_layers.append(upsample_layer)
             self.deep_supervision_layers.append(deep_supervision_layer)
 
-        self.final_conv = nn.Conv3d(out_encoder_dims[-1], num_classes, kernel_size=1)
+        self.final_conv = nn.Conv3d(out_encoder_dims[-1], num_classes, kernel_size=3, stride=(final_stride, 1, 1), padding=1)
+        self.final_conv.weight = nn.Parameter(Normal(0, 1e-5).sample(self.final_conv.weight.shape))
+        self.final_conv.bias = nn.Parameter(torch.zeros(self.final_conv.bias.shape))
+
+        if last_activation == 'tanh':
+            self.last_activation = torch.nn.Tanh()
+        else:
+            self.last_activation = nn.Identity()
     
 
     def forward(self, x, encoder_skip_connections):
@@ -988,8 +1938,9 @@ class FlowDecoder3D(nn.Module):
             x = layer_up(x)
             if i < self.num_stages - 1:
                 out.append(deep_supervision_layer(x))
-        
-        x = self.final_conv(x)
+
+        x = self.final_conv(x).squeeze(2)
+        x = self.last_activation(x)
         out.append(deep_supervision_layer(x))
 
         out = out[::-1]

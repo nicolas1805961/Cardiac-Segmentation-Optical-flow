@@ -70,7 +70,7 @@ def main():
     parser.add_argument('--disable_ensembling', required=False, default=False, action='store_true',
                         help='Set this flag to disable the use of ensembling. This will find the best single '
                              'configuration for each task.')
-    parser.add_argument("--disable_postprocessing", required=False, default=False, action="store_true",
+    parser.add_argument("--disable_postprocessing", required=True, default=False, action="store_true",
                         help="Set this flag if you want to disable the use of postprocessing")
 
     args = parser.parse_args()

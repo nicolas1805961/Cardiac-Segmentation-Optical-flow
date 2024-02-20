@@ -46,4 +46,23 @@ export RESULTS_FOLDER="out/nnUNet_trained_models"
 #python run/run_training.py 2d nnMTLTrainerV2FlowSimple Task031_ACDC 0 -p custom_experiment_planner --deterministic
 #python run/run_training.py 2d nnMTLTrainerV2FlowSimple Task032_Lib 0 -p custom_experiment_planner --deterministic -val -w out/nnUNet_trained_models/nnUNet/2d/Task031_ACDC/nnMTLTrainerV2FlowSimple__custom_experiment_planner/fold_0/2023-09-19_19H40/
 #python run/run_training.py 2d nnMTLTrainerV2FlowSimple Task032_Lib 0 -p custom_experiment_planner --deterministic
-python run/run_training.py 2d nnMTLTrainerV2FlowRecursiveVideo Task032_Lib 0 -p custom_experiment_planner --deterministic
+#python run/run_training.py 2d nnMTLTrainerV2FlowRecursiveVideo Task032_Lib 0 -p custom_experiment_planner --deterministic
+#python run/run_training.py 2d nnMTLTrainerV2FlowVideo Task032_Lib 0 -p custom_experiment_planner --deterministic
+#python run/run_training.py 2d nnMTLTrainerV2FlowSuccessive Task032_Lib 0 -p custom_experiment_planner --deterministic
+#python run/run_training.py 2d nnMTLTrainerV2FlowSuccessiveDouble Task032_Lib 0 -p custom_experiment_planner --deterministic
+#python run/run_training.py 2d ErrorCorrection Task032_Lib 0 -p custom_experiment_planner --deterministic
+#python run/run_training.py 2d nnMTLTrainerV2FlowSuccessiveOther Task032_Lib 0 -p custom_experiment_planner --deterministic
+#python run/run_training.py 2d nnMTLTrainerV2Flow3D Task032_Lib 0 -p custom_experiment_planner --deterministic
+#python run/run_training.py 2d FlowSimple Task032_Lib 0 -p custom_experiment_planner --deterministic
+#python run/run_training.py 2d Interpolator Task032_Lib 0 -p custom_experiment_planner --deterministic
+#python run/run_training.py 2d GlobalModel Task032_Lib 0 -p custom_experiment_planner --deterministic
+#python run/run_training.py 2d nnMTLTrainerV2FlowSuccessiveEmbedding Task032_Lib 0 -p custom_experiment_planner --deterministic
+#python run/run_training.py 2d nnMTLTrainerV2FlowSuccessivePrediction Task032_Lib 0 -p custom_experiment_planner --deterministic
+#python run/run_training.py 2d nnMTLTrainerV2FlowSuccessiveSupervised Task032_Lib 0 -p custom_experiment_planner --deterministic
+#python run/run_training.py 2d MTLembedding Task032_Lib 0 -p custom_experiment_planner --deterministic
+#python run/run_training.py 2d StartEnd Task032_Lib 0 -p custom_experiment_planner --deterministic
+#python run/run_training.py 2d Final Task032_Lib 0 -p custom_experiment_planner --deterministic
+#python run/run_training.py 2d nnMTLTrainerV2FlowSuccessive Task045_Lib 0 -p custom_experiment_planner --deterministic
+python run/run_training.py 2d FinalFlow Task045_Lib 0 -p custom_experiment_planner --deterministic
+
+#python voxelmorph_saver_Lib.py

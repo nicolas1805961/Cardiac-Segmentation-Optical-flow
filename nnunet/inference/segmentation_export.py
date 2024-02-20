@@ -16,12 +16,14 @@
 import sys
 from copy import deepcopy
 from typing import Union, Tuple
+import matplotlib
 
 import numpy as np
 import SimpleITK as sitk
 from batchgenerators.augmentations.utils import resize_segmentation
 from nnunet.preprocessing.preprocessing import get_lowres_axis, get_do_separate_z, resample_data_or_seg
 from batchgenerators.utilities.file_and_folder_operations import *
+import matplotlib.pyplot as plt
 
 
 def save_segmentation_nifti_from_softmax(segmentation_softmax: Union[str, np.ndarray], out_fname: str,
@@ -31,7 +33,7 @@ def save_segmentation_nifti_from_softmax(segmentation_softmax: Union[str, np.nda
                                          resampled_npz_fname: str = None,
                                          non_postprocessed_fname: str = None, force_separate_z: bool = None,
                                          interpolation_order_z: int = 0, verbose: bool = True, flow=None, flow_path=None,
-                                         registered=None, registered_path=None, registered_other=None, registered_path_other=None):
+                                         registered=None, registered_path=None, raw_flow=None):
     
     """
     This is a utility for writing segmentations to nifty and npz. It requires the data to have been preprocessed by
@@ -82,6 +84,13 @@ def save_segmentation_nifti_from_softmax(segmentation_softmax: Union[str, np.nda
     # current_spacing = dct.get('spacing_after_resampling')
     # original_spacing = dct.get('original_spacing')
 
+    if raw_flow is not None:
+        raw_flow = raw_flow.transpose(2, 3, 1, 0)
+        img = raw_flow[:, :, :, :1] # H, W, D, 1
+        raw_flow = raw_flow[:, :, :, 1:] # H, W, D, 2
+        raw_flow_path = flow_path[:-4] + '_raw.npz'
+        np.savez(raw_flow_path, flow=raw_flow.astype(np.float32), img=img.astype(np.float32))
+
     if np.any([i != j for i, j in zip(np.array(current_shape[1:]), np.array(shape_original_after_cropping))]):
         if force_separate_z is None:
             if get_do_separate_z(properties_dict.get('original_spacing')):
@@ -110,15 +119,12 @@ def save_segmentation_nifti_from_softmax(segmentation_softmax: Union[str, np.nda
                                                axis=lowres_axis, order=order, do_separate_z=do_separate_z,
                                                order_z=interpolation_order_z)
         if flow is not None:
+            print(flow.shape)
             flow = resample_data_or_seg(flow, shape_original_after_cropping, is_seg=False,
                                                axis=lowres_axis, order=order, do_separate_z=do_separate_z,
                                                order_z=interpolation_order_z)
         if registered is not None:
             registered = resample_data_or_seg(registered, shape_original_after_cropping, is_seg=True,
-                                               axis=lowres_axis, order=0, do_separate_z=do_separate_z,
-                                               order_z=0)
-        if registered_other is not None:
-            registered_other = resample_data_or_seg(registered_other, shape_original_after_cropping, is_seg=True,
                                                axis=lowres_axis, order=0, do_separate_z=do_separate_z,
                                                order_z=0)
         # seg_old_spacing = resize_softmax_output(segmentation_softmax, shape_original_after_cropping, order=order)
@@ -167,29 +173,19 @@ def save_segmentation_nifti_from_softmax(segmentation_softmax: Union[str, np.nda
             bbox[2][0]:bbox[2][1]] = registered[0]
         else:
             registered_old_size = registered
-        if registered_other is not None:
-            registered_old_size_other = np.zeros(shape_original_before_cropping, dtype=np.uint8)
-            registered_old_size_other[bbox[0][0]:bbox[0][1],
-            bbox[1][0]:bbox[1][1],
-            bbox[2][0]:bbox[2][1]] = registered_other[0]
-        else:
-            registered_old_size_other = registered_other
     else:
         seg_old_size = seg_old_spacing
         flow_old_size = flow
         registered_old_size = registered
-        registered_old_size_other = registered_other
 
     if seg_postprogess_fn is not None:
         seg_old_size_postprocessed = seg_postprogess_fn(np.copy(seg_old_size), *seg_postprocess_args)
         seg_old_size_postprocessed_flow = seg_postprogess_fn(np.copy(flow_old_size), *seg_postprocess_args)
         seg_old_size_postprocessed_registered = seg_postprogess_fn(np.copy(registered_old_size), *seg_postprocess_args)
-        seg_old_size_postprocessed_registered_other = seg_postprogess_fn(np.copy(registered_old_size_other), *seg_postprocess_args)
     else:
         seg_old_size_postprocessed = seg_old_size
         seg_old_size_postprocessed_flow = flow_old_size
         seg_old_size_postprocessed_registered = registered_old_size
-        seg_old_size_postprocessed_registered_other = registered_old_size_other
 
     seg_resized_itk = sitk.GetImageFromArray(seg_old_size_postprocessed.astype(np.uint8))
     seg_resized_itk.SetSpacing(properties_dict['itk_spacing'])
@@ -206,6 +202,7 @@ def save_segmentation_nifti_from_softmax(segmentation_softmax: Union[str, np.nda
 
     if flow is not None:
         flow_old_size = flow_old_size.transpose(2, 3, 1, 0)
+
         np.savez(flow_path, flow=flow_old_size.astype(np.float32), spacing=properties_dict['itk_spacing'])
         #seg_resized_itk_flow = sitk.GetImageFromArray(flow_old_size.astype(np.float32))
         #seg_resized_itk_flow.SetSpacing(properties_dict['itk_spacing'])
@@ -215,17 +212,11 @@ def save_segmentation_nifti_from_softmax(segmentation_softmax: Union[str, np.nda
     
     if registered is not None:
         registered_resized_itk = sitk.GetImageFromArray(registered_old_size.astype(np.uint8))
+        
         registered_resized_itk.SetSpacing(properties_dict['itk_spacing'])
         registered_resized_itk.SetOrigin(properties_dict['itk_origin'])
         registered_resized_itk.SetDirection(properties_dict['itk_direction'])
         sitk.WriteImage(registered_resized_itk, registered_path)
-    
-    if registered_other is not None:
-        registered_resized_itk_other = sitk.GetImageFromArray(registered_old_size_other.astype(np.uint8))
-        registered_resized_itk_other.SetSpacing(properties_dict['itk_spacing'])
-        registered_resized_itk_other.SetOrigin(properties_dict['itk_origin'])
-        registered_resized_itk_other.SetDirection(properties_dict['itk_direction'])
-        sitk.WriteImage(registered_resized_itk_other, registered_path_other)
 
     if (non_postprocessed_fname is not None) and (seg_postprogess_fn is not None):
         seg_resized_itk = sitk.GetImageFromArray(seg_old_size.astype(np.uint8))

@@ -1,86 +1,93 @@
-use_sfb: False
+use_sfb: false
 
-strain_loss_weight: 100.0 # 100.0
-forward_flow_loss_weight: 1.0 #1.0
+strain_loss_weight: 0.0 # 100.0
+forward_flow_loss_weight: 0.0 #1.0
 
-local_motion_loss_weight: 0.0
-global_motion_forward_loss_weight: 0.0
-global_motion_backward_loss_weight: 0.0
-semi_supervised_forward_loss_weight: 0.0
-semi_supervised_backward_loss_weight: 0.0
+global_motion_forward_loss_weight: 1.0 # 0.1
 
-seg_to_seg_forward_loss_weight: 0.0
-seg_to_seg_backward_loss_weight: 0.0
-
-first_flow_loss_weight: 1000.0 #1000.0
-seg_registered_pred_loss_weight: 0.0
-pred_registered_pred_loss_weight: 0.0
-pred_registered_target_loss_weight: 0.0
-seg_curvature_loss_weight: 0.0
-flow_curvature_loss_weight: 0.0 # 100
 interpolation_loss_weight: 0.0
-magnitude_loss_weight: 0.0
+prediction_loss_weight: 0.0
 
+local_seg_registered_loss_weight: 0.0
+
+global_seg_registered_loss_weight: 0.0
+global_label_registered_loss_weight: 0.0
+
+distance: cos # [cos, l2]
+bottleneck_type: transformer_bis # [gru, 3d, transformer, transformer_bis]
+topk: False
+pos_1d: True
+pretrained_first_label: True
+pretrained_2d_folder_path: '2d_cardiotrack_crop_normalized_2'
+nb_conv: 2
+flow_model_path: flow_model_500
+interpolator_model_path: interpolator_model_500
+segmentation: False
+kernel_size: 3
+conv_bottleneck: False
+no_error: False
+registration_loss: ncc
+backward: false
+motion_from_ed: true
+training_modality: forward   # ['backward', 'forward', 'forward_no_sum']
+dataloader_modality: other   # ['all_first', 'all_adjacent', 'regular', 'other']
+legacy: true
+final_stride: 1
+do_data_aug: true
+all_data_lib: false
+dataloader_not_random: false
 nb_iters: 1
 nb_interp_frame: 0
-embedding_dim: 512
-only_first: False
-split: True
-padding: null #['border', null]
-blackout_percent: 0.0
-all_to_all: True
-one_to_all: False
-inference_mode: 'one_step' # sliding_window, one_step, overlap
-load_only_batchnorm: True
+only_first: false
+split: true
+padding: false
+all_to_all: true
+one_to_all: false
+inference_mode: one_step   # sliding_window, one_step, overlap
 consistency_loss_weight: 0.0 #0.01
-regularization_weight_xy: 0.0 #0.01
-regularization_weight_z: 0.0 #0.01
-dot_multiplier: 2
+regularization_weight_xy: 1.0 #0.01
+regularization_weight_z: 0.0 #0.001
 nb_tokens: 1
-segmentation_loss_weight: 1.0 # 1.0
-image_flow_loss_weight: 0.0 # 0.0
-long_image_flow_loss_weight: 0.0 # 0.0
-force_one_label: True
-feature_extractor: False
-video_length: 4
-crop: True
-cropper_weights_folder_path: 'binary'
-video_weights_folder_path: 'pretrained_3d_3d' #'pretrained_old', 'pretrained_3d', 'pretrained_3d_3d'
-crop_size: 192
+segmentation_loss_weight: 0.0 # 0.1
+image_flow_loss_weight_global: 0.5 # 0.5
+image_flow_loss_weight_local: 0.0 # 0.5
+force_one_label: true
+feature_extractor: false
+video_length: 2
+crop: true
 nb_layers: 1
 
-labeled: False
-log_images: True
-patch_size: [224, 224]
-device: 'cuda:0'
-deep_supervision: False
-log_stats: True
-overfit_log: 20 #10
-epoch_log: 50 #50
-scheduler: 'cosine'
-optimizer: 'adam'
+labeled: false
+log_images: false
+device: cuda:0
+deep_supervision: false
+log_stats: true
+overfit_log: 10 #10
+epoch_log: 10 #10
+scheduler: cosine
+optimizer: adam
 initial_lr: 0.0001 #0.0001
 weight_decay: 0.0001 #0.0001
 warmup_percent: 0.1
-max_num_epochs: 1 #400
+max_num_epochs: 100 #400
 #window_size: 7
 #image_size: 224
-norm: 'batchnorm' # 'instancenorm', 'batchnorm'
+norm: group   # 'group', 'batch'
 bottleneck_heads: 8 # 16
-activation: 'gelu'
-conv_layer: 'other'
+activation: gelu
+conv_layer: other
 dropout: 0
-conv_depth: [2, 2, 2]
+conv_depth: [1, 1, 1]
 transformer_depth: [] #[2, 2, 2], [2]
 num_heads: [] #[3, 6, 12], [8] [12]
 spatial_cross_attention_num_heads: [8, 8, 8] #[2, 4, 6, 8, 12] [12, 8, 6, 4, 2] [bottom, ..., top] [3, 6, 12] [4, 4, 8, 8, 16]
-batch_size: 1 #16
+batch_size: 6 #16
 drop_path_rate: 0.0
-in_encoder_dims: [1, 128, 256] #[1, 128, 256] [1, 96, 384] [1, 24, 96] [1, 32, 128] [1, 32, 128, 256, 512] [1, 48, 192] [1, 96, 192]
+in_encoder_dims: [6, 128, 256] #[1, 128, 256] [1, 96, 384] [1, 24, 96] [1, 32, 128] [1, 32, 128, 256, 512] [1, 48, 192] [1, 96, 192]
 out_encoder_dims: [64, 128, 256] #[64, 128, 256] [96, 192, 384] [24, 48, 96] [32, 64, 128] [32, 64, 128, 256, 512] [48, 96, 192] [96, 192, 384]
-loss: 'ce_and_dice' # ['ce_and_dice', 'focal_and_dice', 'topk_and_dice', 'ce']
+loss: ce_and_dice   # ['ce_and_dice', 'focal_and_dice', 'topk_and_dice', 'ce']
 
-do_adv: False
+do_adv: false
 adversarial_weight: 0.0
 discriminator_depth: [2, 2, 2]
 discriminator_in_dims: [4, 128, 256]
@@ -88,7 +95,7 @@ discriminator_out_dims: [64, 128, 256]
 discriminator_lr: 0.00001 # 0.00005
 discriminator_decay: 0.0001
 
-reinforcement: False
+reinforcement: false
 policy_net_learning_rate: 0.0001
 number_of_intervals: 20
 number_of_steps: 200

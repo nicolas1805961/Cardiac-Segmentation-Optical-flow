@@ -18,11 +18,31 @@ from torch.nn.functional import pad
 import matplotlib.patches as patches
 from torchvision.ops import roi_align
 import numpy as np
+import math
 
 from einops import rearrange
 from einops.layers.torch import Rearrange
 from torch.nn import init
 from torch.nn.functional import affine_grid
+
+
+class SinusoidalPositionEmbeddings(nn.Module):
+    """Positional embeddings"""
+
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, time: torch.Tensor):
+        device = time.device
+        half_dim = self.dim // 2
+        embeddings = math.log(10000) / (half_dim - 1)
+        embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
+        embeddings = time[:, None] * embeddings[None, :]
+        embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
+        return embeddings
+
+
 
 def _get_activation_fn(activation):
     """Return an activation function given a string"""
@@ -644,44 +664,6 @@ class SlotTransformer(nn.Module):
 #        return memory_bus, spatial_tokens
 
 
-class SpatioTemporalTransformer(nn.Module):
-    def __init__(self, dim, num_heads, num_layers, d_ffn, dropout=0.0):
-        super().__init__()
-        self.num_layers = num_layers
-        
-        spatial_attn_layer = TransformerEncoderLayer(d_model=dim, nhead=num_heads, dim_feedforward=d_ffn)
-        self.spatial_attention = _get_clones(spatial_attn_layer, num_layers)
-        
-        self.pos_weight = nn.Parameter(torch.randn(1, dim))
-
-
-    def forward(self, spatial_tokens, memory_bus, pos_2d):
-        shape = spatial_tokens.shape
-        T, B, C, H, W = shape
-
-        pos_2d = pos_2d.view(1, H * W, C).repeat(T * B, 1, 1)
-        pos_weight = self.pos_weight.view(1, 1, C).repeat(T * B, 1, 1)
-
-        memory_bus = memory_bus.view(T, 1, 1, C).repeat(1, B, 1, 1).view(T * B, 1, C)
-        spatial_tokens = spatial_tokens.permute(0, 1, 3, 4, 2).contiguous()
-        spatial_tokens = spatial_tokens.view(T * B, H, W, C).view(T * B, H * W, C)
-
-        src = torch.cat([memory_bus, spatial_tokens], dim=1)
-        pos = torch.cat([pos_weight, pos_2d], dim=1)
-
-        for i in range(self.num_layers):
-            src = self.spatial_attention[i](src=src, pos=pos)
-
-        memory_bus = src[:, 0] # T*B, C
-        spatial_tokens = src[:, 1:] # T*B, H*W, C
-        memory_bus = memory_bus.view(T, B, C)
-
-        memory_bus = memory_bus.permute(1, 0, 2).contiguous() # B, T, C
-        spatial_tokens = spatial_tokens.permute(0, 2, 1).contiguous() # T*B, C, H*W
-        spatial_tokens = spatial_tokens.view(T, B, C, H*W).view(T, B, C, H, W)
-        return memory_bus, spatial_tokens
-
-
 #class ModulationTransformer(nn.Module):
 #    def __init__(self, dim, num_heads, num_layers, d_ffn, video_length, dropout=0.0):
 #        super().__init__()
@@ -712,34 +694,41 @@ class SpatioTemporalTransformer(nn.Module):
 
 
 class ModulationTransformer(nn.Module):
-    def __init__(self, dim, num_heads, num_layers, d_ffn, conv_layer_1d, dropout=0.0):
+    def __init__(self, dim, num_heads, num_layers, d_ffn, dropout=0.0):
         super().__init__()
         self.num_layers = num_layers
 
         temporal_attn_layer = TransformerEncoderLayer(d_model=dim, nhead=num_heads, dim_feedforward=d_ffn)
         self.temporal_attention = _get_clones(temporal_attn_layer, num_layers)
 
-        self.conv_1d = _get_clones(conv_layer_1d, num_layers)
+        conv_1d = nn.Conv1d(dim, dim, kernel_size=3, padding='same')
+        self.conv_1d = _get_clones(conv_1d, num_layers)
 
-    def forward(self, memory_bus, spatial_tokens, pos_1d, pos_2d):
+        self.pos_obj_2d = PositionEmbeddingSine2d(num_pos_feats=dim // 2, normalize=True)
+
+    def forward(self, memory_bus, spatial_tokens):
         B, T, C = memory_bus.shape
         B, C, H, W = spatial_tokens.shape
+
+        pos_2d = self.pos_obj_2d(shape_util=(B, H, W), device=spatial_tokens.device)
+        pos_2d = pos_2d.permute(0, 2, 3, 1).contiguous()
+        pos_2d = pos_2d.view(B, H * W, C)
 
         spatial_tokens = spatial_tokens.permute(0, 2, 3, 1).contiguous()
         spatial_tokens = spatial_tokens.view(B, H * W, C)
         
-        pos_1d = pos_1d.view(1, T, C).repeat(B, 1, 1)
-        pos_2d = pos_2d.view(1, H*W, C).repeat(B, 1, 1)
-        pos = torch.cat([pos_1d, pos_2d], dim=1)
 
         for i in range(self.num_layers):
             memory_bus = memory_bus.permute(0, 2, 1).contiguous() # B, C, T
 
-            memory_bus = self.conv_1d[i](memory_bus) # B, C, T
+            pos_1d = self.conv_1d[i](memory_bus) # B, C, T
+            pos_1d = pos_1d.permute(0, 2, 1).contiguous() # B, T, C
             memory_bus = memory_bus.permute(0, 2, 1).contiguous() # B, T, C
 
+            pos = torch.cat([pos_1d, pos_2d], dim=1)
+
             src = torch.cat([memory_bus, spatial_tokens], dim=1)
-            src = self.temporal_attention[i](src=src, pos=pos)
+            src = self.temporal_attention[i](src=src, pos=pos)[0]
 
             memory_bus = src[:, :T] # B, T, C
             spatial_tokens = src[:, T:]
@@ -1003,7 +992,249 @@ class TransformerFlowLayer(nn.Module):
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(myself))))
         myself = myself + self.dropout3(tgt2)
         myself = self.norm3(myself)
+        return myself
+
+    def forward(self, query, key, query_pos, key_pos):
+        return self.forward_post(query, key, query_pos, key_pos)
+    
+
+
+
+class TransformerFlowLayerSeparated(nn.Module):
+
+    def __init__(self, d_model, nhead, distance, topk=None, dim_feedforward=2048, dropout=0.0,
+                 activation="relu", normalize_before=False):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        if distance == 'cos':
+            if topk is not None:
+                self.cross_attn = TopKAttention(d_model, d_model, heads=nhead, topk=topk)
+            else:
+                self.cross_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        elif distance == 'l2':
+            self.cross_attn = L2Attention(d_model, topk)
+        # Implementation of Feedforward model
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+
+        self.activation = nn.GELU()
+        self.normalize_before = normalize_before
+
+    def with_pos_embed(self, tensor, pos: Optional[Tensor]):
+        return tensor if pos is None else tensor + pos
+
+    def forward_post(self, query, key, value, query_pos, key_pos):
+        q = k = self.with_pos_embed(query, query_pos)
+        tgt2 = self.self_attn(q, k, value=query)[0]
+        query = query + self.dropout1(tgt2)
+        query = self.norm1(query)
+
+        tgt2, weights = self.cross_attn(query=self.with_pos_embed(query, query_pos), key=self.with_pos_embed(key, key_pos), value=value)
+        query = query + self.dropout2(tgt2)
+        query = self.norm2(query)
+
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(query))))
+        query = query + self.dropout3(tgt2)
+        query = self.norm3(query)
+        return query
+
+    def forward(self, query, key, value, query_pos, key_pos):
+        return self.forward_post(query, key, value, query_pos, key_pos)
+    
+
+
+class TransformerFlowLayerSelect(nn.Module):
+
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.0,
+                 activation="relu", normalize_before=False):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.cross_attn = AttentionSelect(dim=d_model, heads=nhead, dropout=dropout)
+        # Implementation of Feedforward model
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+
+        self.activation = nn.GELU()
+        self.normalize_before = normalize_before
+
+    def with_pos_embed(self, tensor, pos: Optional[Tensor]):
+        return tensor if pos is None else tensor + pos
+
+    def forward_post(self, myself, context, myself_pos, context_pos):
+        q = k = self.with_pos_embed(myself, myself_pos)
+        tgt2 = self.self_attn(q, k, value=myself)[0]
+        myself = myself + self.dropout1(tgt2)
+        myself = self.norm1(myself)
+
+        tgt2 = self.cross_attn(query=myself, key=context, value=context)
+        myself = myself + self.dropout2(tgt2)
+        myself = self.norm2(myself)
+
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(myself))))
+        myself = myself + self.dropout3(tgt2)
+        myself = self.norm3(myself)
+        return myself
+
+    def forward(self, query, key, query_pos, key_pos):
+        return self.forward_post(query, key, query_pos, key_pos)
+    
+
+
+
+class TransformerFlowLayerTopK(nn.Module):
+
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.0,
+                 activation="relu", normalize_before=False):
+        super().__init__()
+        self.self_attn = TopKAttention(inp=d_model, oup=d_model, heads=nhead)
+        self.cross_attn = TopKAttention(inp=d_model, oup=d_model, heads=nhead)
+        # Implementation of Feedforward model
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+
+        self.activation = nn.GELU()
+        self.normalize_before = normalize_before
+
+    def with_pos_embed(self, tensor, pos: Optional[Tensor]):
+        return tensor if pos is None else tensor + pos
+
+    def forward_post(self, myself, context, myself_pos, context_pos):
+        q = k = self.with_pos_embed(myself, myself_pos)
+        tgt2 = self.self_attn(q, k, value=myself)[0]
+        myself = myself + self.dropout1(tgt2)
+        myself = self.norm1(myself)
+
+        tgt2 = self.cross_attn(query=self.with_pos_embed(myself, myself_pos), key=self.with_pos_embed(context, context_pos), value=context)
+        myself = myself + self.dropout2(tgt2)
+        myself = self.norm2(myself)
+
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(myself))))
+        myself = myself + self.dropout3(tgt2)
+        myself = self.norm3(myself)
+        return myself
+
+    def forward(self, query, key, query_pos, key_pos):
+        return self.forward_post(query, key, query_pos, key_pos)
+    
+
+
+
+class LSSTransformer(nn.Module):
+
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.0,
+                 activation="relu", normalize_before=False):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.cross_attn_short = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.cross_attn_long = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        # Implementation of Feedforward model
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+
+        self.activation = nn.GELU()
+        self.normalize_before = normalize_before
+
+    def with_pos_embed(self, tensor, pos: Optional[Tensor]):
+        return tensor if pos is None else tensor + pos
+
+    def forward_post(self, myself, context_short, context_long, myself_pos, context_pos):
+        q = k = self.with_pos_embed(myself, myself_pos)
+        tgt = self.self_attn(q, k, value=myself)[0]
+        tgt = myself + self.dropout1(tgt)
+        myself = self.norm1(tgt)
+
+        tgt2, weights = self.cross_attn_short(query=self.with_pos_embed(myself, myself_pos), key=self.with_pos_embed(context_short, context_pos), value=context_short)
+        tgt3, weights = self.cross_attn_long(query=self.with_pos_embed(myself, myself_pos), key=self.with_pos_embed(context_long, context_pos), value=context_long)
+        myself = tgt + tgt2 + tgt3
+        myself = self.norm2(myself)
+
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(myself))))
+        myself = myself + self.dropout3(tgt2)
+        myself = self.norm3(myself)
         return myself, weights
+
+    def forward(self, query, key, query_pos, key_pos):
+        return self.forward_post(query, key, query_pos, key_pos)
+    
+
+
+class TransformerCell(nn.Module):
+
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.0,
+                 activation="relu", normalize_before=False):
+        super().__init__()
+        self.cross_attn_1 = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.cross_attn_2 = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.cross_attn_3 = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        # Implementation of Feedforward model
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+
+        self.activation = nn.GELU()
+        self.normalize_before = normalize_before
+
+        self.tanh = nn.Tanh()
+        self.sigmoid = nn.Sigmoid()
+        self.dropout3 = nn.Dropout(dropout)
+        self.norm3 = nn.LayerNorm(d_model)
+
+    def with_pos_embed(self, tensor, pos: Optional[Tensor]):
+        return tensor if pos is None else tensor + pos
+
+    def forward_post(self, myself, context, myself_pos, context_pos):
+        #q = k = self.with_pos_embed(myself, myself_pos)
+        #tgt2 = self.self_attn(q, k, value=myself)[0]
+        #myself = myself + self.dropout1(tgt2)
+        #myself = self.norm1(myself)
+
+        zt, weights = self.cross_attn_1(query=self.with_pos_embed(myself, myself_pos), key=self.with_pos_embed(context, context_pos), value=context)
+        zt = self.sigmoid(zt)
+
+        rt, weights = self.cross_attn_2(query=self.with_pos_embed(context, context_pos), key=self.with_pos_embed(myself, myself_pos), value=myself)
+        rt = self.sigmoid(rt)
+
+        ht, weights = self.cross_attn_3(query=self.with_pos_embed(myself, myself_pos), key=self.with_pos_embed(context * rt, context_pos), value=context)
+        ht = self.tanh(ht)
+
+        h_next = (1 - zt) * context + zt * ht
+
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(h_next))))
+        h_next = h_next + self.dropout3(tgt2)
+        h_next = self.norm3(h_next)
+        return h_next
 
     def forward(self, query, key, query_pos, key_pos):
         return self.forward_post(query, key, query_pos, key_pos)
@@ -2352,8 +2583,8 @@ class TransformerFlowSegEncoderMutualSimple(nn.Module):
     def __init__(self, dim, nhead, num_layers):
         super().__init__()
         self.num_layers = num_layers
-        bilateral_attention_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
 
+        bilateral_attention_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
         self.bilateral_attention_layers = _get_clones(bilateral_attention_layer, num_layers)
 
         self.pos_obj_2d = PositionEmbeddingSine2d(num_pos_feats=dim // 2, normalize=True)
@@ -2449,6 +2680,1414 @@ class TransformerFlowSegEncoderAggregation(nn.Module):
 
         forward = forward.permute(0, 1, 3, 2).contiguous()
         forward = forward.view(T, B, C, H, W)
+
+        return forward, global_motion_forward
+
+
+
+class TransformerFlowEncoderFromStart(nn.Module):
+    def __init__(self, dim, nhead, num_layers):
+        super().__init__()
+        self.num_layers = num_layers
+
+        bilateral_attention_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
+        self.bilateral_attention_layers = _get_clones(bilateral_attention_layer, num_layers)
+
+        decoder_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
+        self.decoder_layers = _get_clones(decoder_layer, num_layers)
+
+        self.pos_obj_2d = PositionEmbeddingSine2d(num_pos_feats=dim // 2, normalize=True)
+
+        proj1 = nn.Linear(dim, dim)
+        self.proj1 = _get_clones(proj1, num_layers)
+        proj2 = nn.Linear(dim, dim)
+        self.proj2 = _get_clones(proj2, num_layers)
+    
+    
+    def forward(self, unlabeled, dist_emb):
+        '''unlabeled: T, B, C, H, W
+        dist_emb: B, T-1, C'''
+        
+        shape = unlabeled.shape
+        T, B, C, H, W = shape
+
+        dist_emb = dist_emb.permute(1, 0, 2).contiguous()
+        dist_emb = dist_emb.view((T-1) * B, C)
+        dist_emb = dist_emb[:, None, :].repeat(1, H * W, 1) # (T-1) * B, H * W, C
+
+        unlabeled = unlabeled.permute(0, 1, 3, 4, 2).contiguous() # T, B, H, W, C
+        unlabeled = unlabeled.view(T, B, H * W, C)
+
+        pos_2d = self.pos_obj_2d(shape_util=(B, H, W), device=unlabeled.device)
+        pos_2d = pos_2d.permute(0, 2, 3, 1).contiguous()
+        pos_2d = pos_2d.view(B, H * W, C)
+        pos_2d = pos_2d[None].repeat(T - 1, 1, 1, 1)
+        pos_2d = pos_2d.view((T-1) * B, H * W, C)
+
+        backward = unlabeled[0][None].repeat(len(unlabeled) - 1, 1, 1, 1)
+        forward = unlabeled[1:]
+
+        backward = backward.view((T-1) * B, H * W, C)
+        forward = forward.view((T-1) * B, H * W, C)
+
+        for l in range(self.num_layers):
+            dist_emb = self.proj1[l](dist_emb)
+            concat0 = torch.cat([forward, backward], dim=0)
+            concat1 = torch.cat([backward, forward], dim=0)
+            pos = torch.cat([pos_2d + dist_emb, pos_2d + dist_emb], dim=0)
+            concat0 = self.bilateral_attention_layers[l](query=concat0, key=concat1, query_pos=pos, key_pos=pos)[0]
+            forward, backward = torch.chunk(concat0, chunks=2, dim=0)
+
+            forward = forward.view(T - 1, B, H * W, C)
+            pos_2d = pos_2d.view(T - 1, B, H * W, C)
+            dist_emb = dist_emb.view(T - 1, B, H * W, C)
+
+            dist_emb = self.proj2[l](dist_emb)
+
+            key_list = [forward[0]]
+            for i in range(1, len(forward)):
+                query_pos = pos_2d[i] + dist_emb[i]
+                key_pos = pos_2d[i-1] + dist_emb[i-1]
+                attn_out = self.decoder_layers[l](query=forward[i], key=key_list[i - 1], query_pos=query_pos, key_pos=key_pos)[0]
+                key_list.append(attn_out)
+            forward = torch.stack(key_list, dim=0)
+
+            forward = forward.permute(0, 1, 3, 2).contiguous()
+            forward = forward.view(T - 1, B, C, H, W)
+
+        return forward
+
+
+
+
+class TransformerFlowEncoderLocalGlobal(nn.Module):
+    def __init__(self, dim, nhead, num_layers):
+        super().__init__()
+        self.num_layers = num_layers
+
+        bilateral_attention_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
+        self.bilateral_attention_layers = _get_clones(bilateral_attention_layer, num_layers)
+
+        decoder_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
+        self.decoder_layers = _get_clones(decoder_layer, num_layers)
+
+        self.pos_obj_2d = PositionEmbeddingSine2d(num_pos_feats=dim // 2, normalize=True)
+
+        proj2 = nn.Linear(dim, dim)
+        self.proj2 = _get_clones(proj2, num_layers)
+    
+    
+    def forward(self, unlabeled, dist_emb):
+        '''unlabeled: T, B, C, H, W
+        dist_emb: B, T-1, C'''
+        
+        shape = unlabeled.shape
+        T, B, C, H, W = shape
+
+        dist_emb = dist_emb.permute(1, 0, 2).contiguous()
+        dist_emb = dist_emb.view((T-1) * B, C)
+        dist_emb = dist_emb[:, None, :].repeat(1, H * W, 1) # (T-1) * B, H * W, C
+
+        unlabeled = unlabeled.permute(0, 1, 3, 4, 2).contiguous() # T, B, H, W, C
+        unlabeled = unlabeled.view(T, B, H * W, C)
+
+        pos_2d = self.pos_obj_2d(shape_util=(B, H, W), device=unlabeled.device)
+        pos_2d = pos_2d.permute(0, 2, 3, 1).contiguous()
+        pos_2d = pos_2d.view(B, H * W, C)
+        pos_2d = pos_2d[None].repeat(T - 1, 1, 1, 1)
+        pos_2d = pos_2d.view((T-1) * B, H * W, C)
+
+        local_backward = unlabeled[:-1]
+        local_forward = unlabeled[1:]
+
+        for l in range(self.num_layers):
+
+            local_backward = local_backward.view((T-1) * B, H * W, C)
+            local_forward = local_forward.view((T-1) * B, H * W, C) 
+
+            concat0 = torch.cat([local_forward, local_backward], dim=0)
+            concat1 = torch.cat([local_backward, local_forward], dim=0)
+            pos = torch.cat([pos_2d, pos_2d], dim=0)
+            concat0 = self.bilateral_attention_layers[l](query=concat0, key=concat1, query_pos=pos, key_pos=pos)[0]
+            local_forward, local_backward = torch.chunk(concat0, chunks=2, dim=0)
+
+            local_forward = local_forward.view(T - 1, B, H * W, C)
+            local_backward = local_backward.view(T - 1, B, H * W, C)
+        
+        pos_2d = pos_2d.view(T - 1, B, H * W, C)
+        dist_emb = dist_emb.view(T - 1, B, H * W, C)
+        global_forward = local_forward
+        
+        for l in range(self.num_layers):
+
+            dist_emb = self.proj2[l](dist_emb)
+
+            key_list = [global_forward[0]]
+            for i in range(1, len(global_forward)):
+                query_pos = pos_2d[i] + dist_emb[i]
+                key_pos = pos_2d[i] + dist_emb[i]
+                attn_out = self.decoder_layers[l](query=global_forward[i], key=key_list[i - 1], query_pos=query_pos, key_pos=key_pos)[0]
+                key_list.append(attn_out)
+            global_forward = torch.stack(key_list, dim=0)
+
+        local_forward = local_forward.permute(0, 1, 3, 2).contiguous()
+        local_forward = local_forward.view(T - 1, B, C, H, W)
+
+        global_forward = global_forward.permute(0, 1, 3, 2).contiguous()
+        global_forward = global_forward.view(T - 1, B, C, H, W)
+
+        return local_forward, global_forward
+    
+
+
+
+class TransformerFlowEncoderSuccessive2All(nn.Module):
+    def __init__(self, dim, nhead, num_layers):
+        super().__init__()
+        self.num_layers = num_layers
+
+        decoder_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
+        self.decoder_layers = _get_clones(decoder_layer, num_layers)
+
+        self.pos_obj_2d = PositionEmbeddingSine2d(num_pos_feats=dim // 2, normalize=True)
+
+        proj2 = nn.Linear(dim, dim)
+        self.proj2 = _get_clones(proj2, num_layers)
+    
+    
+    def forward(self, unlabeled, dist_emb):
+        '''unlabeled: T, B, C, H, W
+        dist_emb: B, T, C'''
+        
+        shape = unlabeled.shape
+        T, B, C, H, W = shape
+
+        dist_emb = dist_emb.permute(1, 0, 2).contiguous()
+        dist_emb = dist_emb[:, :, None, :].repeat(1, 1, H * W, 1) # T, B, H * W, C
+
+        unlabeled = unlabeled.permute(0, 1, 3, 4, 2).contiguous() # T, B, H, W, C
+        unlabeled = unlabeled.view(T, B, H * W, C)
+
+        pos_2d = self.pos_obj_2d(shape_util=(B, H, W), device=unlabeled.device)
+        pos_2d = pos_2d.permute(0, 2, 3, 1).contiguous()
+        pos_2d = pos_2d.view(B, H * W, C)
+        pos_2d = pos_2d[None].repeat(T, 1, 1, 1)
+
+        for l in range(self.num_layers):
+
+            dist_emb = self.proj2[l](dist_emb)
+
+            key = unlabeled.permute(1, 0, 2, 3).contiguous() # B, T, H*W, C
+            key = key.view(B, T * H * W, C)
+            key = key[None, :, :, :].repeat(T, 1, 1, 1)
+            key = key.view(T * B, T * H * W, C)
+
+            key_pos_2d = pos_2d.permute(1, 0, 2, 3).contiguous()
+            key_pos_2d = key_pos_2d.view(B, T * H * W, C)
+            key_pos_2d = key_pos_2d[None, :, :, :].repeat(T, 1, 1, 1)
+            key_pos_2d = key_pos_2d.view(T * B, T * H * W, C)
+
+            key_pos_1d = dist_emb.permute(1, 0, 2, 3).contiguous()
+            key_pos_1d = key_pos_1d.view(B, T * H * W, C)
+            key_pos_1d = key_pos_1d[None, :, :, :].repeat(T, 1, 1, 1)
+            key_pos_1d = key_pos_1d.view(T * B, T * H * W, C)
+
+            query_pos = pos_2d + dist_emb
+            key_pos = key_pos_2d + key_pos_1d
+            query_pos = query_pos.view(T * B, H * W, C)
+
+            unlabeled = unlabeled.view(T * B, H * W, C)
+
+            unlabeled, weights = self.decoder_layers[l](query=unlabeled,
+                                                    key=key, 
+                                                    query_pos=query_pos,
+                                                    key_pos=key_pos)
+            
+            unlabeled = unlabeled.view(T, B, H * W, C)
+        
+        weights = weights.view(T, B, H * W, T * H * W).mean(2) # T, B, T * H * W
+        weights = weights.permute(2, 0, 1).contiguous()
+        weights = weights.view(T, H * W, T, B).mean(1)
+        weights = weights.mean(2).permute(1, 0).contiguous()
+
+        unlabeled = unlabeled.permute(0, 1, 3, 2).contiguous()
+        unlabeled = unlabeled.view(T, B, C, H, W)
+
+        return unlabeled, weights
+    
+
+
+
+
+class TransformerFlowEncoderSuccessive2Iterative(nn.Module):
+    def __init__(self, dim, nhead, num_layers):
+        super().__init__()
+        self.num_layers = num_layers
+
+        decoder_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
+        self.decoder_layers = _get_clones(decoder_layer, num_layers)
+
+        self.pos_obj_2d = PositionEmbeddingSine2d(num_pos_feats=dim // 2, normalize=True)
+
+        proj2 = nn.Linear(dim, dim)
+        self.proj2 = _get_clones(proj2, num_layers)
+    
+    
+    def forward(self, unlabeled, dist_emb):
+        '''unlabeled: T, B, C, H, W
+        dist_emb: B, T, C'''
+        
+        shape = unlabeled.shape
+        T, B, C, H, W = shape
+
+        dist_emb = dist_emb.permute(1, 0, 2).contiguous()
+        dist_emb = dist_emb[:, :, None, :].repeat(1, 1, H * W, 1) # T, B, H * W, C
+
+        unlabeled = unlabeled.permute(0, 1, 3, 4, 2).contiguous() # T, B, H, W, C
+        unlabeled = unlabeled.view(T, B, H * W, C)
+
+        pos_2d = self.pos_obj_2d(shape_util=(B, H, W), device=unlabeled.device)
+        pos_2d = pos_2d.permute(0, 2, 3, 1).contiguous()
+        pos_2d = pos_2d.view(B, H * W, C)
+        pos_2d = pos_2d[None].repeat(T, 1, 1, 1)
+        
+        for l in range(self.num_layers):
+
+            dist_emb = self.proj2[l](dist_emb)
+
+            key_list = [unlabeled[0]]
+            for i in range(1, len(unlabeled)):
+                query_pos = pos_2d[i] + dist_emb[i]
+                key_pos = pos_2d[i] + dist_emb[i]
+                attn_out = self.decoder_layers[l](query=unlabeled[i], key=key_list[i - 1], query_pos=query_pos, key_pos=key_pos)[0]
+                key_list.append(attn_out)
+            unlabeled = torch.stack(key_list, dim=0)
+
+        unlabeled = unlabeled.permute(0, 1, 3, 2).contiguous()
+        unlabeled = unlabeled.view(T, B, C, H, W)
+
+        return unlabeled
+    
+
+
+
+class TransformerFlowEncoderSuccessive(nn.Module):
+    def __init__(self, dim, nhead, num_layers):
+        super().__init__()
+        self.num_layers = num_layers
+
+        bilateral_attention_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
+        self.bilateral_attention_layers = _get_clones(bilateral_attention_layer, num_layers)
+
+        self.pos_obj_2d = PositionEmbeddingSine2d(num_pos_feats=dim // 2, normalize=True)
+
+        self.mlp = MLP(input_dim=dim, hidden_dim=2048, output_dim=dim, num_layers=2)
+    
+    
+    def forward(self, unlabeled, embedding):
+        '''unlabeled: T, B, C, H, W
+        embedding: 1 * B, H * W, C'''
+        
+        shape = unlabeled.shape
+        T, B, C, H, W = shape
+
+        unlabeled = unlabeled.permute(0, 1, 3, 4, 2).contiguous() # T, B, H, W, C
+        unlabeled = unlabeled.view(T, B, H * W, C)
+
+        pos_2d = self.pos_obj_2d(shape_util=(B, H, W), device=unlabeled.device)
+        pos_2d = pos_2d.permute(0, 2, 3, 1).contiguous()
+        pos_2d = pos_2d.view(B, H * W, C)
+        pos_2d = pos_2d[None].repeat(T - 1, 1, 1, 1)
+        pos_2d = pos_2d.view((T-1) * B, H * W, C)
+
+        local_backward = unlabeled[:-1]
+        local_forward = unlabeled[1:]
+
+        local_backward = local_backward.view((T-1) * B, H * W, C)
+        local_forward = local_forward.view((T-1) * B, H * W, C) 
+
+        for l in range(self.num_layers):
+
+            concat0 = torch.cat([local_forward, local_backward], dim=0)
+            concat1 = torch.cat([local_backward, local_forward], dim=0)
+            pos0 = torch.cat([pos_2d + embedding, pos_2d + embedding], dim=0)
+            pos1 = torch.cat([pos_2d + embedding, pos_2d + embedding], dim=0)
+            concat0 = self.bilateral_attention_layers[l](query=concat0, key=concat1, query_pos=pos0, key_pos=pos1)[0]
+            local_forward, local_backward = torch.chunk(concat0, chunks=2, dim=0)
+        
+        embedding = self.mlp(local_forward)
+
+        local_forward = local_forward.view(T - 1, B, H * W, C)
+        local_forward = local_forward.permute(0, 1, 3, 2).contiguous()
+        local_forward = local_forward.view(T - 1, B, C, H, W)
+
+        return local_forward, embedding
+    
+
+
+
+class TransformerFlowEncoderSuccessiveNoEmb(nn.Module):
+    def __init__(self, dim, nhead, num_layers):
+        super().__init__()
+        self.num_layers = num_layers
+
+        bilateral_attention_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
+        self.bilateral_attention_layers = _get_clones(bilateral_attention_layer, num_layers)
+
+        self.pos_obj_2d = PositionEmbeddingSine2d(num_pos_feats=dim // 2, normalize=True)
+    
+    
+    def forward(self, unlabeled):
+        '''unlabeled: T, B, C, H, W'''
+        
+        shape = unlabeled.shape
+        T, B, C, H, W = shape
+
+        unlabeled = unlabeled.permute(0, 1, 3, 4, 2).contiguous() # T, B, H, W, C
+        unlabeled = unlabeled.view(T, B, H * W, C)
+
+        pos_2d = self.pos_obj_2d(shape_util=(B, H, W), device=unlabeled.device)
+        pos_2d = pos_2d.permute(0, 2, 3, 1).contiguous()
+        pos_2d = pos_2d.view(B, H * W, C)
+        pos_2d = pos_2d[None].repeat(T - 1, 1, 1, 1)
+        pos_2d = pos_2d.view((T-1) * B, H * W, C)
+
+        local_backward = unlabeled[:-1]
+        local_forward = unlabeled[1:]
+
+        local_backward = local_backward.view((T-1) * B, H * W, C)
+        local_forward = local_forward.view((T-1) * B, H * W, C) 
+        
+        for l in range(self.num_layers):
+
+            concat0 = torch.cat([local_forward, local_backward], dim=0)
+            concat1 = torch.cat([local_backward, local_forward], dim=0)
+            pos = torch.cat([pos_2d, pos_2d], dim=0)
+            concat0 = self.bilateral_attention_layers[l](query=concat0, key=concat1, query_pos=pos, key_pos=pos)
+            local_forward, local_backward = torch.chunk(concat0, chunks=2, dim=0)
+
+        local_forward = local_forward.view(T - 1, B, H * W, C)
+        local_forward = local_forward.permute(0, 1, 3, 2).contiguous()
+        local_forward = local_forward.view(T - 1, B, C, H, W)
+
+        return local_forward
+
+
+
+class TransformerContext(nn.Module):
+    def __init__(self, dim, nhead, num_layers):
+        super().__init__()
+        self.num_layers = num_layers
+
+        bilateral_attention_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
+        self.bilateral_attention_layers = _get_clones(bilateral_attention_layer, num_layers)
+
+        self.pos_obj_2d = PositionEmbeddingSine2d(num_pos_feats=dim // 2, normalize=True)
+    
+    
+    def forward(self, x1, x2):
+        '''x1: B, C, H, W'''
+        
+        shape = x1.shape
+        B, C, H, W = shape
+
+        x1 = x1.permute(0, 2, 3, 1).contiguous() # B, H, W, C
+        x1 = x1.view(B, H * W, C)
+
+        x2 = x2.permute(0, 2, 3, 1).contiguous() # B, H, W, C
+        x2 = x2.view(B, H * W, C)
+
+        pos_2d = self.pos_obj_2d(shape_util=(B, H, W), device=x1.device)
+        pos_2d = pos_2d.permute(0, 2, 3, 1).contiguous()
+        pos_2d = pos_2d.view(B, H * W, C)
+        
+        for l in range(self.num_layers):
+
+            concat0 = torch.cat([x1, x2], dim=0)
+            concat1 = torch.cat([x2, x1], dim=0)
+            pos = torch.cat([pos_2d, pos_2d], dim=0)
+            concat0 = self.bilateral_attention_layers[l](query=concat0, key=concat1, query_pos=pos, key_pos=pos)
+            x1, x2 = torch.chunk(concat0, chunks=2, dim=0)
+
+        x1 = x1.permute(0, 1, 2).contiguous()
+        x1 = x1.view(B, C, H, W)
+
+        return x1
+    
+
+
+class TopKAttention(nn.Module):
+    def __init__(self, inp, oup, topk, heads, dim_head=64, dropout=0.):
+        super().__init__()
+        self.topk = topk
+        inner_dim = dim_head * heads
+        project_out = not (heads == 1 and dim_head == inp)
+
+        self.heads = heads
+        self.scale = dim_head ** -0.5
+
+        self.attend = nn.Softmax(dim=-1)
+        self.to_q = nn.Linear(inp, inner_dim, bias=False)
+        self.to_k = nn.Linear(inp, inner_dim, bias=False)
+        self.to_v = nn.Linear(inp, inner_dim, bias=False)
+
+        self.to_out = nn.Sequential(
+            nn.Linear(inner_dim, oup),
+            nn.Dropout(dropout)
+        ) if project_out else nn.Identity()
+
+    def forward(self, query, key, value):
+        q = self.to_q(query)
+        k = self.to_k(key)
+        v = self.to_v(value)
+        qkv = [q, k, v]
+        q, k, v = map(lambda t: rearrange(
+            t, 'b n (h d) -> b h n d', h=self.heads), qkv)
+
+        dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+
+        values, indices = torch.topk(dots, k=self.topk, dim=-1)
+
+        values = self.attend(values)
+        dots.zero_().scatter_(-1, indices, values) # B * h * HW * HWT
+
+        #matplotlib.use('QtAgg')
+        #fig, ax = plt.subplots(1, 1)
+        #ax.imshow(dots[0].mean(0).detach().cpu(), cmap='plasma')
+        #plt.show()
+
+        out = torch.matmul(dots, v)
+        out = rearrange(out, 'b h n d -> b n (h d)')
+        out = self.to_out(out)
+        return out, dots.mean(1)
+    
+
+
+
+class MemoryReader(nn.Module):
+    def __init__(self, topk=None):
+        super().__init__()
+        self.topk = topk
+ 
+    def get_affinity(self, mk, qk):
+        B, head, HWT, hidden_dim = mk.shape
+
+        # See supplementary material
+        a_sq = mk.pow(2).sum(-1).unsqueeze(-1)
+        ab = mk @ qk.transpose(2, 3)
+
+        affinity = (2*ab-a_sq) / math.sqrt(hidden_dim)   # B, THW, HW
+
+        if self.topk is not None:
+            values, indices = torch.topk(affinity, k=self.topk, dim=2)
+
+            # softmax operation; aligned the evaluation style
+            maxes = torch.max(values, dim=2, keepdim=True)[0]
+            x_exp = torch.exp(values - maxes)
+            x_exp_sum = torch.sum(x_exp, dim=2, keepdim=True)
+            values = x_exp / x_exp_sum 
+
+            affinity.zero_().scatter_(2, indices, values) # B * h * HW * HWT
+        else:
+            # softmax operation; aligned the evaluation style
+            maxes = torch.max(affinity, dim=2, keepdim=True)[0]
+            x_exp = torch.exp(affinity - maxes)
+            x_exp_sum = torch.sum(x_exp, dim=2, keepdim=True)
+            affinity = x_exp / x_exp_sum 
+
+        return affinity
+
+    def readout(self, affinity, mv, qv):
+        B, CV, T, H, W = mv.shape
+
+        mo = mv.view(B, CV, T*H*W) 
+        mem = torch.bmm(mo, affinity) # Weighted-sum B, CV, HW
+        mem = mem.view(B, CV, H, W)
+
+        mem_out = torch.cat([mem, qv], dim=1)
+
+        return mem_out
+    
+
+
+class L2Attention(nn.Module):
+    def __init__(self, dim, topk=None, dropout=0.):
+        super().__init__()
+
+        self.memory = MemoryReader(topk)
+
+        self.heads = 8
+
+        self.to_q = nn.Linear(dim, dim)
+        self.to_k = nn.Linear(dim, dim)
+        self.to_v = nn.Linear(dim, dim)
+
+        self.to_out = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, query, key, value):
+        q = self.to_q(query)
+        k = self.to_k(key)
+        v = self.to_v(value)
+        qkv = [q, k, v]
+        q, k, v = map(lambda t: rearrange(
+            t, 'b n (h d) -> b h n d', h=self.heads), qkv)
+
+        affinity = self.memory.get_affinity(k, q) # B, head, THW, HW
+
+        #matplotlib.use('QtAgg')
+        #fig, ax = plt.subplots(1, 1)
+        #ax.imshow(dots[0].mean(0).detach().cpu(), cmap='plasma')
+        #plt.show()
+
+        out = torch.matmul(affinity.transpose(3, 2), v)
+        out = rearrange(out, 'b h n d -> b n (h d)')
+        out = self.to_out(out)
+        return out, affinity.mean(1)
+    
+
+
+class AttentionSelect(nn.Module):
+    def __init__(self, dim, heads=8, dropout=0.):
+        super().__init__()
+
+        self.pos_obj_2d = PositionEmbeddingSine2d(num_pos_feats=dim // 2, normalize=True)
+        self.pos_obj_1d = PositionEmbeddingSine1d(num_pos_feats=dim, normalize=True)
+
+        self.heads = heads
+
+        self.to_q = nn.Conv2d(dim, dim, kernel_size=1)
+        self.to_k = nn.Conv2d(dim, dim, kernel_size=1)
+        self.to_v = nn.Conv2d(dim, dim, kernel_size=1)
+
+        self.to_out = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.Dropout(dropout)
+        )
+
+    def select_windows(self, x):
+        T, B, C, H, W = x.shape
+
+        window_size_list = [val for val in range(5, 100, 2) for _ in range(2 * val)]
+        window_size_list = window_size_list[:len(x)]
+        data_list = []
+        for t in range(len(x)):
+            window_size = window_size_list[t]
+            pad_value = window_size // 2
+            current_x = torch.nn.functional.pad(x[t], pad=(pad_value, pad_value, pad_value, pad_value))
+            current_windows = current_x.unfold(2, window_size, 1).unfold(3, window_size, 1)
+            current_windows = current_windows.permute(0, 1, 4, 5, 2, 3).contiguous()
+            current_windows = current_windows.view(B, C, window_size * window_size, H * W)
+            data_list.append(current_windows)
+
+        out = torch.cat(data_list, dim=2)
+        return out
+
+    def forward(self, query, key, value):
+        T, B, C, H, W = key.shape
+
+        dim_head = C // self.heads
+
+        key = key.view(T * B, C, H, W)
+        value = value.view(T * B, C, H, W)
+
+        q = self.to_q(query)
+        k = self.to_k(key)
+        v = self.to_v(value)
+
+        k = k.view(T, B, C, H, W)
+        v = v.view(T, B, C, H, W)
+
+        # Scale
+        q = q / (dim_head**0.5)
+
+        pos_1d = self.pos_obj_1d(shape_util=(B, T), device=q.device)
+        pos_1d = pos_1d[:, :, :, None, None].repeat(1, 1, 1, H, W)
+        pos_1d = pos_1d.permute(2, 0, 1, 3, 4).contiguous()
+
+        pos_2d = self.pos_obj_2d(shape_util=(B, H, W), device=q.device)
+        pos_2d_key = pos_2d[None].repeat(T, 1, 1, 1, 1)
+
+        #pos_2d_key = pos_2d_key
+        pos_2d_key = pos_2d_key + pos_1d
+
+        q = q + pos_2d
+        k = k + pos_2d_key
+
+        k = self.select_windows(k) # B, C, w*w, H * W
+        v = self.select_windows(v) # B, C, w*w, H * W
+        ww = k.shape[2]
+
+        q = q.view(B, self.heads, dim_head, H * W)
+        q = q.view(B * self.heads, dim_head, H * W)
+
+        k = k.view(B, self.heads, dim_head, ww, H * W)
+        k = k.view(B * self.heads, dim_head, ww, H * W)
+
+        v = v.view(B, self.heads, dim_head, ww, H * W)
+
+        qk = (q.unsqueeze(2) * k).sum(dim=1) #B*h, w*w, H*W
+        qk = qk.view(B, self.heads, ww, H * W)
+
+        attn = torch.softmax(qk, dim=2)
+
+        out = (attn.unsqueeze(2) * v).sum(dim=3) # B, h, dim_head, H*W
+        out = out.view(B, C, H * W)
+        out = out.permute(0, 2, 1).contiguous()
+
+        out = self.to_out(out)
+        return out
+    
+
+
+class SpatioTemporalTransformer(nn.Module):
+    def __init__(self, dim, nhead, num_layers, topk, pos_1d):
+        super().__init__()
+        self.num_layers = num_layers
+        self.pos_1d = pos_1d
+        self.topk = topk
+        self.dim = dim
+
+        if topk:
+            bilateral_attention_layer = TransformerFlowLayerTopK(d_model=dim, nhead=nhead)
+        else:
+            bilateral_attention_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
+
+        self.bilateral_attention_layers = _get_clones(bilateral_attention_layer, num_layers)
+
+        self.pos_obj_2d = PositionEmbeddingSine2d(num_pos_feats=dim // 2, normalize=True)
+
+        if pos_1d:
+            self.pos_obj_1d = PositionEmbeddingSine1d(num_pos_feats=dim, normalize=True)
+    
+    
+    def forward(self, x1, x2):
+        '''x1: B, C, H, W,
+        x2: T, B, C, H, W'''
+        
+        T, B, C, H, W = x2.shape
+
+        if self.pos_1d:
+            pos_1d = self.pos_obj_1d(shape_util=(B, T), device=x1.device)
+
+            #matplotlib.use('QtAgg')
+            #fig, ax = plt.subplots(1, 1)
+            #cos = torch.nn.CosineSimilarity(dim=1)
+            #out_cos = cos(pos_1d.permute(2, 1, 0), pos_1d)
+            #ax.imshow(out_cos.cpu())
+            #plt.show()
+
+            pos_1d = pos_1d[:, :, :, None, None].repeat(1, 1, 1, H, W)
+            pos_1d = pos_1d.view(B, C, T * H * W)
+            pos_1d = pos_1d.permute(0, 2, 1).contiguous()
+        else:
+            pos_1d = torch.zeros(size=(B, T * H * W, C), device=x1.device)
+
+        x1 = x1.permute(0, 2, 3, 1).contiguous() # B, H, W, C
+        x1 = x1.view(B, H * W, C)
+
+        x2 = x2.permute(0, 3, 4, 1, 2).contiguous()
+        x2 = x2.view(T * H * W, B, C)
+        x2 = x2.permute(1, 0, 2).contiguous() # B, T * H * W, C
+
+        pos_2d = self.pos_obj_2d(shape_util=(B, H, W), device=x1.device)
+        pos_2d = pos_2d.permute(0, 2, 3, 1).contiguous()
+        pos_2d = pos_2d.view(B, H * W, C)
+
+        pos_2d_key = pos_2d[:, None, :, :].repeat(1, T, 1, 1)
+        pos_2d_key = pos_2d_key.view(B, T * H * W, C)
+
+        #pos_2d_key = pos_2d_key
+        pos_2d_key = pos_2d_key + pos_1d
+        
+        for l in range(self.num_layers):
+            x1 = self.bilateral_attention_layers[l](query=x1, key=x2, query_pos=pos_2d, key_pos=pos_2d_key)
+
+        x1 = x1.permute(0, 1, 2).contiguous()
+        x1 = x1.view(B, C, H, W)
+
+        return x1
+    
+
+
+
+class SpatioTemporalTransformerSeparated(nn.Module):
+    def __init__(self, dim, nhead, num_layers, topk, pos_1d, distance):
+        super().__init__()
+        self.num_layers = num_layers
+        self.pos_1d = pos_1d
+        self.topk = topk
+        self.dim = dim
+
+        bilateral_attention_layer = TransformerFlowLayerSeparated(d_model=dim, nhead=nhead, distance=distance, topk=topk)
+
+        self.bilateral_attention_layers = _get_clones(bilateral_attention_layer, num_layers)
+
+        self.pos_obj_2d = PositionEmbeddingSine2d(num_pos_feats=dim // 2, normalize=True)
+
+        if pos_1d:
+            self.pos_obj_1d = PositionEmbeddingSine1d(num_pos_feats=dim, normalize=True)
+    
+    
+    def forward(self, query, key, value):
+        '''query: B, C, H, W,
+        key: T, B, C, H, W,
+        value: T, B, C, H, W'''
+        
+        T, B, C, H, W = key.shape
+
+        if self.pos_1d:
+            pos_1d = self.pos_obj_1d(shape_util=(B, T), device=query.device)
+
+            #matplotlib.use('QtAgg')
+            #fig, ax = plt.subplots(1, 1)
+            #cos = torch.nn.CosineSimilarity(dim=1)
+            #out_cos = cos(pos_1d.permute(2, 1, 0), pos_1d)
+            #ax.imshow(out_cos.cpu())
+            #plt.show()
+
+            pos_1d = pos_1d[:, :, :, None, None].repeat(1, 1, 1, H, W)
+            pos_1d = pos_1d.view(B, C, T * H * W)
+            pos_1d = pos_1d.permute(0, 2, 1).contiguous()
+        else:
+            pos_1d = torch.zeros(size=(B, T * H * W, C), device=query.device)
+
+        query = query.permute(0, 2, 3, 1).contiguous() # B, H, W, C
+        query = query.view(B, H * W, C)
+
+        key = key.permute(0, 3, 4, 1, 2).contiguous()
+        key = key.view(T * H * W, B, C)
+        key = key.permute(1, 0, 2).contiguous() # B, T * H * W, C
+
+        value = value.permute(0, 3, 4, 1, 2).contiguous()
+        value = value.view(T * H * W, B, C)
+        value = value.permute(1, 0, 2).contiguous() # B, T * H * W, C
+
+        pos_2d = self.pos_obj_2d(shape_util=(B, H, W), device=query.device)
+        pos_2d = pos_2d.permute(0, 2, 3, 1).contiguous()
+        pos_2d = pos_2d.view(B, H * W, C)
+
+        pos_2d_key = pos_2d[:, None, :, :].repeat(1, T, 1, 1)
+        pos_2d_key = pos_2d_key.view(B, T * H * W, C)
+
+        #pos_2d_key = pos_2d_key
+        pos_2d_key = pos_2d_key + pos_1d
+        
+        for l in range(self.num_layers):
+            query = self.bilateral_attention_layers[l](query=query, key=key, value=value, query_pos=pos_2d, key_pos=pos_2d_key)
+
+        query = query.permute(0, 1, 2).contiguous()
+        query = query.view(B, C, H, W)
+
+        return query
+    
+
+
+class TransformerContextEmbedding(nn.Module):
+    def __init__(self, dim, nhead, num_layers):
+        super().__init__()
+        self.num_layers = num_layers
+
+        bilateral_attention_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
+        self.bilateral_attention_layers = _get_clones(bilateral_attention_layer, num_layers)
+
+        self.pos_obj_2d = PositionEmbeddingSine2d(num_pos_feats=dim // 2, normalize=True)
+    
+    
+    def forward(self, x1, x2, embedding):
+        '''unlabeled: B, C, H, W,
+        embedding: B, C'''
+        
+        shape = x1.shape
+        B, C, H, W = shape
+
+        embedding = embedding[:, None, :].repeat(1, H * W, 1)
+
+        x1 = x1.permute(0, 2, 3, 1).contiguous() # B, H, W, C
+        x1 = x1.view(B, H * W, C)
+
+        x2 = x2.permute(0, 2, 3, 1).contiguous() # B, H, W, C
+        x2 = x2.view(B, H * W, C)
+
+        pos_2d = self.pos_obj_2d(shape_util=(B, H, W), device=x1.device)
+        pos_2d = pos_2d.permute(0, 2, 3, 1).contiguous()
+        pos_2d = pos_2d.view(B, H * W, C)
+        
+        for l in range(self.num_layers):
+
+            concat0 = torch.cat([x1, x2], dim=0)
+            concat1 = torch.cat([x2, x1], dim=0)
+            pos = torch.cat([pos_2d + embedding, pos_2d + embedding], dim=0)
+            concat0 = self.bilateral_attention_layers[l](query=concat0, key=concat1, query_pos=pos, key_pos=pos)[0]
+            x1, x2 = torch.chunk(concat0, chunks=2, dim=0)
+
+        x1 = x1.permute(0, 1, 2).contiguous()
+        x1 = x1.view(B, C, H, W)
+
+        return x1
+    
+
+
+class TransformerFlowEncoderLocalGlobalAll(nn.Module):
+    def __init__(self, dim, nhead, num_layers):
+        super().__init__()
+        self.num_layers = num_layers
+
+        bilateral_attention_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
+        self.bilateral_attention_layers = _get_clones(bilateral_attention_layer, num_layers)
+
+        decoder_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
+        self.decoder_layers = _get_clones(decoder_layer, num_layers)
+
+        self.pos_obj_2d = PositionEmbeddingSine2d(num_pos_feats=dim // 2, normalize=True)
+
+        proj2 = nn.Linear(dim, dim)
+        self.proj2 = _get_clones(proj2, num_layers)
+    
+    
+    def forward(self, unlabeled, dist_emb):
+        '''unlabeled: T, B, C, H, W
+        dist_emb: B, T-1, C'''
+        
+        shape = unlabeled.shape
+        T, B, C, H, W = shape
+
+        dist_emb = dist_emb.permute(1, 0, 2).contiguous()
+        dist_emb = dist_emb.view((T-1) * B, C)
+        dist_emb = dist_emb[:, None, :].repeat(1, H * W, 1) # (T-1) * B, H * W, C
+
+        unlabeled = unlabeled.permute(0, 1, 3, 4, 2).contiguous() # T, B, H, W, C
+        unlabeled = unlabeled.view(T, B, H * W, C)
+
+        pos_2d = self.pos_obj_2d(shape_util=(B, H, W), device=unlabeled.device)
+        pos_2d = pos_2d.permute(0, 2, 3, 1).contiguous()
+        pos_2d = pos_2d.view(B, H * W, C)
+        pos_2d = pos_2d[None].repeat(T - 1, 1, 1, 1)
+        pos_2d = pos_2d.view((T-1) * B, H * W, C)
+
+        local_backward = unlabeled[:-1]
+        local_forward = unlabeled[1:]
+
+        for l in range(self.num_layers):
+
+            local_backward = local_backward.view((T-1) * B, H * W, C)
+            local_forward = local_forward.view((T-1) * B, H * W, C) 
+
+            concat0 = torch.cat([local_forward, local_backward], dim=0)
+            concat1 = torch.cat([local_backward, local_forward], dim=0)
+            pos = torch.cat([pos_2d, pos_2d], dim=0)
+            concat0 = self.bilateral_attention_layers[l](query=concat0, key=concat1, query_pos=pos, key_pos=pos)[0]
+            local_forward, local_backward = torch.chunk(concat0, chunks=2, dim=0)
+
+            local_forward = local_forward.view(T - 1, B, H * W, C)
+            local_backward = local_backward.view(T - 1, B, H * W, C)
+        
+        pos_2d = pos_2d.view(T - 1, B, H * W, C)
+        dist_emb = dist_emb.view(T - 1, B, H * W, C)
+        global_forward = local_forward
+
+        T_dim = T - 1
+
+        for l in range(self.num_layers):
+
+            dist_emb = self.proj2[l](dist_emb)
+
+            key = global_forward.permute(1, 0, 2, 3).contiguous()
+            key = key.view(B, T_dim * H * W, C)
+            key = key[None, :, :, :].repeat((T-1), 1, 1, 1)
+            key = key.view((T-1) * B, T_dim * H * W, C)
+
+            key_pos_2d = pos_2d.permute(1, 0, 2, 3).contiguous()
+            key_pos_2d = key_pos_2d.view(B, T_dim * H * W, C)
+            key_pos_2d = key_pos_2d[None, :, :, :].repeat((T-1), 1, 1, 1)
+            key_pos_2d = key_pos_2d.view((T-1) * B, T_dim * H * W, C)
+
+            key_pos_1d = dist_emb.permute(1, 0, 2, 3).contiguous()
+            key_pos_1d = key_pos_1d.view(B, T_dim * H * W, C)
+            key_pos_1d = key_pos_1d[None, :, :, :].repeat((T-1), 1, 1, 1)
+            key_pos_1d = key_pos_1d.view((T-1) * B, T_dim * H * W, C)
+
+            query_pos = pos_2d + dist_emb
+            key_pos = key_pos_2d + key_pos_1d
+            query_pos = query_pos.view((T-1) * B, H * W, C)
+
+            global_forward = global_forward.view((T-1) * B, H * W, C)
+
+            global_forward, weights = self.decoder_layers[l](query=global_forward,
+                                                    key=key, 
+                                                    query_pos=query_pos,
+                                                    key_pos=key_pos)
+            
+            global_forward = global_forward.view((T-1), B, H * W, C)
+        
+        weights = weights.view((T-1), B, H * W, T_dim * H * W).mean(2) # (T-1), B, T_dim * H * W
+        weights = weights.permute(2, 0, 1).contiguous()
+        weights = weights.view(T_dim, H * W, (T-1), B).mean(1)
+        weights = weights.mean(2).permute(1, 0).contiguous()
+
+        local_forward = local_forward.permute(0, 1, 3, 2).contiguous()
+        local_forward = local_forward.view(T - 1, B, C, H, W)
+
+        global_forward = global_forward.permute(0, 1, 3, 2).contiguous()
+        global_forward = global_forward.view(T - 1, B, C, H, W)
+
+        return local_forward, global_forward, weights
+
+
+
+class TransformerFlowEncoderFromStartNoEmb(nn.Module):
+    def __init__(self, dim, nhead, num_layers):
+        super().__init__()
+        self.num_layers = num_layers
+
+        bilateral_attention_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
+        self.bilateral_attention_layers = _get_clones(bilateral_attention_layer, num_layers)
+
+        decoder_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
+        self.decoder_layers = _get_clones(decoder_layer, num_layers)
+
+        self.pos_obj_2d = PositionEmbeddingSine2d(num_pos_feats=dim // 2, normalize=True)
+    
+    
+    def forward(self, unlabeled):
+        '''unlabeled: T, B, C, H, W
+        dist_emb: B, T-1, C'''
+        
+        shape = unlabeled.shape
+        T, B, C, H, W = shape
+
+        unlabeled = unlabeled.permute(0, 1, 3, 4, 2).contiguous() # T, B, H, W, C
+        unlabeled = unlabeled.view(T, B, H * W, C)
+
+        pos_2d = self.pos_obj_2d(shape_util=(B, H, W), device=unlabeled.device)
+        pos_2d = pos_2d.permute(0, 2, 3, 1).contiguous()
+        pos_2d = pos_2d.view(B, H * W, C)
+        pos_2d = pos_2d[None].repeat(T - 1, 1, 1, 1)
+        pos_2d = pos_2d.view((T-1) * B, H * W, C)
+
+        backward = unlabeled[0][None].repeat(len(unlabeled) - 1, 1, 1, 1)
+        forward = unlabeled[1:]
+
+        backward = backward.view((T-1) * B, H * W, C)
+        forward = forward.view((T-1) * B, H * W, C)
+
+        for l in range(self.num_layers):
+            concat0 = torch.cat([forward, backward], dim=0)
+            concat1 = torch.cat([backward, forward], dim=0)
+            pos = torch.cat([pos_2d, pos_2d], dim=0)
+            concat0 = self.bilateral_attention_layers[l](query=concat0, key=concat1, query_pos=pos, key_pos=pos)[0]
+            forward, backward = torch.chunk(concat0, chunks=2, dim=0)
+
+            forward = forward.view(T - 1, B, H * W, C)
+            pos_2d = pos_2d.view(T - 1, B, H * W, C)
+
+            key_list = [forward[0]]
+            for i in range(1, len(forward)):
+                query_pos = pos_2d[i]
+                key_pos = pos_2d[i-1]
+                attn_out = self.decoder_layers[l](query=forward[i], key=key_list[i - 1], query_pos=query_pos, key_pos=key_pos)[0]
+                key_list.append(attn_out)
+            forward = torch.stack(key_list, dim=0)
+
+            forward = forward.permute(0, 1, 3, 2).contiguous()
+            forward = forward.view(T - 1, B, C, H, W)
+
+        return forward
+
+
+
+class TransformerFlowSegEncoderAggregationDistance(nn.Module):
+    def __init__(self, dim, nhead, num_layers):
+        super().__init__()
+        self.num_layers = num_layers
+
+        bilateral_attention_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
+        self.bilateral_attention_layers = _get_clones(bilateral_attention_layer, num_layers)
+
+        self.decoder_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
+
+        self.pos_obj_2d = PositionEmbeddingSine2d(num_pos_feats=dim // 2, normalize=True)
+    
+    
+    def forward(self, unlabeled, dist_emb):
+        '''unlabeled: T, B, C, H, W
+        dist_emb: B, T-1, C'''
+        
+        shape = unlabeled.shape
+        T, B, C, H, W = shape
+
+        dist_emb = dist_emb.permute(1, 0, 2).contiguous()
+        dist_emb = dist_emb.view((T-1) * B, C)
+        dist_emb = dist_emb[:, None, :].repeat(1, H * W, 1) # (T-1) * B, H * W, C
+
+        unlabeled = unlabeled.permute(0, 1, 3, 4, 2).contiguous() # T, B, H, W, C
+        unlabeled = unlabeled.view(T, B, H * W, C)
+
+        pos_2d = self.pos_obj_2d(shape_util=(B, H, W), device=unlabeled.device)
+        pos_2d = pos_2d.permute(0, 2, 3, 1).contiguous()
+        pos_2d = pos_2d.view(B, H * W, C)
+        pos_2d = pos_2d[None].repeat(T - 1, 1, 1, 1)
+        pos_2d = pos_2d.view((T-1) * B, H * W, C)
+
+        backward = unlabeled[:-1]
+        forward = unlabeled[1:]
+
+        backward = backward.view((T-1) * B, H * W, C)
+        forward = forward.view((T-1) * B, H * W, C)
+
+        for l in range(self.num_layers):
+            concat0 = torch.cat([forward, backward], dim=0)
+            concat1 = torch.cat([backward, forward], dim=0)
+            pos = torch.cat([pos_2d + dist_emb, pos_2d + dist_emb], dim=0)
+            concat0 = self.bilateral_attention_layers[l](query=concat0, key=concat1, query_pos=pos, key_pos=pos)[0]
+            forward, backward = torch.chunk(concat0, chunks=2, dim=0)
+
+        forward = forward.view(T - 1, B, H * W, C)
+        pos_2d = pos_2d.view(T - 1, B, H * W, C)
+        dist_emb = dist_emb.view(T - 1, B, H * W, C)
+
+        key_list = [forward[0]]
+        for i in range(1, len(forward)):
+            current_pos = pos_2d[i]
+            attn_out = self.decoder_layer(query=forward[i], key=key_list[i - 1], query_pos=current_pos, key_pos=current_pos)[0]
+            key_list.append(attn_out)
+        global_motion_forward = torch.stack(key_list, dim=0)
+
+        global_motion_forward = global_motion_forward.permute(0, 1, 3, 2).contiguous()
+        global_motion_forward = global_motion_forward.view(T - 1, B, C, H, W)
+
+        forward = forward.permute(0, 1, 3, 2).contiguous()
+        forward = forward.view(T - 1, B, C, H, W)
+
+        return forward, global_motion_forward
+
+
+
+class TransformerFlowEncoderAllDistanceNoEmb(nn.Module):
+    def __init__(self, dim, nhead, num_layers):
+        super().__init__()
+        self.num_layers = num_layers
+
+        bilateral_attention_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
+        self.bilateral_attention_layers = _get_clones(bilateral_attention_layer, num_layers)
+
+        decoder_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
+        self.decoder_layers = _get_clones(decoder_layer, num_layers)
+
+        self.pos_obj_2d = PositionEmbeddingSine2d(num_pos_feats=dim // 2, normalize=True)
+    
+    
+    def forward(self, unlabeled):
+        '''unlabeled: T, B, C, H, W
+        dist_emb: B, T-1, C'''
+
+        
+        shape = unlabeled.shape
+        T, B, C, H, W = shape
+
+        unlabeled = unlabeled.permute(0, 1, 3, 4, 2).contiguous() # T, B, H, W, C
+        unlabeled = unlabeled.view(T, B, H * W, C)
+
+        pos_2d = self.pos_obj_2d(shape_util=(B, H, W), device=unlabeled.device)
+        pos_2d = pos_2d.permute(0, 2, 3, 1).contiguous()
+        pos_2d = pos_2d.view(B, H * W, C)
+        pos_2d = pos_2d[None].repeat(T - 1, 1, 1, 1)
+        pos_2d = pos_2d.view((T-1) * B, H * W, C)
+
+        backward = unlabeled[:-1]
+        forward = unlabeled[1:]
+
+        backward = unlabeled[0][None].repeat(len(unlabeled) - 1, 1, 1, 1)
+        forward = unlabeled[1:]
+
+        backward = backward.view((T-1) * B, H * W, C)
+        forward = forward.view((T-1) * B, H * W, C)
+
+        for l in range(self.num_layers):
+            concat0 = torch.cat([forward, backward], dim=0)
+            concat1 = torch.cat([backward, forward], dim=0)
+            pos = torch.cat([pos_2d, pos_2d], dim=0)
+            concat0 = self.bilateral_attention_layers[l](query=concat0, key=concat1, query_pos=pos, key_pos=pos)[0]
+            forward, backward = torch.chunk(concat0, chunks=2, dim=0)
+
+            forward = forward.view(T - 1, B, H * W, C)
+            pos_2d = pos_2d.view(T - 1, B, H * W, C)
+
+            T_dim = T - 1
+
+            key = forward.permute(1, 0, 2, 3).contiguous()
+            key = key.view(B, T_dim * H * W, C)
+            key = key[None, :, :, :].repeat((T-1), 1, 1, 1)
+            key = key.view((T-1) * B, T_dim * H * W, C)
+
+            key_pos_2d = pos_2d.permute(1, 0, 2, 3).contiguous()
+            key_pos_2d = key_pos_2d.view(B, T_dim * H * W, C)
+            key_pos_2d = key_pos_2d[None, :, :, :].repeat((T-1), 1, 1, 1)
+            key_pos_2d = key_pos_2d.view((T-1) * B, T_dim * H * W, C)
+        
+            query_pos = pos_2d
+            key_pos = key_pos_2d
+
+            query_pos = query_pos.view((T-1) * B, H * W, C)
+            forward = forward.view((T-1) * B, H * W, C)
+
+            forward, weights = self.decoder_layers[l](query=forward,
+                                                    key=key, 
+                                                    query_pos=query_pos,
+                                                    key_pos=key_pos)
+            
+        
+        weights = weights.view((T-1), B, H * W, T_dim * H * W).mean(2) # (T-1), B, T_dim * H * W
+        weights = weights.permute(2, 0, 1).contiguous()
+        weights = weights.view(T_dim, H * W, (T-1), B).mean(1)
+        weights = weights.mean(2).permute(1, 0).contiguous()
+
+        forward = forward.view(T - 1, B, H * W, C)
+        forward = forward.permute(0, 1, 3, 2).contiguous()
+        forward = forward.view(T - 1, B, C, H, W)
+
+        return forward, weights.detach()
+
+
+
+class TransformerFlowEncoderAllDistance(nn.Module):
+    def __init__(self, dim, nhead, num_layers):
+        super().__init__()
+        self.num_layers = num_layers
+
+        bilateral_attention_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
+        self.bilateral_attention_layers = _get_clones(bilateral_attention_layer, num_layers)
+
+        decoder_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
+        self.decoder_layers = _get_clones(decoder_layer, num_layers)
+
+        self.pos_obj_2d = PositionEmbeddingSine2d(num_pos_feats=dim // 2, normalize=True)
+
+        proj1 = nn.Linear(dim, dim)
+        self.proj1 = _get_clones(proj1, num_layers)
+        proj2 = nn.Linear(dim, dim)
+        self.proj2 = _get_clones(proj2, num_layers)
+    
+    
+    def forward(self, unlabeled, dist_emb):
+        '''unlabeled: T, B, C, H, W
+        dist_emb: B, T-1, C'''
+
+        
+        shape = unlabeled.shape
+        T, B, C, H, W = shape
+
+        dist_emb = dist_emb.permute(1, 0, 2).contiguous()
+        dist_emb = dist_emb.view((T-1) * B, C)
+        dist_emb = dist_emb[:, None, :].repeat(1, H * W, 1) # (T-1) * B, H * W, C
+
+        unlabeled = unlabeled.permute(0, 1, 3, 4, 2).contiguous() # T, B, H, W, C
+        unlabeled = unlabeled.view(T, B, H * W, C)
+
+        pos_2d = self.pos_obj_2d(shape_util=(B, H, W), device=unlabeled.device)
+        pos_2d = pos_2d.permute(0, 2, 3, 1).contiguous()
+        pos_2d = pos_2d.view(B, H * W, C)
+        pos_2d = pos_2d[None].repeat(T - 1, 1, 1, 1)
+        pos_2d = pos_2d.view((T-1) * B, H * W, C)
+
+        backward = unlabeled[:-1]
+        forward = unlabeled[1:]
+
+        backward = unlabeled[0][None].repeat(len(unlabeled) - 1, 1, 1, 1)
+        forward = unlabeled[1:]
+
+        backward = backward.view((T-1) * B, H * W, C)
+        forward = forward.view((T-1) * B, H * W, C)
+
+        for l in range(self.num_layers):
+            dist_emb = self.proj1[l](dist_emb)
+            concat0 = torch.cat([forward, backward], dim=0)
+            concat1 = torch.cat([backward, forward], dim=0)
+            pos = torch.cat([pos_2d + dist_emb, pos_2d + dist_emb], dim=0)
+            concat0 = self.bilateral_attention_layers[l](query=concat0, key=concat1, query_pos=pos, key_pos=pos)[0]
+            forward, backward = torch.chunk(concat0, chunks=2, dim=0)
+
+            forward = forward.view(T - 1, B, H * W, C)
+            pos_2d = pos_2d.view(T - 1, B, H * W, C)
+            dist_emb = dist_emb.view(T - 1, B, H * W, C)
+
+            dist_emb = self.proj2[l](dist_emb)
+
+            T_dim = T - 1
+
+            key = forward.permute(1, 0, 2, 3).contiguous()
+            key = key.view(B, T_dim * H * W, C)
+            key = key[None, :, :, :].repeat((T-1), 1, 1, 1)
+            key = key.view((T-1) * B, T_dim * H * W, C)
+
+            key_pos_2d = pos_2d.permute(1, 0, 2, 3).contiguous()
+            key_pos_2d = key_pos_2d.view(B, T_dim * H * W, C)
+            key_pos_2d = key_pos_2d[None, :, :, :].repeat((T-1), 1, 1, 1)
+            key_pos_2d = key_pos_2d.view((T-1) * B, T_dim * H * W, C)
+
+            key_pos_1d = dist_emb.permute(1, 0, 2, 3).contiguous()
+            key_pos_1d = key_pos_1d.view(B, T_dim * H * W, C)
+            key_pos_1d = key_pos_1d[None, :, :, :].repeat((T-1), 1, 1, 1)
+            key_pos_1d = key_pos_1d.view((T-1) * B, T_dim * H * W, C)
+        
+            query_pos = pos_2d + dist_emb
+            key_pos = key_pos_2d + key_pos_1d
+
+            query_pos = query_pos.view((T-1) * B, H * W, C)
+            forward = forward.view((T-1) * B, H * W, C)
+
+            forward, weights = self.decoder_layers[l](query=forward,
+                                                    key=key, 
+                                                    query_pos=query_pos,
+                                                    key_pos=key_pos)
+            
+        
+        weights = weights.view((T-1), B, H * W, T_dim * H * W).mean(2) # (T-1), B, T_dim * H * W
+        weights = weights.permute(2, 0, 1).contiguous()
+        weights = weights.view(T_dim, H * W, (T-1), B).mean(1)
+        weights = weights.mean(2).permute(1, 0).contiguous()
+
+        forward = forward.view(T - 1, B, H * W, C)
+        forward = forward.permute(0, 1, 3, 2).contiguous()
+        forward = forward.view(T - 1, B, C, H, W)
+
+        return forward, weights.detach()
+    
+
+
+class TransformerFlowSegEncoderAggregationDistanceNoEmb(nn.Module):
+    def __init__(self, dim, nhead, num_layers):
+        super().__init__()
+        self.num_layers = num_layers
+
+        bilateral_attention_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
+        self.bilateral_attention_layers = _get_clones(bilateral_attention_layer, num_layers)
+
+        self.decoder_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
+
+        self.pos_obj_2d = PositionEmbeddingSine2d(num_pos_feats=dim // 2, normalize=True)
+    
+    
+    def forward(self, unlabeled):
+        '''unlabeled: T, B, C, H, W
+        dist_emb: B, T-1, C'''
+        
+        shape = unlabeled.shape
+        T, B, C, H, W = shape
+
+        unlabeled = unlabeled.permute(0, 1, 3, 4, 2).contiguous() # T, B, H, W, C
+        unlabeled = unlabeled.view(T, B, H * W, C)
+
+        pos_2d = self.pos_obj_2d(shape_util=(B, H, W), device=unlabeled.device)
+        pos_2d = pos_2d.permute(0, 2, 3, 1).contiguous()
+        pos_2d = pos_2d.view(B, H * W, C)
+        pos_2d = pos_2d[None].repeat(T - 1, 1, 1, 1)
+        pos_2d = pos_2d.view((T-1) * B, H * W, C)
+
+        backward = unlabeled[:-1]
+        forward = unlabeled[1:]
+
+        backward = backward.view((T-1) * B, H * W, C)
+        forward = forward.view((T-1) * B, H * W, C)
+
+        for l in range(self.num_layers):
+            concat0 = torch.cat([forward, backward], dim=0)
+            concat1 = torch.cat([backward, forward], dim=0)
+            pos = torch.cat([pos_2d, pos_2d], dim=0)
+            concat0 = self.bilateral_attention_layers[l](query=concat0, key=concat1, query_pos=pos, key_pos=pos)[0]
+            forward, backward = torch.chunk(concat0, chunks=2, dim=0)
+
+        forward = forward.view(T - 1, B, H * W, C)
+        pos_2d = pos_2d.view(T - 1, B, H * W, C)
+
+        key_list = [forward[0]]
+        for i in range(1, len(forward)):
+            current_pos = pos_2d[i]
+            attn_out = self.decoder_layer(query=forward[i], key=key_list[i - 1], query_pos=current_pos, key_pos=current_pos)[0]
+            key_list.append(attn_out)
+        global_motion_forward = torch.stack(key_list, dim=0)
+
+        global_motion_forward = global_motion_forward.permute(0, 1, 3, 2).contiguous()
+        global_motion_forward = global_motion_forward.view(T - 1, B, C, H, W)
+
+        forward = forward.permute(0, 1, 3, 2).contiguous()
+        forward = forward.view(T - 1, B, C, H, W)
+
+        return forward, global_motion_forward
+    
+
+
+
+
+class TransformerFlowSegEncoderAggregation3D(nn.Module):
+    def __init__(self, dim, nhead, num_layers):
+        super().__init__()
+        self.num_layers = num_layers
+
+        bilateral_attention_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
+        self.bilateral_attention_layers = _get_clones(bilateral_attention_layer, num_layers)
+
+        self.decoder_layer = TransformerFlowLayer(d_model=dim, nhead=nhead)
+
+        self.pos_obj_2d = PositionEmbeddingSine2d(num_pos_feats=dim // 2, normalize=True)
+        self.pos_z = nn.Parameter(torch.randn(2, dim))
+    
+    
+    def forward(self, unlabeled):
+        '''unlabeled: T, B, C, D, H, W'''
+        
+        shape = unlabeled.shape
+        T, B, C, D, H, W = shape
+
+        unlabeled = unlabeled.permute(0, 1, 3, 4, 5, 2).contiguous() # T, B, D, H, W, C
+        unlabeled = unlabeled.view(T, B, D * H * W, C)
+
+        pos_2d = self.pos_obj_2d(shape_util=(B, H, W), device=unlabeled.device)
+        pos_2d = pos_2d.permute(0, 2, 3, 1).contiguous()
+        pos_2d = pos_2d[:, None, :, :, :].repeat(1, D, 1, 1, 1)
+        pos_2d = pos_2d.view(B, D * H * W, C)
+        pos_2d = pos_2d[None].repeat(T, 1, 1, 1)
+        pos_2d = pos_2d.view(T * B, D * H * W, C)
+
+        pos_z = self.pos_z[None, :, None, None, :].repeat(B, 1, H, W, 1)
+        pos_z = pos_z.view(B, D * H * W, C)
+        pos_z = pos_z[None].repeat(T, 1, 1, 1)
+        pos_z = pos_z.view(T * B, D * H * W, C)
+
+        backward = unlabeled[:-1]
+        forward = unlabeled
+        backward = torch.cat([unlabeled[0][None], backward], dim=0)
+
+        backward = backward.view(T * B, D * H * W, C)
+        forward = forward.view(T * B, D * H * W, C)
+
+        for l in range(self.num_layers):
+            concat0 = torch.cat([forward, backward], dim=0)
+            concat1 = torch.cat([backward, forward], dim=0)
+            pos = torch.cat([pos_2d + pos_z, pos_2d + pos_z], dim=0)
+            concat0 = self.bilateral_attention_layers[l](query=concat0, key=concat1, query_pos=pos, key_pos=pos)[0]
+            forward, backward = torch.chunk(concat0, chunks=2, dim=0)
+
+        forward = forward.view(T, B, D * H * W, C)
+        pos_2d = pos_2d.view(T, B, D * H * W, C)
+        pos_z = pos_z.view(T, B, D * H * W, C)
+
+        global_motion_forward_list = []
+        key = forward[0]
+        for i in range(len(forward)):
+            pos = pos_2d[i] + pos_z[i]
+            attn_out = self.decoder_layer(query=forward[i], key=key, query_pos=pos, key_pos=pos)[0]
+            key = attn_out
+            global_motion_forward_list.append(key)
+        global_motion_forward = torch.stack(global_motion_forward_list, dim=0) # T, B, D * H * W, C
+
+        global_motion_forward = global_motion_forward.permute(0, 1, 3, 2).contiguous()
+        global_motion_forward = global_motion_forward.view(T, B, C, D, H, W)
+
+        forward = forward.permute(0, 1, 3, 2).contiguous()
+        forward = forward.view(T, B, C, D, H, W)
 
         return forward, global_motion_forward
 

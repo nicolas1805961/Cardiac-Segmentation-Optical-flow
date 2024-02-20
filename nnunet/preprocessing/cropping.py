@@ -83,6 +83,8 @@ def load_case_from_list_of_files(data_files, seg_file=None, info_dict=None):
     properties["list_of_data_files"] = data_files
     properties["seg_file"] = seg_file
 
+    properties['volume_per_voxel'] = float(np.prod(data_itk[0].GetSpacing(), dtype=np.float64))
+
     properties["itk_origin"] = data_itk[0].GetOrigin()
     properties["itk_spacing"] = data_itk[0].GetSpacing()
     properties["itk_direction"] = data_itk[0].GetDirection()
