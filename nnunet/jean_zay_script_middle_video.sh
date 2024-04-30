@@ -1,4 +1,5 @@
 #!/bin/bash
+#SBATCH --array=1-4   # Number of configuration files
 #SBATCH --job-name=gpu_mono          # nom du job
 #SBATCH -C v100-16g                  # reserver des GPU 16 Go seulement
 ##SBATCH --partition=gpu_p2          # de-commente pour la partition gpu_p2
@@ -63,6 +64,12 @@ export RESULTS_FOLDER="out/nnUNet_trained_models"
 #python run/run_training.py 2d StartEnd Task032_Lib 0 -p custom_experiment_planner --deterministic
 #python run/run_training.py 2d Final Task032_Lib 0 -p custom_experiment_planner --deterministic
 #python run/run_training.py 2d nnMTLTrainerV2FlowSuccessive Task045_Lib 0 -p custom_experiment_planner --deterministic
-python run/run_training.py 2d FinalFlow Task045_Lib 0 -p custom_experiment_planner --deterministic
+#python run/run_training.py 2d FinalFlow Task045_Lib 0 -p custom_experiment_planner --deterministic
+#python run/run_training.py 2d nnMTLTrainerV2FlowSuccessive Task032_Lib 0 -p custom_experiment_planner -config config9.yaml --deterministic
+#python run/run_training.py 2d FinalFlow Task045_Lib 0 -p custom_experiment_planner -config config${SLURM_ARRAY_TASK_ID}.yaml --deterministic
+#python run/run_training.py 2d SegPrediction Task045_Lib 0 -p custom_experiment_planner -config config${SLURM_ARRAY_TASK_ID}.yaml --deterministic
+python run/run_training.py 2d SegFlowGaussian Task045_Lib 0 -p custom_experiment_planner -config config${SLURM_ARRAY_TASK_ID}.yaml --deterministic
+
+sleep 1
 
 #python voxelmorph_saver_Lib.py

@@ -11,8 +11,8 @@ import pandas as pd
 
 if __name__ == "__main__":
 
-    csv_file_1 = r"C:\Users\Portal\Documents\Isensee\nnUNet\nnunet\Medis_to_ACDC\metrics.csv"
-    csv_file_2 = r"C:\Users\Portal\Documents\Isensee\nnUNet\nnunet\ACDC_rv_rejection\metrics.csv"
+    csv_file_1 = r"C:\Users\Portal\Documents\voxelmorph\2023-12-14_17H47\Task032_Lib\fold_0\Lib\test\Raw\Flow\ssim_metrics.csv"
+    csv_file_2 = r"C:\Users\Portal\Documents\voxelmorph\results\VM-NCC\Lib\test\Raw\Flow\ssim_metrics.csv"
 
     #merge_on = ['File ID',
     #            'Patient ID',
@@ -66,8 +66,11 @@ if __name__ == "__main__":
     #            'TH15_ES',
     #            'TH16_ES']
 
+    #merge_on = ['Name',
+    #            'Phase']
+    
     merge_on = ['Name',
-                'Phase']
+                'slice_number']
 
     df1 = pd.read_csv(csv_file_1)
     df2 = pd.read_csv(csv_file_2)

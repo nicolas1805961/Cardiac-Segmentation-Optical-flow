@@ -21,10 +21,53 @@ from .seresnet import ResnetBasicBlock1D, RescaleBasicBlock, RescaleBasicBlock1D
 import logging
 import matplotlib
 
-from mmcv.utils import get_logger
 import sys
 from torch.nn.functional import affine_grid
 from torch.nn.functional import grid_sample
+
+class KeyProjection(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+
+        # shrinkage
+        self.d_proj = nn.Conv2d(dim, 1, kernel_size=3, padding=1)
+        # selection
+        self.e_proj = nn.Conv2d(dim, dim, kernel_size=3, padding=1)
+    
+    def forward(self, x):
+        shrinkage = self.d_proj(x)**2 + 1
+        selection = torch.sigmoid(self.e_proj(x))
+
+        return shrinkage, selection
+
+
+
+def gaussian_kernel(kernel_size, sigma, peak_index):
+    """
+    Generate a 1D Gaussian kernel.
+
+    Args:
+        kernel_size (int): Size of the kernel.
+        sigma (float): Standard deviation of the Gaussian distribution.
+        peak_index (int or None): Index of the peak value in the kernel. If None, peak_index is set to the center of the kernel.
+
+    Returns:
+        torch.Tensor: 1D Gaussian kernel.
+    """
+    # Create a one-dimensional grid
+    grid = torch.arange(kernel_size, dtype=torch.float32)
+
+    # Calculate the mean (center) of the kernel
+    if peak_index is None:
+        peak_index = (kernel_size - 1) / 2.0
+
+    # Calculate the Gaussian distribution
+    kernel = torch.exp(-((grid - peak_index) ** 2) / (2 * sigma ** 2))
+
+    # Normalize the kernel to ensure the sum of its elements equals 1
+    kernel = kernel / torch.sum(kernel)
+
+    return kernel
 
 class MotionEstimation(nn.Module):
     def __init__(self):
@@ -589,72 +632,71 @@ class SkipCoDeformableAttention(nn.Module):
         return skip_connection, sampling_locations, attention_weights, theta_coords
 
 
-class DeformableTransformer(nn.Module):
-    def __init__(self, dim, n_heads, video_length, n_points, d_ffn, res, dropout=0.0):
-        super(DeformableTransformer, self).__init__()
-        self.n_heads = n_heads
-        self.attn = DeformableAttention(dim=dim, n_heads=n_heads, n_points=n_points, video_length=video_length)
-
-        self.dropout1 = nn.Dropout(dropout)
-        self.norm1 = nn.LayerNorm(dim)
-
-        self.pos_2d = nn.Parameter(torch.randn(res**2, dim))
-
-        # ffn
-        self.linear1 = nn.Linear(dim, d_ffn)
-        self.activation = nn.GELU()
-        self.dropout2 = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(d_ffn, dim)
-        self.dropout3 = nn.Dropout(dropout)
-        self.norm2 = nn.LayerNorm(dim)
-    
-    def _get_ref_points(self, x, H, W):
-        B = x.shape[0]
-        
-        ref_y, ref_x = torch.meshgrid(
-            torch.linspace(0.5, H - 0.5, H, dtype=x.dtype, device=x.device), 
-            torch.linspace(0.5, W - 0.5, W, dtype=x.dtype, device=x.device)
-        )
-        ref = torch.stack((ref_x, ref_y), -1)
-        ref[..., 1].div_(W).mul_(2).sub_(1)
-        ref[..., 0].div_(H).mul_(2).sub_(1)
-        ref = ref[None, ...].expand(B, -1, -1, -1) # B H W 2
-        
-        return ref
-    
-    def forward_ffn(self, src):
-        src2 = self.linear2(self.dropout2(self.activation(self.linear1(src))))
-        src = src + self.dropout3(src2)
-        src = self.norm2(src)
-        return src
-    
-    @staticmethod
-    def with_pos_embed(tensor, pos):
-        return tensor if pos is None else tensor + pos
-
-    def forward(self, key, query, temporal_pos, spatial_pos):
-        T, B, C, H, W = key.shape
-        B, C, H, W = query.shape
-
-        reference_points = self._get_ref_points(query, H, W)
-        reference_points = reference_points.view(B, H * W, 2)
-
-        temporal_pos = temporal_pos.view(1, 1, C).repeat(B, H * W, 1)
-        src = query.permute(0, 2, 3, 1).contiguous().view(B, -1, C)
-
-        pos = temporal_pos + spatial_pos
-
-        #src2, sampling_locations, attention_weights = self.attn(key=key, query=src, reference_points=reference_points) # query = B, L, C
-        src2, sampling_locations, attention_weights = self.attn(key=key, query=self.with_pos_embed(src, pos), reference_points=reference_points) # query = B, L, C
-        src = src + self.dropout1(src2)
-        src = self.norm1(src)
-
-        # ffn
-        src = self.forward_ffn(src)
-
-        src = src.permute(0, 2, 1).view(B, C, H, W)
-        return src, sampling_locations, attention_weights
-
+#class DeformableTransformer(nn.Module):
+#    def __init__(self, dim, n_heads, video_length, n_points, d_ffn, res, dropout=0.0):
+#        super(DeformableTransformer, self).__init__()
+#        self.n_heads = n_heads
+#        self.attn = DeformableAttention(dim=dim, n_heads=n_heads, n_points=n_points, video_length=video_length)
+#
+#        self.dropout1 = nn.Dropout(dropout)
+#        self.norm1 = nn.LayerNorm(dim)
+#
+#        self.pos_2d = nn.Parameter(torch.randn(res**2, dim))
+#
+#        # ffn
+#        self.linear1 = nn.Linear(dim, d_ffn)
+#        self.activation = nn.GELU()
+#        self.dropout2 = nn.Dropout(dropout)
+#        self.linear2 = nn.Linear(d_ffn, dim)
+#        self.dropout3 = nn.Dropout(dropout)
+#        self.norm2 = nn.LayerNorm(dim)
+#    
+#    def _get_ref_points(self, x, H, W):
+#        B = x.shape[0]
+#        
+#        ref_y, ref_x = torch.meshgrid(
+#            torch.linspace(0.5, H - 0.5, H, dtype=x.dtype, device=x.device), 
+#            torch.linspace(0.5, W - 0.5, W, dtype=x.dtype, device=x.device)
+#        )
+#        ref = torch.stack((ref_x, ref_y), -1)
+#        ref[..., 1].div_(W).mul_(2).sub_(1)
+#        ref[..., 0].div_(H).mul_(2).sub_(1)
+#        ref = ref[None, ...].expand(B, -1, -1, -1) # B H W 2
+#        
+#        return ref
+#    
+#    def forward_ffn(self, src):
+#        src2 = self.linear2(self.dropout2(self.activation(self.linear1(src))))
+#        src = src + self.dropout3(src2)
+#        src = self.norm2(src)
+#        return src
+#    
+#    @staticmethod
+#    def with_pos_embed(tensor, pos):
+#        return tensor if pos is None else tensor + pos
+#
+#    def forward(self, key, query, temporal_pos, spatial_pos):
+#        T, B, C, H, W = key.shape
+#        B, C, H, W = query.shape
+#
+#        reference_points = self._get_ref_points(query, H, W)
+#        reference_points = reference_points.view(B, H * W, 2)
+#
+#        temporal_pos = temporal_pos.view(1, 1, C).repeat(B, H * W, 1)
+#        src = query.permute(0, 2, 3, 1).contiguous().view(B, -1, C)
+#
+#        pos = temporal_pos + spatial_pos
+#
+#        #src2, sampling_locations, attention_weights = self.attn(key=key, query=src, reference_points=reference_points) # query = B, L, C
+#        src2, sampling_locations, attention_weights = self.attn(key=key, query=self.with_pos_embed(src, pos), reference_points=reference_points) # query = B, L, C
+#        src = src + self.dropout1(src2)
+#        src = self.norm1(src)
+#
+#        # ffn
+#        src = self.forward_ffn(src)
+#
+#        src = src.permute(0, 2, 1).view(B, C, H, W)
+#        return src, sampling_locations, attention_weights
 
 
 class ConvDecoderDeformableAttentionIdentity(nn.Module):
@@ -1068,8 +1110,40 @@ class ConvBlocks2DGroup(nn.Module):
 
 
 
+class DoubleConvBatch(nn.Module):
+    def __init__(self, in_dim, out_dim, residual, d_model=None, kernel_size=3):
+        super(DoubleConvBatch, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels=in_dim, out_channels=out_dim, kernel_size=kernel_size, padding='same')
+        self.norm1 = nn.BatchNorm2d(out_dim)
+        self.conv2 = nn.Conv2d(in_channels=out_dim, out_channels=out_dim, kernel_size=kernel_size, padding='same')
+        self.norm2 = nn.BatchNorm2d(out_dim)
+        self.gelu = nn.GELU()
+
+        self.residual = residual
+    
+    def forward(self, x):
+        """"dist_emb: B, C"""
+        identity = x
+        B, C, H, W = x.shape
+
+        residual = x
+        
+        x = self.conv1(x)
+        x = self.norm1(x)
+        x = self.gelu(x)
+
+        x = self.conv2(x)
+        x = self.norm2(x)
+        #if self.residual:
+        #    x = x + residual
+        x = self.gelu(x)
+
+        return x
+    
+
+
 class DoubleConv(nn.Module):
-    def __init__(self, in_dim, out_dim, d_model=None, kernel_size=3):
+    def __init__(self, in_dim, out_dim, residual, d_model=None, kernel_size=3):
         super(DoubleConv, self).__init__()
         self.conv1 = nn.Conv2d(in_channels=in_dim, out_channels=out_dim, kernel_size=kernel_size, padding='same')
         self.norm1 = nn.GroupNorm(8, out_dim)
@@ -1078,11 +1152,39 @@ class DoubleConv(nn.Module):
         self.gelu = nn.GELU()
         self.embedding = False
 
-        if d_model is not None:
-            self.embedding = True
-            self.modulate = nn.Linear(d_model, out_dim)
+        self.residual = residual
     
-    def forward(self, x, dist_emb=None):
+    def forward(self, x):
+        """"dist_emb: B, C"""
+        identity = x
+        B, C, H, W = x.shape
+
+        residual = x
+        
+        x = self.conv1(x)
+        x = self.norm1(x)
+        x = self.gelu(x)
+
+        x = self.conv2(x)
+        x = self.norm2(x)
+        #if self.residual:
+        #    x = x + residual
+        x = self.gelu(x)
+
+        return x
+    
+
+
+
+class SingleConvBatch(nn.Module):
+    def __init__(self, in_dim, out_dim, residual, d_model=None, kernel_size=3):
+        super(SingleConvBatch, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels=in_dim, out_channels=out_dim, kernel_size=kernel_size, padding='same')
+        self.norm1 = nn.BatchNorm2d(out_dim)
+        self.gelu = nn.GELU()
+        self.residual = residual
+    
+    def forward(self, x):
         """"dist_emb: B, C"""
         identity = x
         B, C, H, W = x.shape
@@ -1091,32 +1193,20 @@ class DoubleConv(nn.Module):
         x = self.norm1(x)
         x = self.gelu(x)
 
-        if self.embedding:
-            dist_emb = self.modulate(dist_emb)
-            dist_emb = dist_emb[:, :, None, None].repeat(1, 1, H, W)
-            x = x + dist_emb
-
-        x = self.conv2(x)
-        x = self.norm2(x)
-        x = self.gelu(x)
-
         return x
     
 
 
 class SingleConv(nn.Module):
-    def __init__(self, in_dim, out_dim, d_model=None, kernel_size=3):
+    def __init__(self, in_dim, out_dim, residual, d_model=None, kernel_size=3):
         super(SingleConv, self).__init__()
         self.conv1 = nn.Conv2d(in_channels=in_dim, out_channels=out_dim, kernel_size=kernel_size, padding='same')
         self.norm1 = nn.GroupNorm(8, out_dim)
         self.gelu = nn.GELU()
         self.embedding = False
-
-        if d_model is not None:
-            self.embedding = True
-            self.modulate = nn.Linear(d_model, out_dim)
+        self.residual = residual
     
-    def forward(self, x, dist_emb=None):
+    def forward(self, x):
         """"dist_emb: B, C"""
         identity = x
         B, C, H, W = x.shape
@@ -1207,7 +1297,7 @@ class DoubleConv3D(nn.Module):
 
 
 class ConvBlocks2DGroupLegacy(nn.Module):
-    def __init__(self, in_dim, out_dim, nb_blocks, kernel_size=3, d_model=None, nb_conv=2):
+    def __init__(self, in_dim, out_dim, nb_blocks, residual=False, kernel_size=3, nb_conv=2):
         super(ConvBlocks2DGroupLegacy, self).__init__()
         dims = torch.linspace(in_dim, out_dim, nb_blocks+1).int()
         dims[1:] = (torch.round(dims[1:] / 8) * 8).int()
@@ -1220,12 +1310,12 @@ class ConvBlocks2DGroupLegacy(nn.Module):
             blockfunction = SingleConv
 
         for i in range(nb_blocks):
-            block = blockfunction(in_dim=dims[i], out_dim=dims[i+1], d_model=d_model)
+            block = blockfunction(in_dim=dims[i], out_dim=dims[i+1], residual=residual)
             self.blocks.append(block)
     
-    def forward(self, x, dist_emb=None):
+    def forward(self, x):
         for block in self.blocks:
-            x = block(x, dist_emb)
+            x = block(x)
         return x
     
 
@@ -1304,14 +1394,20 @@ class ConvBlocks3DGroup(nn.Module):
 
 
 class ConvBlocks2DBatch(nn.Module):
-    def __init__(self, in_dim, out_dim, nb_blocks, kernel_size=3):
+    def __init__(self, in_dim, out_dim, nb_blocks, residual=False, kernel_size=3, nb_conv=2):
         super(ConvBlocks2DBatch, self).__init__()
         dims = torch.linspace(in_dim, out_dim, nb_blocks+1).int()
+        dims[1:] = (torch.round(dims[1:] / 8) * 8).int()
 
         self.blocks = nn.ModuleList()
 
+        if nb_conv == 2:
+            blockfunction = DoubleConvBatch
+        elif nb_conv == 1:
+            blockfunction = SingleConvBatch
+
         for i in range(nb_blocks):
-            block = ResnetBlock2DBatch(in_dim=dims[i], out_dim=dims[i+1], kernel_size=kernel_size)
+            block = blockfunction(in_dim=dims[i], out_dim=dims[i+1], residual=residual)
             self.blocks.append(block)
     
     def forward(self, x):
@@ -1525,23 +1621,6 @@ class ConvFilterBlock(nn.Module):
 
         return out
 
-
-def get_root_logger(log_file=None, log_level=logging.INFO):
-    """Use ``get_logger`` method in mmcv to get the root logger.
-    The logger will be initialized if it has not been initialized. By default a
-    StreamHandler will be added. If ``log_file`` is specified, a FileHandler
-    will also be added. The name of the root logger is the top-level package
-    name, e.g., "mmaction".
-    Args:
-        log_file (str | None): The log filename. If specified, a FileHandler
-            will be added to the root logger.
-        log_level (int): The root logger level. Note that only the process of
-            rank 0 is affected, while other processes will set the level to
-            "Error" and be silent most of the time.
-    Returns:
-        :obj:`logging.Logger`: The root logger.
-    """
-    return get_logger(__name__.split('.')[0], log_file, log_level)
 
 class MLP(nn.Module):
     """ Very simple multi-layer perceptron (also called FFN)"""

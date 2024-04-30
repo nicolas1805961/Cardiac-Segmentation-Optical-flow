@@ -33,7 +33,7 @@ def save_segmentation_nifti_from_softmax(segmentation_softmax: Union[str, np.nda
                                          resampled_npz_fname: str = None,
                                          non_postprocessed_fname: str = None, force_separate_z: bool = None,
                                          interpolation_order_z: int = 0, verbose: bool = True, flow=None, flow_path=None,
-                                         registered=None, registered_path=None, raw_flow=None):
+                                         registered=None, registered_path=None):
     
     """
     This is a utility for writing segmentations to nifty and npz. It requires the data to have been preprocessed by
@@ -84,13 +84,6 @@ def save_segmentation_nifti_from_softmax(segmentation_softmax: Union[str, np.nda
     # current_spacing = dct.get('spacing_after_resampling')
     # original_spacing = dct.get('original_spacing')
 
-    if raw_flow is not None:
-        raw_flow = raw_flow.transpose(2, 3, 1, 0)
-        img = raw_flow[:, :, :, :1] # H, W, D, 1
-        raw_flow = raw_flow[:, :, :, 1:] # H, W, D, 2
-        raw_flow_path = flow_path[:-4] + '_raw.npz'
-        np.savez(raw_flow_path, flow=raw_flow.astype(np.float32), img=img.astype(np.float32))
-
     if np.any([i != j for i, j in zip(np.array(current_shape[1:]), np.array(shape_original_after_cropping))]):
         if force_separate_z is None:
             if get_do_separate_z(properties_dict.get('original_spacing')):
@@ -119,7 +112,6 @@ def save_segmentation_nifti_from_softmax(segmentation_softmax: Union[str, np.nda
                                                axis=lowres_axis, order=order, do_separate_z=do_separate_z,
                                                order_z=interpolation_order_z)
         if flow is not None:
-            print(flow.shape)
             flow = resample_data_or_seg(flow, shape_original_after_cropping, is_seg=False,
                                                axis=lowres_axis, order=order, do_separate_z=do_separate_z,
                                                order_z=interpolation_order_z)

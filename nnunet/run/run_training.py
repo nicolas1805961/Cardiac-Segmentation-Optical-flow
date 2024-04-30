@@ -42,6 +42,7 @@ def main():
     parser.add_argument("network_trainer")
     parser.add_argument("task", help="can be task name or task id")
     parser.add_argument("fold", help='0, 1, ..., 5 or \'all\'')
+    parser.add_argument("-config", help="yaml config file", required=True)
     parser.add_argument("-val", "--validation_only", help="use this if you want to only run the validation",
                         action="store_true")
     parser.add_argument('-w', '--weight_folder', help='folder where to find the model\'s weights',
@@ -169,8 +170,13 @@ def main():
                            'ErrorCorrection',
                            'Final',
                            'FinalFlow',
+                           'FinalFlowPred',
+                           'SegPrediction',
+                           'SegFlowGaussian',
+                           'FinalFlowRaft',
                            'StartEnd',
                            'Interpolator',
+                           'MemoryAdjacent',
                            'FlowSimple',
                            'nnMTLTrainerV2SegFlow',
                            'TemporalModel',
@@ -184,7 +190,8 @@ def main():
         if validation_only:
             config = read_config_video(os.path.join(weight_folder, 'config.yaml'))
         else:
-            config = read_config_video(os.path.join(Path.cwd(), 'video.yaml'))
+            print(f'My config file is {args.config}')
+            config = read_config_video(os.path.join(Path.cwd(), args.config))
     else:
         config = read_config(os.path.join(Path.cwd(), 'adversarial_acdc.yaml'), middle=False, video=False)
 
@@ -212,9 +219,7 @@ def main():
         assert issubclass(trainer_class,
                           nnUNetTrainer), "network_trainer was found but is not derived from nnUNetTrainer"
     
-    if not validation_only:
-        config = None
-    else:
+    if validation_only:
         output_folder_name = weight_folder
 
         

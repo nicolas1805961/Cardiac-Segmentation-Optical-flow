@@ -20,8 +20,7 @@ from sklearn.model_selection import KFold
 import nibabel as nib
 import sys
 from tqdm import tqdm
-import pickle
-from glob import glob
+from copy import copy
 
 def get_labeled_frame_nb(info_file):
     indices = []
@@ -46,52 +45,60 @@ def convert_to_submission(source_dir, target_dir):
 
 
 if __name__ == "__main__":
-    folder = "Lib_training_2"
+    folder = "ACDC_training"
     folder_test = "/media/fabian/My Book/datasets/ACDC/testing/testing"
-    out_folder = os.path.join('out', 'nnUNet_raw_data_base', 'nnUNet_raw_data', 'Task032_Lib')
+    out_folder = os.path.join('out', 'nnUNet_raw_data_base', 'nnUNet_raw_data', 'Task039_ACDC')
     #out_folder = "out\\nnUNet_raw_data_base\\nnUNet_raw_data\Task027_ACDC"
 
     maybe_mkdir_p(join(out_folder, "imagesTr"))
     maybe_mkdir_p(join(out_folder, "imagesTs"))
     maybe_mkdir_p(join(out_folder, "labelsTr"))
-    maybe_mkdir_p(join(out_folder, "strain", "LV", "radial"))
-    maybe_mkdir_p(join(out_folder, "strain", "LV", "tangential"))
-    maybe_mkdir_p(join(out_folder, "strain", "RV", "tangential"))
-    maybe_mkdir_p(join(out_folder, "contour", "RV"))
-    maybe_mkdir_p(join(out_folder, "contour", "LV"))
 
     # train
-    all_train_files = []
     all_dict = []
+    all_dict_unlabeled = []
     patient_dirs_train = subfolders(folder, prefix="patient")
-    patient_dirs_train = sorted(patient_dirs_train)
     for p in tqdm(patient_dirs_train):
         current_dir = p
+
+        with open(os.path.join(current_dir, 'Info.cfg')) as f:
+            lines = f.read().splitlines() 
+            patient_loaded_dict = {lines[2][:5]: lines[2][7:], lines[0][:2]: int(lines[0][4:]), lines[1][:2]: int(lines[1][4:])}
+
         data_files_train = [i for i in subfiles(current_dir, suffix=".nii.gz") if i.find("_gt") == -1 and i.find("_4d") == -1]
         corresponding_seg_files = [i[:-7] + "_gt.nii.gz" for i in data_files_train]
-        data_files_train = sorted(data_files_train)
-        corresponding_seg_files = sorted(corresponding_seg_files)
+        assert len(data_files_train) == 2
         for d, s in zip(data_files_train, corresponding_seg_files):
+            loaded_dict = copy(patient_loaded_dict)
             patient_identifier = d.split(os.sep)[-1][:-7]
-            all_train_files.append(patient_identifier + "_0000.nii.gz")
             shutil.copy(d, join(out_folder, "imagesTr", patient_identifier + "_0000.nii.gz"))
             shutil.copy(s, join(out_folder, "labelsTr", patient_identifier + ".nii.gz"))
 
-            pickle_file = 'info_' + patient_identifier[-2:] + '.pkl'
-            with open(os.path.join(current_dir, pickle_file), 'rb') as f:
-                loaded_dict = pickle.load(f)
             current_dict = {'image': "./imagesTr/%s.nii.gz" % patient_identifier, "label": "./labelsTr/%s.nii.gz" % patient_identifier}
-            #[x.update(current_dict) for x in loaded_dict]
             loaded_dict.update(current_dict)
             all_dict.append(loaded_dict)
 
-        npy_paths = glob(os.path.join(current_dir, '**', '*.npy'), recursive=True)
+        info_file = [i for i in subfiles(current_dir, suffix=".cfg")][0]
+        labeled_frame_indices = get_labeled_frame_nb(info_file)
+        data_file_train_unlabeled = [i for i in subfiles(current_dir, suffix=".nii.gz") if i.find("_4d") >= 0][0]
+        in_nib_img = nib.load(data_file_train_unlabeled)
+        original_header = in_nib_img.header
+        original_affine = in_nib_img.affine
+        img = in_nib_img.get_fdata()
+        for i in range(img.shape[-1]):
+            if i in labeled_frame_indices:
+                continue
+            else:
+                loaded_dict = copy(patient_loaded_dict)
+                current_dict = {'image': "./imagesTr/%s.nii.gz" % patient_identifier}
+                loaded_dict.update(current_dict)
+                all_dict_unlabeled.append(loaded_dict)
 
-        for npy_path in npy_paths:
-            split_index = 4 if 'strain' in npy_path else 3
-            start_path = [out_folder]
-            start_path.extend(npy_path.split(os.sep)[-split_index:])
-            shutil.copy(npy_path, os.path.join(*start_path))
+                patient_identifier = data_file_train_unlabeled.split(os.sep)[-1].split('4d')[0] + 'frame' + str(i + 1).zfill(2) + '_u'
+                out_path = join(out_folder, "imagesTr", patient_identifier + "_0000.nii.gz")
+                out_nib_img = nib.Nifti1Image(img[:, :, :, i], original_affine, original_header)
+                assert ~np.all(np.array(out_nib_img.header['pixdim']) == 1.0), print(p)
+                nib.save(out_nib_img, out_path)
 
 
     # test
@@ -107,11 +114,11 @@ if __name__ == "__main__":
 
 
     json_dict = OrderedDict()
-    json_dict['name'] = "Libvolumes"
+    json_dict['name'] = "ACDCNoNorm"
     json_dict['description'] = "cardiac cine MRI segmentation"
     json_dict['tensorImageSize'] = "4D"
-    json_dict['reference'] = ""
-    json_dict['licence'] = ""
+    json_dict['reference'] = "see ACDC challenge"
+    json_dict['licence'] = "see ACDC challenge"
     json_dict['release'] = "0.0"
     json_dict['modality'] = {
         "0": "noNorm",
@@ -123,7 +130,9 @@ if __name__ == "__main__":
         "3": "LVC"
     }
     json_dict['numTraining'] = len(all_dict)
+    json_dict['numUnlabeled'] = len(all_dict_unlabeled)
     json_dict['numTest'] = len(all_test_files)
+    json_dict['unlabeled'] = all_dict_unlabeled
     json_dict['training'] = all_dict
     json_dict['test'] = ["./imagesTs/%s.nii.gz" % i.split("/")[-1][:-12] for i in all_test_files]
 

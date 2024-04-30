@@ -17,7 +17,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     #registered folder path here
-    pred_directory = r"C:\Users\Portal\Documents\voxelmorph\2024-02-08_12H44\Task045_Lib\fold_0\Lib\val\Postprocessed\Registered"
+    pred_directory = r"C:\Users\Portal\Documents\voxelmorph\new_models_256\2024-03-01_23H51_16s_864320\Task045_Lib\fold_0\Lib\val\Postprocessed\Registered"
 
     registered_patients = [name for name in os.listdir(pred_directory) if os.path.isdir(os.path.join(pred_directory, name))]
 
@@ -46,8 +46,14 @@ if __name__ == "__main__":
     results_list = []
     for patient_name in tqdm(registered_patients):
 
+        path_list_flow = glob(os.path.join(os.path.dirname(pred_directory), 'Flow', patient_name, '*.npz'))
+        flow_patient = [os.path.basename(x)[:-4] for x in path_list_flow]
+
         path_list = glob(os.path.join(pred_directory, patient_name, 'temp_allClasses', '*.gz'))
+
         path_list = [x for x in path_list if os.path.basename(x)[:-7] in validation_patients]
+
+        path_list = [x for x in path_list if os.path.basename(x)[:-7] in flow_patient]
 
         corresponding_pkl_file = os.path.join(gt_directory, 'custom_experiment_planner_stage0', patient_name + '_frame01.pkl')
         with open(corresponding_pkl_file, 'rb') as f:

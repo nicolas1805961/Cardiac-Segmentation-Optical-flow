@@ -11,8 +11,14 @@ from nnunet.network_architecture.Optical_flow_model_successive import OpticalFlo
 from nnunet.network_architecture.Optical_flow_model_successive_other import OpticalFlowModelSuccessiveOther
 from nnunet.network_architecture.Optical_flow_model_successive_embedding import OpticalFlowModelSuccessiveEmbedding
 from nnunet.network_architecture.Optical_flow_model_successive_prediction import OpticalFlowModelSuccessivePrediction
+from nnunet.network_architecture.memory_adjacent import MemoryAdjacent
+from nnunet.network_architecture.Seg_prediction import SegPrediction
+from nnunet.network_architecture.SegFlowGaussian import SegFlowGaussian
+from nnunet.network_architecture.SegFlow2 import SegFlow2
 from nnunet.network_architecture.Final import Final
 from nnunet.network_architecture.Final_flow import FinalFlow
+from nnunet.network_architecture.Final_flow_pred import FinalFlowPred
+from nnunet.network_architecture.Final_flow_raft import FinalFlowRaft
 from nnunet.network_architecture.Start_End import StartEnd
 from nnunet.network_architecture.MTLEmbedding import MTLEmbedding
 from nnunet.network_architecture.Seg_simple import SegSimple
@@ -1409,7 +1415,18 @@ def build_final_flow_model(config, image_size, log_function, nb_channels):
 
     model = FinalFlow(deep_supervision=config['deep_supervision'],
              nb_conv=config['nb_conv'],
+             P=config['P'],
+             nb_inputs=config['nb_inputs'],
+             dumb=config['dumb'],
+             kernel_size=config['kernel_size'],
+             gaussian=config['gaussian'],
+             timesformer=config['timesformer'],
+             supervise_iterations=config['supervise_iterations'],
+             deformable=config['deformable'],
+             skip_co_type=config['skip_co_type'],
+             shrink_select=config['shrink_select'],
              bottleneck_type=config['bottleneck_type'],
+             marginal=config['marginal'],
              topk=config['topk'],
              pos_1d=config['pos_1d'],
              distance=config['distance'],
@@ -1440,20 +1457,217 @@ def build_final_flow_model(config, image_size, log_function, nb_channels):
 
 
 
-def build_SegFlow_model(config, image_size, log_function, nb_channels, backward, segmentation):
+def build_seg_flow_gaussian_model(config, image_size, log_function):
 
-    model = SegFlow(deep_supervision=config['deep_supervision'],
+    #SegFlowGaussian
+
+    #SegFlow2
+
+    model = SegFlowGaussian(deep_supervision=config['deep_supervision'],
+             no_residual=config['no_residual'],
+             small_memory=config['small_memory'],
+             conv_bottleneck=config['conv_bottleneck'],
+             multiplier=config['multiplier'],
+             pos_2d=config['pos_2d'],
+             warp=config['warp'],
+             memory_length=config['video_length'],
+             add_motion_cues=config['add_motion_cues'],
              nb_conv=config['nb_conv'],
+             dropout=config['dropout'],
+             residual=config['residual'],
+             query_type=config['query_type'],
+             nb_extra_block=config['nb_extra_block'],
+             nb_merging_block=config['nb_merging_blocks'],
+             no_skip_co=config['no_skip_co'],
+             P=config['P'],
+             no_label=config['no_label'],
+             logits_input=config['logits_input'],
+             nb_inputs=config['nb_inputs'],
+             nb_inputs_memory=config['nb_inputs_memory'],
+             backward_flow=config['backward_flow'],
+             learn_seg=config['learn_seg'],
+             gaussian_type=config['gaussian_type'],
+             dumb=config['dumb'],
+             kernel_size=config['kernel_size'],
+             gaussian=config['gaussian'],
+             timesformer=config['timesformer'],
+             supervise_iterations=config['supervise_iterations'],
+             deformable=config['deformable'],
+             skip_co_type=config['skip_co_type'],
+             shrink_select=config['shrink_select'],
+             bottleneck_type=config['bottleneck_type'],
+             marginal=config['marginal'],
+             topk=config['topk'],
+             pos_1d=config['pos_1d'],
+             distance=config['distance'],
              norm=config['norm'],
              legacy=config['legacy'],
-             segmentation=segmentation,
+             motion_from_ed=config['motion_from_ed'],
+             one_to_all=config['one_to_all'],
+             all_to_all=config['all_to_all'],
+             final_stride=config['final_stride'],
+             out_encoder_dims=config['out_encoder_dims'],
+             inference_mode=config['inference_mode'],
+             in_dims=config['in_encoder_dims'],
+             nb_layers=config['nb_layers'],
+             image_size=image_size,
+             conv_depth=config['conv_depth'],
+             bottleneck_heads=config['bottleneck_heads'],
+             drop_path_rate=config['drop_path_rate'],
+             log_function=log_function,
+             only_first=config['only_first'],
+             dot_multiplier=2)
+        
+    model = model.to(config['device'])
+
+    return model
+
+
+
+
+def build_memory_adjacent_model(config, image_size, log_function, nb_channels):
+
+    model = MemoryAdjacent(deep_supervision=config['deep_supervision'],
+             nb_conv=config['nb_conv'],
+             P=config['P'],
+             dumb=config['dumb'],
+             kernel_size=config['kernel_size'],
+             gaussian=config['gaussian'],
+             timesformer=config['timesformer'],
+             supervise_iterations=config['supervise_iterations'],
+             deformable=config['deformable'],
+             skip_co_type=config['skip_co_type'],
+             shrink_select=config['shrink_select'],
+             bottleneck_type=config['bottleneck_type'],
+             marginal=config['marginal'],
+             topk=config['topk'],
+             pos_1d=config['pos_1d'],
+             distance=config['distance'],
+             norm=config['norm'],
+             legacy=config['legacy'],
              nb_channels=nb_channels,
              motion_from_ed=config['motion_from_ed'],
              one_to_all=config['one_to_all'],
              all_to_all=config['all_to_all'],
              final_stride=config['final_stride'],
              use_sfb=config['use_sfb'],
-             backward=backward,
+             out_encoder_dims=config['out_encoder_dims'],
+             inference_mode=config['inference_mode'],
+             in_dims=config['in_encoder_dims'],
+             nb_layers=config['nb_layers'],
+             image_size=image_size,
+             conv_depth=config['conv_depth'],
+             bottleneck_heads=config['bottleneck_heads'],
+             drop_path_rate=config['drop_path_rate'],
+             log_function=log_function,
+             only_first=config['only_first'],
+             dot_multiplier=2)
+        
+    model = model.to(config['device'])
+
+    return model
+
+
+
+
+def build_seg_prediction_model(config, image_size, log_function, nb_channels):
+
+    model = SegPrediction(deep_supervision=config['deep_supervision'],
+             nb_conv=config['nb_conv'],
+             P=config['P'],
+             dumb=config['dumb'],
+             kernel_size=config['kernel_size'],
+             gaussian=config['gaussian'],
+             timesformer=config['timesformer'],
+             supervise_iterations=config['supervise_iterations'],
+             deformable=config['deformable'],
+             skip_co_type=config['skip_co_type'],
+             shrink_select=config['shrink_select'],
+             bottleneck_type=config['bottleneck_type'],
+             marginal=config['marginal'],
+             topk=config['topk'],
+             pos_1d=config['pos_1d'],
+             distance=config['distance'],
+             norm=config['norm'],
+             legacy=config['legacy'],
+             nb_channels=nb_channels,
+             motion_from_ed=config['motion_from_ed'],
+             one_to_all=config['one_to_all'],
+             all_to_all=config['all_to_all'],
+             final_stride=config['final_stride'],
+             use_sfb=config['use_sfb'],
+             out_encoder_dims=config['out_encoder_dims'],
+             inference_mode=config['inference_mode'],
+             in_dims=config['in_encoder_dims'],
+             nb_layers=config['nb_layers'],
+             image_size=image_size,
+             conv_depth=config['conv_depth'],
+             bottleneck_heads=config['bottleneck_heads'],
+             drop_path_rate=config['drop_path_rate'],
+             log_function=log_function,
+             only_first=config['only_first'],
+             dot_multiplier=2)
+        
+    model = model.to(config['device'])
+
+    return model
+
+
+
+def build_final_flow_pred_model(config, image_size, log_function, nb_channels):
+
+    model = FinalFlowPred(deep_supervision=config['deep_supervision'],
+             nb_conv=config['nb_conv'],
+             bottleneck_type=config['bottleneck_type'],
+             align=config['align'],
+             topk=config['topk'],
+             pos_1d=config['pos_1d'],
+             distance=config['distance'],
+             norm=config['norm'],
+             legacy=config['legacy'],
+             nb_channels=nb_channels,
+             motion_from_ed=config['motion_from_ed'],
+             one_to_all=config['one_to_all'],
+             all_to_all=config['all_to_all'],
+             final_stride=config['final_stride'],
+             use_sfb=config['use_sfb'],
+             out_encoder_dims=config['out_encoder_dims'],
+             inference_mode=config['inference_mode'],
+             in_dims=config['in_encoder_dims'],
+             nb_layers=config['nb_layers'],
+             image_size=image_size,
+             conv_depth=config['conv_depth'],
+             bottleneck_heads=config['bottleneck_heads'],
+             drop_path_rate=config['drop_path_rate'],
+             log_function=log_function,
+             only_first=config['only_first'],
+             dot_multiplier=2)
+        
+    model = model.to(config['device'])
+
+    return model
+
+
+
+
+
+def build_final_flow_raft_model(config, image_size, log_function, nb_channels):
+
+    model = FinalFlowRaft(deep_supervision=config['deep_supervision'],
+             nb_conv=config['nb_conv'],
+             bottleneck_type=config['bottleneck_type'],
+             align=config['align'],
+             topk=config['topk'],
+             pos_1d=config['pos_1d'],
+             distance=config['distance'],
+             norm=config['norm'],
+             legacy=config['legacy'],
+             nb_channels=nb_channels,
+             motion_from_ed=config['motion_from_ed'],
+             one_to_all=config['one_to_all'],
+             all_to_all=config['all_to_all'],
+             final_stride=config['final_stride'],
+             use_sfb=config['use_sfb'],
              out_encoder_dims=config['out_encoder_dims'],
              inference_mode=config['inference_mode'],
              in_dims=config['in_encoder_dims'],

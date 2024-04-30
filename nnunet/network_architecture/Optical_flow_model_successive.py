@@ -16,7 +16,7 @@ import sys
 import torch.nn as nn
 import matplotlib.pyplot as plt
 from nnunet.lib.encoder import Encoder, Encoder1D, Encoder3D, Encoder2D
-from nnunet.lib.utils import DoubleConv, MLP, DeformableTransformer, ConvBlocks2DGroupLegacy, ConvBlock, ConvBlocks3DEmbedding, ConvBlocks2DGroup, ConvBlocks2DEmbedding, GetSeparability, GetCrossSimilarityMatrix, ReplicateChannels, To_image, From_image, rescale, CCA
+from nnunet.lib.utils import DoubleConv, MLP, ConvBlocks2DGroupLegacy, ConvBlock, ConvBlocks3DEmbedding, ConvBlocks2DGroup, ConvBlocks2DEmbedding, GetSeparability, GetCrossSimilarityMatrix, ReplicateChannels, To_image, From_image, rescale, CCA
 from nnunet.lib import swin_transformer_2
 from nnunet.lib import decoder_alt
 import torchvision.transforms.functional as TF
@@ -292,7 +292,7 @@ class OpticalFlowModelSuccessive(SegmentationNetwork):
 
         #encoder_in_dims = in_dims[:]
         #encoder_in_dims[0] = 2
-        self.encoder = Encoder2D(out_dims=out_encoder_dims, in_dims=in_dims, conv_depth=conv_depth, norm=norm, legacy=legacy, nb_conv=nb_conv)
+        self.encoder = Encoder2D(out_dims=out_encoder_dims, in_dims=in_dims, conv_depth=conv_depth, norm=norm, legacy=legacy, nb_conv=nb_conv, nb_extra_block=0, residual=False)
         #self.encoder = Encoder3D(out_dims=out_encoder_dims, in_dims=in_dims, conv_depth=conv_depth)
         
         decoder_in_dims = in_dims[:]
@@ -307,11 +307,11 @@ class OpticalFlowModelSuccessive(SegmentationNetwork):
             self.flow_decoder = sfb.Decoder2D(dot_multiplier=dot_multiplier, deep_supervision=deep_supervision, conv_depth=conv_depth_decoder, in_encoder_dims=decoder_in_dims[::-1], out_encoder_dims=out_encoder_dims[::-1], num_classes=2, img_size=image_size, norm=norm, last_activation='identity')
             #self.seg_decoder = sfb.Decoder2D(dot_multiplier=2, deep_supervision=deep_supervision, conv_depth=conv_depth_decoder, in_encoder_dims=decoder_in_dims[::-1], out_encoder_dims=out_encoder_dims[::-1], num_classes=4, img_size=image_size, norm=norm, last_activation='identity')
         else:
-            self.flow_decoder = decoder_alt.Decoder2D(dot_multiplier=dot_multiplier, deep_supervision=deep_supervision, conv_depth=conv_depth_decoder, in_encoder_dims=decoder_in_dims[::-1], out_encoder_dims=out_encoder_dims[::-1], num_classes=2, img_size=image_size, norm=norm, last_activation='identity', legacy=legacy, nb_conv=nb_conv)
+            self.flow_decoder = decoder_alt.Decoder2D(dot_multiplier=dot_multiplier, deep_supervision=deep_supervision, conv_depth=conv_depth_decoder, in_encoder_dims=decoder_in_dims[::-1], out_encoder_dims=out_encoder_dims[::-1], num_classes=2, img_size=image_size, norm=norm, last_activation='identity', legacy=legacy, nb_conv=nb_conv, nb_extra_block=0)
             if self.segmentation:
-                self.segmentation_decoder = decoder_alt.Decoder2D(dot_multiplier=dot_multiplier, deep_supervision=deep_supervision, conv_depth=conv_depth_decoder, in_encoder_dims=decoder_in_dims[::-1], out_encoder_dims=out_encoder_dims[::-1], num_classes=4, img_size=image_size, norm=norm, last_activation='identity', legacy=legacy, nb_conv=nb_conv)
+                self.segmentation_decoder = decoder_alt.Decoder2D(dot_multiplier=dot_multiplier, deep_supervision=deep_supervision, conv_depth=conv_depth_decoder, in_encoder_dims=decoder_in_dims[::-1], out_encoder_dims=out_encoder_dims[::-1], num_classes=4, img_size=image_size, norm=norm, last_activation='identity', legacy=legacy, nb_conv=nb_conv, nb_extra_block=0)
             if self.backward:
-                self.backward_decoder = decoder_alt.Decoder2D(dot_multiplier=dot_multiplier, deep_supervision=deep_supervision, conv_depth=conv_depth_decoder, in_encoder_dims=decoder_in_dims[::-1], out_encoder_dims=out_encoder_dims[::-1], num_classes=2, img_size=image_size, norm=norm, last_activation='identity', legacy=legacy, nb_conv=nb_conv)
+                self.backward_decoder = decoder_alt.Decoder2D(dot_multiplier=dot_multiplier, deep_supervision=deep_supervision, conv_depth=conv_depth_decoder, in_encoder_dims=decoder_in_dims[::-1], out_encoder_dims=out_encoder_dims[::-1], num_classes=2, img_size=image_size, norm=norm, last_activation='identity', legacy=legacy, nb_conv=nb_conv, nb_extra_block=0)
 
         self.H, self.W = (int(image_size / 2**(self.num_stages)), int(image_size / 2**(self.num_stages)))
         #d_ffn = min(2048, self.d_model * 4)
@@ -329,7 +329,7 @@ class OpticalFlowModelSuccessive(SegmentationNetwork):
         self.skip_co_reduction_list = nn.ModuleList()
         for idx, dim in enumerate(out_encoder_dims):
             if legacy:
-                reduction = ConvBlocks2DGroupLegacy(in_dim=2 * dim, out_dim=dim, nb_blocks=1, d_model=None, nb_conv=nb_conv)
+                reduction = ConvBlocks2DGroupLegacy(in_dim=2 * dim, out_dim=dim, nb_blocks=1, nb_conv=nb_conv)
             else:
                 reduction = ConvBlocks2DGroup(in_dim=2 * dim, out_dim=dim, nb_blocks=1)
             self.skip_co_reduction_list.append(reduction)
@@ -405,7 +405,7 @@ class OpticalFlowModelSuccessive(SegmentationNetwork):
                 concatenated = self.skip_co_reduction_list[s](concatenated)
                 flow_skip_co_forward.append(concatenated)
 
-            current_global_motion_forward = self.flow_decoder(forward[t], flow_skip_co_forward)
+            current_global_motion_forward = self.flow_decoder(forward[t], flow_skip_co_forward)[0]
             out['flow'].append(current_global_motion_forward)
 
             if self.segmentation:
@@ -415,16 +415,18 @@ class OpticalFlowModelSuccessive(SegmentationNetwork):
             if self.backward:
                 backward_motion = self.backward_decoder(forward[t], flow_skip_co_forward)
                 out['backward_flow'].append(backward_motion)
+        
+        out['flow'] = torch.stack(out['flow'], dim=0)
 
-        out['flow'] = self.organize_deep_supervision(out['flow'])
-        if self.segmentation:
-            out['seg'] = self.organize_deep_supervision(out['seg'])
-        if self.backward:
-            out['backward_flow'] = self.organize_deep_supervision(out['backward_flow'])
-
-        for k in out.keys():
-            if not self.do_ds:
-                out[k] = out[k][0]
+        #out['flow'] = self.organize_deep_supervision(out['flow'])
+        #if self.segmentation:
+        #    out['seg'] = self.organize_deep_supervision(out['seg'])
+        #if self.backward:
+        #    out['backward_flow'] = self.organize_deep_supervision(out['backward_flow'])
+#
+        #for k in out.keys():
+        #    if not self.do_ds:
+        #        out[k] = out[k][0]
 
         if inference:
             #integration_list = []

@@ -18,7 +18,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     #registered folder path here
-    pred_directory = r"C:\Users\Portal\Documents\voxelmorph\results\2024-01-24_11H28\Lib\test\Postprocessed\Registered"
+    pred_directory = r"C:\Users\Portal\Documents\voxelmorph\2023-12-15_19H01\temp_sum\Lib\test\Postprocessed\Registered"
 
     registered_patients = [name for name in os.listdir(pred_directory) if os.path.isdir(os.path.join(pred_directory, name))]
 

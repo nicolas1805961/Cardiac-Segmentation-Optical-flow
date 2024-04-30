@@ -554,7 +554,7 @@ if __name__ == "__main__":
     default_num_threads = 1
 
     # Postprocessed Flow here
-    pred_file_folder = r"C:\Users\Portal\Documents\voxelmorph\2024-02-08_12H44\Task045_Lib\fold_0\Lib\val\Postprocessed\Flow"
+    pred_file_folder = r"C:\Users\Portal\Documents\voxelmorph\2023-12-15_19H01\cumulative_sum\Lib\test\Postprocessed\Flow"
 
     if 'val' in pred_file_folder:
         gt_folder_name = r"C:\Users\Portal\Documents\Isensee\nnUNet\nnunet\out\nnUNet_preprocessed\Task032_Lib"
@@ -577,6 +577,7 @@ if __name__ == "__main__":
     except:
         config = {'motion_from_ed': True, 'dataloader_modality': 'other'}
 
+    #applied_function = from_ed
     if config['motion_from_ed']:
         if config['dataloader_modality'] == 'all_adjacent':
             applied_function = from_ed_accumulation

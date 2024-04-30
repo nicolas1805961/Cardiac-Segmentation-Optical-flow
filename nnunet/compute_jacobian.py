@@ -68,7 +68,7 @@ if __name__ == "__main__":
 
     # Raw here
     #dir_path = r"C:\Users\Portal\Documents\voxelmorph\results\VM-NCC\Lib\test\Raw\Flow"
-    dir_path = r"C:\Users\Portal\Documents\voxelmorph\2024-01-18_18H32\Task032_Lib\fold_0\Lib\val\Raw\Flow"
+    dir_path = r"C:\Users\Portal\Documents\voxelmorph\multi_task\2024-04-21_06H12_01s_902005\Task045_Lib\fold_0\Lib\val\Raw\Backward_flow"
 
     if dir_path.split(os.sep)[-3] == 'val':
         pkl_dirname = 'voxelmorph_Lib_2D'

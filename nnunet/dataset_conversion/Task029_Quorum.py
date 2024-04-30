@@ -18,6 +18,7 @@ import shutil
 import numpy as np
 from sklearn.model_selection import KFold
 import pandas as pd
+from tqdm import tqdm
 
 def split_factor(all_train_files, sorter_factor_list):
     unique_subfactors = set(sorter_factor_list)
@@ -43,9 +44,9 @@ def convert_to_submission(source_dir, target_dir):
 
 
 if __name__ == "__main__":
-    folder = "custom_quorum_RV_removed"
+    folder = "Quorum_training"
     folder_test = "/media/fabian/My Book/datasets/ACDC/testing/testing"
-    out_folder = os.path.join('out', 'nnUNet_raw_data_base', 'nnUNet_raw_data', 'Task030_Quorum_RV_removed')
+    out_folder = os.path.join('out', 'nnUNet_raw_data_base', 'nnUNet_raw_data', 'Task040_Quorum_training')
     #out_folder = "out\\nnUNet_raw_data_base\\nnUNet_raw_data\Task027_ACDC"
 
     maybe_mkdir_p(join(out_folder, "imagesTr"))
@@ -61,7 +62,7 @@ if __name__ == "__main__":
     all_spacing_between_slices = []
     all_slice_thickness = []
     patient_dirs_train = subfolders(folder, prefix="patient")
-    for p in patient_dirs_train:
+    for p in tqdm(patient_dirs_train):
         current_dir = p
         ed_info_path = os.path.join(current_dir, 'ed_info.csv')
         es_info_path = os.path.join(current_dir, 'es_info.csv')
@@ -157,4 +158,4 @@ if __name__ == "__main__":
         splits[j]['train'] = np.concatenate(train_list)
         splits[j]['val'] = np.concatenate(val_list)
 
-    save_pickle(splits, os.path.join('out', 'nnUNet_raw_data_base', 'nnUNet_raw_data', 'Task030_Quorum_RV_removed', 'splits_final.pkl'))
+    save_pickle(splits, os.path.join('out', 'nnUNet_raw_data_base', 'nnUNet_raw_data', 'Task040_Quorum_training', 'splits_final.pkl'))

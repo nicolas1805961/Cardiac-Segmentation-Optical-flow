@@ -3,9 +3,10 @@ import os
 import scipy
 import csv
 from tqdm import tqdm
+import numpy as np
 
 #strain folder here:
-folder = r'C:\Users\Portal\Documents\voxelmorph\2024-02-18_20H44\Task045_Lib\fold_0\Lib\val\Postprocessed\Strain'
+folder = r'C:\Users\Portal\Documents\voxelmorph\multi_task\2024-04-25_21H46_45s_686392\Task045_Lib\fold_0\Lib\val\Postprocessed\Strain'
 
 path_list = glob(os.path.join(folder, 'AI', '*.mat'))
 out_list = []
@@ -20,8 +21,25 @@ for path in tqdm(path_list):
     peak_gt_radial = mat_gt['Structure_gt']['Sradial_LV_peak']
     peak_ai_circ = mat_ai['Structure_ai']['Scirc_LV_peak']
     peak_gt_circ = mat_gt['Structure_gt']['Scirc_LV_peak']
+
+
+    Sradial_LV_curve_ai = mat_ai['Structure_ai']['Sradial_LV_curve']
+    Sradial_LV_curve_gt = mat_gt['Structure_gt']['Sradial_LV_curve']
+    distance_radial_lv = np.linalg.norm(Sradial_LV_curve_ai - Sradial_LV_curve_gt)
+
+    Scirc_LV_curve_ai = mat_ai['Structure_ai']['Scirc_LV_curve']
+    Scirc_LV_curve_gt = mat_gt['Structure_gt']['Scirc_LV_curve']
+    distance_circ_lv = np.linalg.norm(Scirc_LV_curve_ai - Scirc_LV_curve_gt)
+
+    Scirc_RV_curve_ai = mat_ai['Structure_ai']['Scirc_RV_curve']
+    Scirc_RV_curve_gt = mat_gt['Structure_gt']['Scirc_RV_curve']
+    distance_circ_rv = np.linalg.norm(Scirc_RV_curve_ai - Scirc_RV_curve_gt)
+
     data = {'patient': os.path.basename(path).split('_')[0],
                'slice_nb': os.path.basename(path).split('_')[2],
+               'distance_radial_lv': distance_radial_lv,
+               'distance_circ_lv': distance_circ_lv,
+               'distance_circ_RV': distance_circ_rv,
                'ES_peak_index_ai_radial': peak_ai_radial[0, 0],
                'ED_peak_index_ai_radial': peak_ai_radial[0, 1],
                'ES_peak_value_ai_radial': peak_ai_radial[1, 0],

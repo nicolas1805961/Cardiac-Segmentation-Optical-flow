@@ -414,28 +414,32 @@ def from_ed(patient_name, phase_list_pkl, phase_list_img, phase_list):
     patient_results = {'all': []}
     with open(phase_list_pkl[0], 'rb') as f:
         data = pickle.load(f)
+        print(data)
+        size_after_cropping_xy = np.array(list(data['size_after_cropping']))[1:]
+        size_after_cropping_z = np.array(list(data['size_after_cropping']))[0]
+        size_after_resampling_xy = np.array(list(data['size_after_resampling']))[1:]
+        size_after_resampling_z = np.array(list(data['size_after_resampling']))[0]
+        padding_need = data['padding_need']
+        crop_bbox = data['crop_bbox']
         es_number = np.rint(data['es_number']).astype(int) % len(phase_list)
         ed_number = np.rint(data['ed_number']).astype(int) % len(phase_list)
 
     video = []
+    img_list = []
     for phase in phase_list:
         data = np.load(phase)
         arr = data['flow'] # H, W, D, C
+        img = data['img'].transpose((2, 0, 1)) # D, H, W
         arr = arr.transpose((2, 3, 0, 1)) # D, C, H, W
         video.append(arr)
+        img_list.append(img)
     flow = np.stack(video, axis=1) # D, T, C, H, W
-    flow = flow.transpose(0, 1, 2, 4, 3) # D, T, C, W, H
+    img = np.stack(img_list, axis=1) # D, T, H, W
+    #flow = flow.transpose(0, 1, 2, 4, 3) # D, T, C, W, H
     flow = np.insert(flow, ed_number, values=np.nan, axis=1)
+    img = np.insert(img, ed_number, values=np.nan, axis=1)
 
     spatial_transformer = SpatialTransformerContour(size=flow.shape[-2:])
-
-    video_img = []
-    for phase_img in phase_list_img:
-        data = nib.load(phase_img)
-        arr = data.get_fdata()
-        arr = arr.transpose((2, 0, 1)) # D, H, W
-        video_img.append(arr)
-    img = np.stack(video_img, axis=1) # D, T, H, W
 
     frame_indices = np.arange(len(phase_list_img))
 
@@ -458,8 +462,8 @@ def from_ed(patient_name, phase_list_pkl, phase_list_img, phase_list):
 
     slice_error_list = []
     for d in range(len(flow)):
-        if patient_name == 'patient029' and d == 0:
-            continue
+        current_padding_need = padding_need[:, d] # left, right, top, bottom
+
         current_slice_flow = flow[d] # T, 2, H, W
         slice_nb = str(d + 1).zfill(2)
         filename = patient_name + '_slice' + slice_nb + '.npy'
@@ -471,8 +475,16 @@ def from_ed(patient_name, phase_list_pkl, phase_list_img, phase_list):
         gt_epi_contour = gt_lv_contour[:, :, 2:]
         split_index = np.cumsum([gt_endo_contour.shape[1], gt_epi_contour.shape[1]])
         contours = np.concatenate([gt_endo_contour, gt_epi_contour, gt_rv_contour], axis=1) # T, P, 2
-
         contours = contours[frame_indices] - 1
+
+        contours[:, :, 0] = contours[:, :, 0] - crop_bbox[1][0]
+        contours[:, :, 1] = contours[:, :, 1] - crop_bbox[2][0]
+
+        scaling_ratio = size_after_resampling_xy / size_after_cropping_xy
+        print(size_after_resampling_xy)
+        print(size_after_cropping_xy)
+        print(scaling_ratio)
+
 
         contours = torch.from_numpy(contours.copy()).float()
         current_slice_flow = torch.from_numpy(current_slice_flow.copy()).float()
@@ -487,30 +499,30 @@ def from_ed(patient_name, phase_list_pkl, phase_list_img, phase_list):
 
             current_frame_flow = current_slice_flow[t] # 2, H, W; index 0 is nan so start at index 1
 
-            #current_frame_flow = current_frame_flow.transpose((1, 2, 0)) # H, W, 2
-            #x = np.rint(current_contours[:, 0]).astype(int)
-            #y = np.rint(current_contours[:, 1]).astype(int)
+            current_frame_flow = current_frame_flow.numpy().transpose((1, 2, 0)) # H, W, 2
+            x = np.rint(current_contours.numpy()[:, 0]).astype(int)
+            y = np.rint(current_contours.numpy()[:, 1]).astype(int)
 
-            #x_range = np.arange(0, current_frame_flow.shape[1])
-            #y_range = np.arange(0, current_frame_flow.shape[0])
-            #xv, yv = np.meshgrid(x_range, y_range)
-            #grid_x = current_frame_flow[:, :, 0] + xv
-            #grid_y = current_frame_flow[:, :, 1] + yv
-            #grid_x = grid_x[y, x]
-            #grid_y = grid_y[y, x]
-            #grid_x_alt = current_frame_flow[:, :, 1] + xv
-            #grid_y_alt = current_frame_flow[:, :, 0] + yv
-            #grid_x_alt = grid_x_alt[y, x]
-            #grid_y_alt = grid_y_alt[y, x]
+            x_range = np.arange(0, current_frame_flow.shape[1])
+            y_range = np.arange(0, current_frame_flow.shape[0])
+            xv, yv = np.meshgrid(x_range, y_range)
+            grid_x = current_frame_flow[:, :, 0] + xv
+            grid_y = current_frame_flow[:, :, 1] + yv
+            grid_x = grid_x[y, x]
+            grid_y = grid_y[y, x]
+            grid_x_alt = current_frame_flow[:, :, 1] + xv
+            grid_y_alt = current_frame_flow[:, :, 0] + yv
+            grid_x_alt = grid_x_alt[y, x]
+            grid_y_alt = grid_y_alt[y, x]
 
-            #fig, ax = plt.subplots(1, 2)
-            #ax[0].imshow(img[d, -1, :, :], cmap='gray')
-            #ax[1].imshow(img[d, -1, :, :], cmap='gray')
-            #ax[0].scatter(grid_x, grid_y, c='r')
-            #ax[0].scatter(next_contours[:, 0], next_contours[:, 1], c='g')
-            #ax[1].scatter(grid_x_alt, grid_y_alt, c='b')
-            #ax[1].scatter(next_contours[:, 0], next_contours[:, 1], c='g')
-            #plt.show()
+            fig, ax = plt.subplots(1, 2)
+            ax[0].imshow(img[d, -1, :, :], cmap='gray')
+            ax[1].imshow(img[d, -1, :, :], cmap='gray')
+            ax[0].scatter(grid_x, grid_y, c='r')
+            ax[0].scatter(next_contours[:, 0], next_contours[:, 1], c='g')
+            ax[1].scatter(grid_x_alt, grid_y_alt, c='b')
+            ax[1].scatter(next_contours[:, 0], next_contours[:, 1], c='g')
+            plt.show()
 
             delta_pred = spatial_transformer(torch.clone(first_contours), current_frame_flow[None])
             new_predicted_points = (first_contours + delta_pred).squeeze()
@@ -547,147 +559,12 @@ def from_ed(patient_name, phase_list_pkl, phase_list_img, phase_list):
 
 
 
-
-
-def forward(patient_name, phase_list_pkl, phase_list_img, phase_list):
-
-    patient_results = {'all': []}
-    with open(phase_list_pkl[0], 'rb') as f:
-        data = pickle.load(f)
-        es_number = np.rint(data['es_number']).astype(int) % len(phase_list)
-        ed_number = np.rint(data['ed_number']).astype(int) % len(phase_list)
-
-    video = []
-    for phase in phase_list:
-        data = np.load(phase)
-        arr = data['flow'] # H, W, D, C
-        arr = arr.transpose((2, 3, 0, 1)) # D, C, H, W
-        video.append(arr)
-    flow = np.stack(video, axis=1) # D, T, C, H, W
-    flow = flow.transpose(0, 1, 2, 4, 3) # D, T, C, W, H
-    flow = np.insert(flow, ed_number, values=np.nan, axis=1)
-
-    spatial_transformer = SpatialTransformerContour(size=flow.shape[-2:])
-
-    video_img = []
-    for phase_img in phase_list_img:
-        data = nib.load(phase_img)
-        arr = data.get_fdata()
-        arr = arr.transpose((2, 0, 1)) # D, H, W
-        video_img.append(arr)
-    img = np.stack(video_img, axis=1) # D, T, H, W
-
-    frame_indices = np.arange(len(phase_list_img))
-
-    before_where = np.argwhere(frame_indices < ed_number).reshape(-1,)
-    after_where = np.argwhere(frame_indices >= ed_number).reshape(-1,)
-
-    all_where = np.concatenate([after_where, before_where])
-
-    frame_indices = frame_indices[all_where]
-    img = img[:, frame_indices]
-    flow = flow[:, frame_indices]
-
-    assert frame_indices[0] == ed_number
-
-    #fig, ax = plt.subplots(1, 1)
-    #X, Y = np.meshgrid(np.arange(0, flow.shape[-1], step=step), np.arange(flow.shape[-2], step=step))
-    #ax.imshow(img[0, es_number, :, :], cmap='gray')
-    #ax.quiver(X, Y, flow[0, es_number, 1, ::step, ::step], flow[0, es_number, 0, ::step, ::step], color='r', angles='xy', scale_units='xy', scale=1)
-    #plt.show()
-
-    slice_error_list = []
-    for d in range(len(flow)):
-        if patient_name == 'patient029' and d == 0:
-            continue
-        current_slice_flow = flow[d] # T, 2, H, W
-        slice_nb = str(d + 1).zfill(2)
-        filename = patient_name + '_slice' + slice_nb + '.npy'
-        gt_path_lv = os.path.join(gt_folder_name, 'contour', 'LV', filename)
-        gt_path_rv = os.path.join(gt_folder_name, 'contour', 'RV', filename)
-        gt_lv_contour = np.load(gt_path_lv).transpose((2, 1, 0)) # T, P1, 4
-        gt_rv_contour = np.load(gt_path_rv).transpose((2, 1, 0)) # T, P2, 2
-        gt_endo_contour = gt_lv_contour[:, :, :2]
-        gt_epi_contour = gt_lv_contour[:, :, 2:]
-        split_index = np.cumsum([gt_endo_contour.shape[1], gt_epi_contour.shape[1]])
-        contours = np.concatenate([gt_endo_contour, gt_epi_contour, gt_rv_contour], axis=1) # T, P, 2
-
-        contours = contours[frame_indices] - 1
-
-        contours = torch.from_numpy(contours.copy()).float()
-        current_slice_flow = torch.from_numpy(current_slice_flow.copy()).float()
-
-        first_contours = contours[0] # P, 2
-
-        temporal_error_list = []
-        for t in range(1, len(current_slice_flow)):
-            current_contours = contours[t] # P, 2
-            current_contours = current_contours.transpose(1, 0) # 2, P
-            current_contours = current_contours[None, :, None, :] # 1, 2, 1, P
-
-            current_frame_flow = current_slice_flow[t] # 2, H, W; index 0 is nan so start at index 1
-
-            #current_frame_flow = current_frame_flow.transpose((1, 2, 0)) # H, W, 2
-            #x = np.rint(current_contours[:, 0]).astype(int)
-            #y = np.rint(current_contours[:, 1]).astype(int)
-
-            #x_range = np.arange(0, current_frame_flow.shape[1])
-            #y_range = np.arange(0, current_frame_flow.shape[0])
-            #xv, yv = np.meshgrid(x_range, y_range)
-            #grid_x = current_frame_flow[:, :, 0] + xv
-            #grid_y = current_frame_flow[:, :, 1] + yv
-            #grid_x = grid_x[y, x]
-            #grid_y = grid_y[y, x]
-            #grid_x_alt = current_frame_flow[:, :, 1] + xv
-            #grid_y_alt = current_frame_flow[:, :, 0] + yv
-            #grid_x_alt = grid_x_alt[y, x]
-            #grid_y_alt = grid_y_alt[y, x]
-
-            #fig, ax = plt.subplots(1, 2)
-            #ax[0].imshow(img[d, -1, :, :], cmap='gray')
-            #ax[1].imshow(img[d, -1, :, :], cmap='gray')
-            #ax[0].scatter(grid_x, grid_y, c='r')
-            #ax[0].scatter(next_contours[:, 0], next_contours[:, 1], c='g')
-            #ax[1].scatter(grid_x_alt, grid_y_alt, c='b')
-            #ax[1].scatter(next_contours[:, 0], next_contours[:, 1], c='g')
-            #plt.show()
-
-            delta_pred = spatial_transformer(torch.clone(current_contours), current_frame_flow[None])
-            new_predicted_points = (current_contours + delta_pred).squeeze()
-            new_predicted_points = new_predicted_points.permute(1, 0).numpy()
-
-            #delta_pred = current_frame_flow[y, x, :] # P, 2
-            euclidean_distance = norm(first_contours - new_predicted_points, axis=1) # P, careful here x and y (voxelmorph)
-            #error = np.abs(gt_delta - delta_pred).mean(-1) # P, careful here x and y (voxelmorph)
-            #error = np.abs(gt_delta - np.flip(delta_pred, axis=-1)).mean(-1) # P, careful here x and y (not voxelmorph)
-            temporal_error_list.append(euclidean_distance)
-            #print(f'ERROR: {error.mean()}, ERROR2: {error_2.mean()}')
-
-        temporal_error_list = np.stack(temporal_error_list, axis=0) # T, P
-
-        error = np.split(temporal_error_list, indices_or_sections=split_index, axis=1) # [(T, P1) , (T, P2), (T, P3)]
-        error = np.stack([x.mean(-1) for x in error], axis=-1) # T, 3
-
-        slice_error_list.append(error)
-    slice_error_list = np.stack(slice_error_list, axis=0) # D, T, 3
-
-    #sorted_where = np.argsort(all_where)
-    #slice_error_list_initial = slice_error_list[:, sorted_where]
-
-    for i in range(slice_error_list.shape[0]):
-        current_res = slice_error_list[i] # T, 3
-        current_res_info = {'Name': patient_name,
-                            'slice_number': i,
-                            'ENDO': current_res[:, 0].tolist(),
-                            'EPI': current_res[:, 1].tolist(),
-                            'RV': current_res[:, 2].tolist()}
-        patient_results['all'].append(current_res_info)
-
-    return patient_results
-
-
-
 if __name__ == "__main__":
+
+    # parse commandline args
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--test_or_val', required=True, help='Whether this is testing or validation set')
+    args = parser.parse_args()
 
     results = {"all": [], "mean": None}
     results_per_patient = {"all": {}, "mean": None}
@@ -695,19 +572,21 @@ if __name__ == "__main__":
 
     default_num_threads = 1
 
-    # Postprocessed Flow here
-    pred_file_folder = r"C:\Users\Portal\Documents\voxelmorph\multi_task\2024-04-21_06H12_01s_902005\Task045_Lib\fold_0\Lib\val\Postprocessed\Backward_flow"
-
-    if 'val' in pred_file_folder:
-        gt_folder_name = r"C:\Users\Portal\Documents\Isensee\nnUNet\nnunet\out\nnUNet_preprocessed\Task045_Lib"
+    if args.test_or_val == 'val':
+        pkl_path = r"C:\Users\Portal\Documents\voxelmorph\voxelmorph_Lib_2D"
+        gt_folder_name = r"C:\Users\Portal\Documents\Isensee\nnUNet\nnunet\out\nnUNet_preprocessed\Task032_Lib"
         gt_folder_lib = 'Lib_training_2'
-    elif 'test' in pred_file_folder:
-        gt_folder_name = r"C:\Users\Portal\Documents\Isensee\nnUNet\nnunet\out\nnUNet_preprocessed\Task046_Lib"
+    elif args.test_or_val == 'test':
+        pkl_path = r"C:\Users\Portal\Documents\voxelmorph\voxelmorph_Lib_2D_testing"
+        gt_folder_name = r"C:\Users\Portal\Documents\Isensee\nnUNet\nnunet\out\nnUNet_preprocessed\Task036_Lib"
         gt_folder_lib = 'Lib_testing_2'
 
     #pred_file_folder = os.path.join(pred_folder, r"C:\Users\Portal\Documents\voxelmorph\results\Lib_regu_not_all_small\Validation\Flow")
     #pred_file_folder = os.path.join(pred_folder, r"C:\Users\Portal\Documents\voxelmorph\testings_no_regu\inference\Validation\Flow")
     #pred_file_folder = os.path.join(pred_folder, r"C:\Users\Portal\Documents\voxelmorph\testings2_small\inference\Validation\Flow")
+
+    # Postprocessed Flow here
+    pred_file_folder = r"C:\Users\Portal\Documents\voxelmorph\2023-12-14_17H47\Task032_Lib\fold_0\Lib\test\Raw\Flow"
 
     splitted = pred_file_folder.split(os.sep)
     is_date_list = [is_date(x, True) for x in splitted]
@@ -741,7 +620,7 @@ if __name__ == "__main__":
         all_files_img = glob(os.path.join(gt_folder_lib, patient_name, '*.gz'))
         all_files_img = sorted([x for x in all_files_img if '_gt' not in x])
 
-        all_files_pkl = glob(os.path.join(gt_folder_lib, patient_name, '*.pkl'))
+        all_files_pkl = glob(os.path.join(pkl_path, patient_name + '*.pkl'))
 
         phase_list = np.array(sorted(all_files, key=lambda x: int(os.path.basename(x).split('.')[0][-2:])))
         phase_list_img = np.array(sorted(all_files_img, key=lambda x: int(os.path.basename(x).split('.')[0][-2:])))
