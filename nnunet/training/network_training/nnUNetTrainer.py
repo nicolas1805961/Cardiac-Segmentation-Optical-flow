@@ -871,7 +871,7 @@ class nnUNetTrainer(NetworkTrainer):
         self.print_to_log_file("finished prediction")
 
         determine_postprocessing_custom_with_metrics(self.output_folder, self.gt_niftis_folder, validation_folder_name,
-                                    final_subf_name=validation_folder_name + "_postprocessed", debug=True, metadata_list=metadata_list, nb_threads=nb_threads, rv_rejection=rv_rejection)
+                                    final_subf_name=validation_folder_name + "_postprocessed", debug=True, metadata_list=metadata_list, nb_threads=nb_threads, rv_rejection=rv_rejection, log_function=self.print_to_log_file)
 
 
 

@@ -98,6 +98,7 @@ def load_case_from_list_of_files(data_files, seg_file=None, info_dict=None):
         seg_npy = sitk.GetArrayFromImage(seg_itk)[None].astype(np.float32)
     else:
         seg_npy = None
+
     return data_npy.astype(np.float32), seg_npy, properties
 
 
@@ -217,8 +218,9 @@ class ImageCropper(object):
 
             current_data = data_list[i]
             current_seg = seg_list[i]
-            current_data = np.pad(current_data, current_padding)
-            current_seg = np.pad(current_seg, current_padding)
+            if 'Quorum' not in case[i][0]:
+                current_data = np.pad(current_data, current_padding)
+                current_seg = np.pad(current_seg, current_padding)
 
             current_property = property_list[i]
             current_property['size_after_cropping'] = current_data[0].shape

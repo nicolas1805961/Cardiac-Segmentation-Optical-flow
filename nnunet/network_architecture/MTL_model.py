@@ -9,7 +9,6 @@ from torchvision.transforms.functional import resize
 from monai.transforms import NormalizeIntensity
 import psutil
 import os
-from nnunet.analysis import flop_count_operators
 import matplotlib
 from copy import copy
 from math import ceil
@@ -32,7 +31,7 @@ from nnunet.lib.vq_vae import VectorQuantizer, VectorQuantizerEMA, VanillaVAE, Q
 from torch.cuda.amp import autocast
 from nnunet.utilities.random_stuff import no_op
 from typing import Union, Tuple
-from nnunet.lib.vit_transformer import SpatialTransformerLayer, ChannelAttention, TransformerEncoderLayer, TransformerEncoder, CrossTransformerEncoderLayer, CrossTransformerEncoder, RelativeTransformerEncoderLayer
+from nnunet.lib.vit_transformer import SpatialTransformerLayer, ChannelAttention, TransformerEncoderLayer, TransformerEncoder, CrossTransformerEncoderLayer, CrossTransformerEncoder
 from batchgenerators.augmentations.utils import pad_nd_image
 from ..training.dataloading.dataset_loading import get_idx, select_idx
 from nnunet.lib.position_embedding import PositionEmbeddingSine2d, PositionEmbeddingLearned
@@ -876,6 +875,14 @@ class MTLmodel(SegmentationNetwork):
         
             padding_need = padding_need[None]
 
+        else:
+            data_list = []
+            for b in range(len(x)):
+                if normalize:
+                    current_x = NormalizeIntensity()(x[b])[None]
+                data_list.append(current_x)
+            x = torch.cat(data_list, dim=0)
+
         result_torch = torch.zeros([x.shape[0], self.num_classes] + list(x.shape[2:]), dtype=torch.float)
 
         if torch.cuda.is_available():
@@ -885,7 +892,6 @@ class MTLmodel(SegmentationNetwork):
         #fig, ax = plt.subplots(1, 1)
         #ax.imshow(x[0, 0].cpu(), cmap='gray')
         #plt.show()
-        
 
         for m in range(mirror_idx):
             if m == 0:

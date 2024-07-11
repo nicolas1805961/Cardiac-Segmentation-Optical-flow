@@ -112,9 +112,17 @@ def save_segmentation_nifti_from_softmax(segmentation_softmax: Union[str, np.nda
                                                axis=lowres_axis, order=order, do_separate_z=do_separate_z,
                                                order_z=interpolation_order_z)
         if flow is not None:
+            rescale_y = shape_original_after_cropping[1] / flow.shape[2]
+            rescale_x = shape_original_after_cropping[2] / flow.shape[3]
             flow = resample_data_or_seg(flow, shape_original_after_cropping, is_seg=False,
                                                axis=lowres_axis, order=order, do_separate_z=do_separate_z,
                                                order_z=interpolation_order_z)
+            #flow[0] = flow[0] * rescale_x
+            #flow[1] = flow[1] * rescale_y
+
+            flow[0] = flow[0] * rescale_y
+            flow[1] = flow[1] * rescale_x
+            
         if registered is not None:
             registered = resample_data_or_seg(registered, shape_original_after_cropping, is_seg=True,
                                                axis=lowres_axis, order=0, do_separate_z=do_separate_z,

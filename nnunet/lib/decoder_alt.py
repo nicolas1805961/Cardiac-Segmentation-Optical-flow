@@ -801,6 +801,7 @@ class Decoder2D(nn.Module):
     """
 
     def __init__(self,
+                 d_model,
                 conv_depth,
                 in_encoder_dims, 
                 out_encoder_dims,
@@ -811,7 +812,7 @@ class Decoder2D(nn.Module):
                 nb_conv,
                 legacy,
                 norm,
-                nb_extra_block,
+                residual,
                 skip_co=True,
                 last_activation='identity',
                 **kwargs):
@@ -824,7 +825,6 @@ class Decoder2D(nn.Module):
         self.skip_co = skip_co
         self.dot_multiplier = dot_multiplier
         self.deep_supervision = deep_supervision
-        self.nb_extra_block = nb_extra_block
         
         # build decoder layers
         self.layers = nn.ModuleList()
@@ -840,7 +840,8 @@ class Decoder2D(nn.Module):
         #                                    nb_conv=nb_extra_block)
 
         for i_layer in range(self.num_stages):
-            in_dim = out_encoder_dims[i_layer] * 2 if i_layer == 0 else in_encoder_dims[i_layer - 1]
+            #residual = False if i_layer == self.num_stages - 1 else residual
+            in_dim = d_model if i_layer == 0 else in_encoder_dims[i_layer - 1]
 
             deep_supervision_layer = nn.Identity()
             if deep_supervision and i_layer < self.num_stages - 1:
@@ -871,7 +872,8 @@ class Decoder2D(nn.Module):
                                 out_dim=out_dim,
                                 nb_blocks=conv_depth[i_layer],
                                 kernel_size=3,
-                                nb_conv=nb_conv)
+                                nb_conv=nb_conv,
+                                residual=residual)
                 else: 
                     layer_up = ConvBlocks2DGroup(in_dim=in_dim, 
                                     out_dim=out_dim,
@@ -1132,6 +1134,7 @@ class Decoder2DTransformer6(nn.Module):
                 legacy,
                 norm,
                 nb_extra_block,
+                remove_last_block,
                 add_motion_cues,
                 memory_length,
                 skip_co=True,
@@ -1147,6 +1150,7 @@ class Decoder2DTransformer6(nn.Module):
         self.dot_multiplier = dot_multiplier
         self.deep_supervision = deep_supervision
         self.nb_extra_block = nb_extra_block
+        self.remove_last_block = remove_last_block
         
         # build decoder layers
         self.layers = nn.ModuleList()
@@ -1162,14 +1166,16 @@ class Decoder2DTransformer6(nn.Module):
         #                                    nb_blocks=conv_depth[0],
         #                                    nb_conv=nb_extra_block)
         
+        heads = [8, 4, 4]
+        points = [4, 4, 4]
         self.skip_co_transformer_list = nn.ModuleList()
         for i_layer in range(self.num_stages):
             in_dim = out_encoder_dims[i_layer] * 2 if i_layer == 0 else in_encoder_dims[i_layer - 1]
             #print(4**(i_layer + 1))
-            if i_layer == self.num_stages - 1:
+            if self.remove_last_block and i_layer == self.num_stages - 1:
                 transformer = nn.Identity()
             else:
-                transformer = DeformableTransformer6(dim=out_encoder_dims[i_layer], nhead=8, num_layers=1, memory_length=memory_length, add_motion_cues=add_motion_cues, self_attention=False)
+                transformer = DeformableTransformer6(dim=out_encoder_dims[i_layer], nhead=heads[i_layer], num_layers=1, memory_length=memory_length, add_motion_cues=add_motion_cues, self_attention=False, points=points[i_layer])
                 #transformer = DeformableTransformer(dim=out_encoder_dims[i_layer], nhead=2**(self.num_stages - 1 - i_layer), num_layers=1, memory_length=memory_length, self_attention=False)
                 
             deep_supervision_layer = nn.Identity()
@@ -1227,7 +1233,7 @@ class Decoder2DTransformer6(nn.Module):
         self.last_activation = nn.Identity()
     
 
-    def forward(self, x, skip_co, memory, query, video_length):
+    def forward(self, x, skip_co, memory, query, video_length, index):
         out = []
 
         #if self.nb_extra_block > 0:
@@ -1240,7 +1246,7 @@ class Decoder2DTransformer6(nn.Module):
                 query_skip_connection,
                 deep_supervision_layer,
                 transformer,
-                reduction,
+                reduction
                 ) in enumerate(zip(
                     self.layers,
                     self.upsample_layers,
@@ -1255,10 +1261,12 @@ class Decoder2DTransformer6(nn.Module):
             if self.skip_co:
                 x = torch.cat((encoder_skip_connection, x), dim=1)
                 x = reduction(x)
+                out.append(x)
                 if i < self.num_stages - 1:
-                    x, sampling_locations, attention_weights, offsets = transformer(query=x, key=memory_skip_connection, value=query_skip_connection, video_length=video_length)
+                    x, sampling_locations, attention_weights, offsets = transformer(query=x, key=memory_skip_connection, value=query_skip_connection, video_length=video_length, index=index)
+                elif not self.remove_last_block:
+                    x, sampling_locations, attention_weights, offsets = transformer(query=x, key=memory_skip_connection, value=query_skip_connection, video_length=video_length, index=index)
             x = layer_up(x)
-            out.append(deep_supervision_layer(x))
         
         x = self.final_conv(x)
         x = self.last_activation(x)
@@ -1266,8 +1274,6 @@ class Decoder2DTransformer6(nn.Module):
 
         out = out[::-1]
         return x, out, sampling_locations, attention_weights, offsets
-    
-
 
 
 

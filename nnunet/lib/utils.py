@@ -25,6 +25,41 @@ import sys
 from torch.nn.functional import affine_grid
 from torch.nn.functional import grid_sample
 
+
+def warp(x, flo):
+        """
+        warp an image/tensor (im2) back to im1, according to the optical flow
+
+        x: [B, C, H, W] (im2)
+        flo: [B, 2, H, W] flow
+
+        """
+        B, C, H, W = x.size()
+        # mesh grid 
+        xx = torch.arange(0, W).view(1,-1).repeat(H,1)
+        yy = torch.arange(0, H).view(-1,1).repeat(1,W)
+        xx = xx.view(1,1,H,W).repeat(B,1,1,1)
+        yy = yy.view(1,1,H,W).repeat(B,1,1,1)
+        grid = torch.cat((xx,yy),1).float()
+
+        grid = grid.cuda()
+        vgrid = grid + flo
+
+        # scale grid to [-1,1] 
+        vgrid[:,0,:,:] = 2.0*vgrid[:,0,:,:].clone() / max(W-1,1)-1.0
+        vgrid[:,1,:,:] = 2.0*vgrid[:,1,:,:].clone() / max(H-1,1)-1.0
+
+        vgrid = vgrid.permute(0,2,3,1)        
+        output = nn.functional.grid_sample(x, vgrid)
+
+        # if W==128:
+            # np.save('mask.npy', mask.cpu().data.numpy())
+            # np.save('warp.npy', output.cpu().data.numpy())
+        
+        return output
+
+
+
 class KeyProjection(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -1111,21 +1146,22 @@ class ConvBlocks2DGroup(nn.Module):
 
 
 class DoubleConvBatch(nn.Module):
-    def __init__(self, in_dim, out_dim, residual, d_model=None, kernel_size=3):
+    def __init__(self, in_dim, out_dim, residual, stride=1, kernel_size=3):
         super(DoubleConvBatch, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels=in_dim, out_channels=out_dim, kernel_size=kernel_size, padding='same')
+        self.conv1 = nn.Conv2d(in_channels=in_dim, out_channels=out_dim, kernel_size=kernel_size, stride=stride, padding=1)
         self.norm1 = nn.BatchNorm2d(out_dim)
-        self.conv2 = nn.Conv2d(in_channels=out_dim, out_channels=out_dim, kernel_size=kernel_size, padding='same')
+        self.conv2 = nn.Conv2d(in_channels=out_dim, out_channels=out_dim, kernel_size=kernel_size, padding=1)
         self.norm2 = nn.BatchNorm2d(out_dim)
         self.gelu = nn.GELU()
 
         self.residual = residual
+        if self.residual and (in_dim != out_dim or stride != 1):
+            self.downsample = nn.Sequential(nn.Conv2d(in_channels=in_dim, out_channels=out_dim, stride=stride, kernel_size=1), nn.BatchNorm2d(out_dim))
+        else:
+            self.downsample = nn.Identity()
     
     def forward(self, x):
-        """"dist_emb: B, C"""
-        identity = x
-        B, C, H, W = x.shape
-
+        
         residual = x
         
         x = self.conv1(x)
@@ -1134,30 +1170,32 @@ class DoubleConvBatch(nn.Module):
 
         x = self.conv2(x)
         x = self.norm2(x)
-        #if self.residual:
-        #    x = x + residual
         x = self.gelu(x)
+
+        if self.residual:
+            x = x + self.downsample(residual)
 
         return x
     
 
 
 class DoubleConv(nn.Module):
-    def __init__(self, in_dim, out_dim, residual, d_model=None, kernel_size=3):
+    def __init__(self, in_dim, out_dim, residual, stride=1, kernel_size=3):
         super(DoubleConv, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels=in_dim, out_channels=out_dim, kernel_size=kernel_size, padding='same')
+        self.conv1 = nn.Conv2d(in_channels=in_dim, out_channels=out_dim, kernel_size=kernel_size, stride=stride, padding=1)
         self.norm1 = nn.GroupNorm(8, out_dim)
-        self.conv2 = nn.Conv2d(in_channels=out_dim, out_channels=out_dim, kernel_size=kernel_size, padding='same')
+        self.conv2 = nn.Conv2d(in_channels=out_dim, out_channels=out_dim, kernel_size=kernel_size, padding=1)
         self.norm2 = nn.GroupNorm(8, out_dim)
         self.gelu = nn.GELU()
         self.embedding = False
 
         self.residual = residual
+        if self.residual and (in_dim != out_dim or stride != 1):
+            self.downsample = nn.Sequential(nn.Conv2d(in_channels=in_dim, out_channels=out_dim, stride=stride, kernel_size=1), nn.GroupNorm(8, out_dim))
+        else:
+            self.downsample = nn.Identity()
     
     def forward(self, x):
-        """"dist_emb: B, C"""
-        identity = x
-        B, C, H, W = x.shape
 
         residual = x
         
@@ -1167,9 +1205,10 @@ class DoubleConv(nn.Module):
 
         x = self.conv2(x)
         x = self.norm2(x)
-        #if self.residual:
-        #    x = x + residual
         x = self.gelu(x)
+
+        if self.residual:
+            x = x + self.downsample(residual)
 
         return x
     
@@ -1198,21 +1237,28 @@ class SingleConvBatch(nn.Module):
 
 
 class SingleConv(nn.Module):
-    def __init__(self, in_dim, out_dim, residual, d_model=None, kernel_size=3):
+    def __init__(self, in_dim, out_dim, residual, stride=1, kernel_size=3):
         super(SingleConv, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels=in_dim, out_channels=out_dim, kernel_size=kernel_size, padding='same')
+        self.conv1 = nn.Conv2d(in_channels=in_dim, out_channels=out_dim, kernel_size=kernel_size, stride=stride, padding=1)
         self.norm1 = nn.GroupNorm(8, out_dim)
         self.gelu = nn.GELU()
         self.embedding = False
         self.residual = residual
+
+        self.residual = residual
+        if self.residual and (in_dim != out_dim or stride != 1):
+            self.downsample = nn.Conv2d(in_channels=in_dim, out_channels=out_dim, stride=stride, kernel_size=1)
+        else:
+            self.downsample = nn.Identity()
     
     def forward(self, x):
-        """"dist_emb: B, C"""
-        identity = x
-        B, C, H, W = x.shape
+
+        residual = x
         
         x = self.conv1(x)
         x = self.norm1(x)
+        if self.residual:
+            x = x + self.downsample(residual)
         x = self.gelu(x)
 
         return x
@@ -1297,7 +1343,7 @@ class DoubleConv3D(nn.Module):
 
 
 class ConvBlocks2DGroupLegacy(nn.Module):
-    def __init__(self, in_dim, out_dim, nb_blocks, residual=False, kernel_size=3, nb_conv=2):
+    def __init__(self, in_dim, out_dim, nb_blocks, stride=1, residual=False, kernel_size=3, nb_conv=2):
         super(ConvBlocks2DGroupLegacy, self).__init__()
         dims = torch.linspace(in_dim, out_dim, nb_blocks+1).int()
         dims[1:] = (torch.round(dims[1:] / 8) * 8).int()
@@ -1310,7 +1356,7 @@ class ConvBlocks2DGroupLegacy(nn.Module):
             blockfunction = SingleConv
 
         for i in range(nb_blocks):
-            block = blockfunction(in_dim=dims[i], out_dim=dims[i+1], residual=residual)
+            block = blockfunction(in_dim=dims[i], out_dim=dims[i+1], residual=residual, stride=stride)
             self.blocks.append(block)
     
     def forward(self, x):
@@ -1394,7 +1440,7 @@ class ConvBlocks3DGroup(nn.Module):
 
 
 class ConvBlocks2DBatch(nn.Module):
-    def __init__(self, in_dim, out_dim, nb_blocks, residual=False, kernel_size=3, nb_conv=2):
+    def __init__(self, in_dim, out_dim, nb_blocks, stride=1, residual=False, kernel_size=3, nb_conv=2):
         super(ConvBlocks2DBatch, self).__init__()
         dims = torch.linspace(in_dim, out_dim, nb_blocks+1).int()
         dims[1:] = (torch.round(dims[1:] / 8) * 8).int()
@@ -1407,7 +1453,7 @@ class ConvBlocks2DBatch(nn.Module):
             blockfunction = SingleConvBatch
 
         for i in range(nb_blocks):
-            block = blockfunction(in_dim=dims[i], out_dim=dims[i+1], residual=residual)
+            block = blockfunction(in_dim=dims[i], out_dim=dims[i+1], stride=stride, residual=residual)
             self.blocks.append(block)
     
     def forward(self, x):

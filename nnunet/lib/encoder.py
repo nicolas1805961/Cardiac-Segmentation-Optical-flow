@@ -14,6 +14,7 @@ from einops.layers.torch import Rearrange
 import sys
 import matplotlib.pyplot as plt
 from . import swin_cross_attention
+from .vit_transformer import TransformerEncoderLayer
 
 class FusionModuleConv(nn.Module):
     def __init__(self, 
@@ -537,17 +538,21 @@ class Encoder2D(nn.Module):
         use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False
     """
 
-    def __init__(self, conv_depth, in_dims, out_dims, norm, legacy, nb_conv, nb_extra_block, residual):
+    def __init__(self, d_model, conv_depth, in_dims, out_dims, norm, legacy, nb_conv, extra_block, residual, expand, nhead, downsample_conv):
         super().__init__()
 
         self.num_stages = len(conv_depth)
-        self.nb_extra_block = nb_extra_block
+        self.extra_block = extra_block
+        self.expand = expand
+        self.nhead = nhead
+        self.downsample_conv = downsample_conv
 
         # build encoder layers
         self.layers = nn.ModuleList()
         self.downsample_layers = nn.ModuleList()
         for i_layer in range(self.num_stages):
-            out_dim = 2*out_dims[i_layer] if i_layer == self.num_stages - 1 else in_dims[i_layer+1]
+            #residual = False if i_layer == 0 else residual
+            out_dim = d_model if i_layer == self.num_stages - 1 else in_dims[i_layer+1]
             if norm == 'group':
                 if legacy:
                     layer = ConvBlocks2DGroupLegacy(in_dim=in_dims[i_layer],
@@ -561,8 +566,18 @@ class Encoder2D(nn.Module):
                                         kernel_size=3,
                                         out_dim=out_dims[i_layer],
                                         nb_blocks=conv_depth[i_layer])
-                                    
-                downsample_layer = PatchMerging2DGroup(in_dim=out_dims[i_layer], out_dim=out_dim)
+                    
+                if self.downsample_conv == 2:
+                    
+                    downsample_layer = ConvBlocks2DGroupLegacy(in_dim=out_dims[i_layer],
+                                            kernel_size=3,
+                                            residual=residual,
+                                            out_dim=out_dim,
+                                            nb_blocks=1,
+                                            nb_conv=nb_conv,
+                                            stride=2)
+                else:      
+                    downsample_layer = PatchMerging2DGroup(in_dim=out_dims[i_layer], out_dim=out_dim)
             elif norm == 'batch':
                 layer = ConvBlocks2DBatch(in_dim=in_dims[i_layer],
                                         kernel_size=3,
@@ -570,26 +585,40 @@ class Encoder2D(nn.Module):
                                         out_dim=out_dims[i_layer],
                                         nb_blocks=conv_depth[i_layer],
                                         nb_conv=nb_conv)
-                                    
-                downsample_layer = PatchMerging2DBatch(in_dim=out_dims[i_layer], out_dim=out_dim)
+                
+                if self.downsample_conv == 2:
+                    
+                    downsample_layer = ConvBlocks2DBatch(in_dim=out_dims[i_layer],
+                                            kernel_size=3,
+                                            residual=residual,
+                                            out_dim=out_dim,
+                                            nb_blocks=1,
+                                            nb_conv=nb_conv,
+                                            stride=2)
+                else:      
+                    downsample_layer = PatchMerging2DBatch(in_dim=out_dims[i_layer], out_dim=out_dim)
+
             self.layers.append(layer)
             self.downsample_layers.append(downsample_layer)
 
-        if nb_extra_block > 0:
+        if extra_block:
             if norm == 'group':
                 self.out_conv = ConvBlocks2DGroupLegacy(in_dim=out_dim,
-                                                kernel_size=3,
-                                                residual=residual,
-                                                out_dim=out_dim,
-                                                nb_blocks=conv_depth[0],
-                                                nb_conv=nb_extra_block)
+                                                    kernel_size=3,
+                                                    residual=residual,
+                                                    out_dim=out_dim,
+                                                    nb_blocks=conv_depth[-1],
+                                                    nb_conv=nb_conv)
             elif norm == 'batch':
                 self.out_conv = ConvBlocks2DBatch(in_dim=out_dim,
-                                                kernel_size=3,
-                                                residual=residual,
-                                                out_dim=out_dim,
-                                                nb_blocks=conv_depth[0],
-                                                nb_conv=nb_extra_block)
+                                                    kernel_size=3,
+                                                    residual=residual,
+                                                    out_dim=out_dim,
+                                                    nb_blocks=conv_depth[-1],
+                                                    nb_conv=nb_conv)
+        
+        if self.expand:
+            self.expand_layer = nn.Conv2d(in_channels=d_model, out_channels=d_model * 2, kernel_size=1)
 
         #self.norm = norm_layer(self.num_features)
         #self.norm_after_conv = norm_layer(embed_dim)
@@ -619,13 +648,19 @@ class Encoder2D(nn.Module):
             skip_connections.append(x)
             x = downsample_layer(x)
         
-        if self.nb_extra_block > 0:
+        if self.extra_block:
             x = self.out_conv(x)
+        
+        B, C, H, W = x.shape
+
+        if self.expand:
+            x = self.expand_layer(x)
+            
         
         return x, skip_connections
     
 
-class Encoder3DPos(nn.Module):
+class EncoderMotionAppearance(nn.Module):
     r""" Swin Transformer
         A PyTorch impl of : `Swin Transformer: Hierarchical Vision Transformer using Shifted Windows`  -
           https://arxiv.org/pdf/2103.14030
@@ -651,26 +686,85 @@ class Encoder3DPos(nn.Module):
         use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False
     """
 
-    def __init__(self, conv_depth, in_dims, out_dims, embedding_dim):
+    def __init__(self, d_model, conv_depth, in_dims, out_dims, norm, legacy, nb_conv, residual, expand, nhead, downsample_conv):
         super().__init__()
 
         self.num_stages = len(conv_depth)
+        self.expand = expand
+        self.nhead = nhead
+        self.downsample_conv = downsample_conv
 
         # build encoder layers
         self.layers = nn.ModuleList()
         self.downsample_layers = nn.ModuleList()
         for i_layer in range(self.num_stages):
-            out_dim = 2*out_dims[i_layer] if i_layer == self.num_stages - 1 else in_dims[i_layer+1]
-            layer = ConvBlocks3DPos(in_dim=in_dims[i_layer],
-                                kernel_size=3,
-                                out_dim=out_dims[i_layer],
-                                nb_blocks=conv_depth[i_layer],
-                                embedding_dim=embedding_dim)
-                #layer = ConvBlocks(in_dim=in_dims[i_layer], out_dim=out_dims[i_layer], nb_block=conv_depth[i_layer])
-                                
-            downsample_layer = PatchMerging3D(in_dim=out_dims[i_layer], out_dim=out_dim)
+            #residual = False if i_layer == 0 else residual
+            out_dim = d_model if i_layer == self.num_stages - 1 else in_dims[i_layer+1]
+            if norm == 'group':
+                if legacy:
+                    layer = ConvBlocks2DGroupLegacy(in_dim=in_dims[i_layer],
+                                        kernel_size=3,
+                                        residual=residual,
+                                        out_dim=out_dims[i_layer],
+                                        nb_blocks=conv_depth[i_layer],
+                                        nb_conv=nb_conv)
+                else:
+                    layer = ConvBlocks2DGroup(in_dim=in_dims[i_layer],
+                                        kernel_size=3,
+                                        out_dim=out_dims[i_layer],
+                                        nb_blocks=conv_depth[i_layer])
+                    
+                if self.downsample_conv == 2:
+                    
+                    downsample_layer = ConvBlocks2DGroupLegacy(in_dim=out_dims[i_layer],
+                                            kernel_size=3,
+                                            residual=residual,
+                                            out_dim=out_dim,
+                                            nb_blocks=1,
+                                            nb_conv=nb_conv,
+                                            stride=2)
+                else:      
+                    downsample_layer = PatchMerging2DGroup(in_dim=out_dims[i_layer], out_dim=out_dim)
+            elif norm == 'batch':
+                layer = ConvBlocks2DBatch(in_dim=in_dims[i_layer],
+                                        kernel_size=3,
+                                        residual=residual,
+                                        out_dim=out_dims[i_layer],
+                                        nb_blocks=conv_depth[i_layer],
+                                        nb_conv=nb_conv)
+                
+                if self.downsample_conv == 2:
+                    
+                    downsample_layer = ConvBlocks2DBatch(in_dim=out_dims[i_layer],
+                                            kernel_size=3,
+                                            residual=residual,
+                                            out_dim=out_dim,
+                                            nb_blocks=1,
+                                            nb_conv=nb_conv,
+                                            stride=2)
+                else:      
+                    downsample_layer = PatchMerging2DBatch(in_dim=out_dims[i_layer], out_dim=out_dim)
+
             self.layers.append(layer)
             self.downsample_layers.append(downsample_layer)
+
+        if norm == 'group':
+            self.out_conv = ConvBlocks2DGroupLegacy(in_dim=out_dim,
+                                                    kernel_size=3,
+                                                    residual=residual,
+                                                    out_dim=out_dim,
+                                                    nb_blocks=conv_depth[-1],
+                                                    nb_conv=nb_conv)
+        elif norm == 'batch':
+            self.out_conv = ConvBlocks2DBatch(in_dim=out_dim,
+                                                    kernel_size=3,
+                                                    residual=residual,
+                                                    out_dim=out_dim,
+                                                    nb_blocks=conv_depth[-1],
+                                                    nb_conv=nb_conv)
+        
+        if self.expand:
+            self.expand_layer = nn.Conv2d(in_channels=d_model, out_channels=d_model * 2, kernel_size=1)
 
         #self.norm = norm_layer(self.num_features)
         #self.norm_after_conv = norm_layer(embed_dim)
@@ -692,15 +786,18 @@ class Encoder3DPos(nn.Module):
     def no_weight_decay_keywords(self):
         return {'relative_position_bias_table'}
 
-    def forward(self, x, embedding):
+    def forward(self, x):
         skip_connections = []
 
         for layer, downsample_layer in zip(self.layers, self.downsample_layers):
-            x = layer(x, embedding)
+            x = layer(x)
             skip_connections.append(x)
             x = downsample_layer(x)
         
-        return x, skip_connections
+        appearance = self.out_conv(x)
+            
+        
+        return appearance, x, skip_connections
     
 
 

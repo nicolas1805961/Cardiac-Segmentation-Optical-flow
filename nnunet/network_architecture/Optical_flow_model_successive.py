@@ -56,7 +56,7 @@ class SinusoidalPositionEmbeddings(nn.Module):
     
 
 class ModelWrap(SegmentationNetwork):
-    def __init__(self, model1, model2, do_ds, motion_from_ed, backward, segmentation, no_error):
+    def __init__(self, model1, model2, do_ds, motion_from_ed, backward, segmentation, no_error, use_label):
         super().__init__()
         self.model1 = model1
         self.model2 = model2
@@ -69,6 +69,7 @@ class ModelWrap(SegmentationNetwork):
         #self.num_classes = 4
         self.motion_estimation = SpatialTransformer((self.image_size, self.image_size))
         self.ncc = NCC(reduction=None)
+        self.use_label = use_label
 
         self._do_ds = do_ds
     
@@ -80,20 +81,11 @@ class ModelWrap(SegmentationNetwork):
     def do_ds(self, value):
         self.model1.do_ds = value
 
-    def forward(self, x, inference=False):
-        if self.motion_from_ed:
-            if self.backward:
-                return self.forward_from_ed_backward(x, inference=inference)
-            else:
-                if self.segmentation:
-                    return self.forward_from_ed_segmentation(x, inference=inference)
-                else:
-                    return self.forward_from_ed(x, inference=inference)
+    def forward(self, x, label=None, inference=False):
+        if self.use_label:
+            return self.forward_label(x, label=label, inference=inference)
         else:
-            if self.backward:
-                return self.forward_to_ed_backward(x, inference=inference)
-            else:
-                return self.forward_to_ed(x, inference=inference)
+            return self.forward_from_ed(x, inference=inference)
 
     
     def forward_from_ed(self, x, inference=False):
@@ -143,60 +135,16 @@ class ModelWrap(SegmentationNetwork):
     
 
 
-    def forward_from_ed_backward(self, x, inference=False):
+    def forward_label(self, x, label, inference=False):
         T, B, C, H, W = x.shape
         out2 = {}
-        out1 = self.model1(x)
-        if len(x) == 2:
-            out2['flow'] = out1['flow'][0]
-        else:
-            flow1 = torch.flip(out1['flow'], dims=[0])
-            x = torch.flip(x, dims=[0])
-            assert len(flow1) == len(x) - 1
-            cumulated = flow1[0]
-            cumulated_list = [cumulated]
-            for t in range(1, len(flow1)):
-
-                registered1 = self.motion_estimation(flow=cumulated, original=x[0])
-                registered2 = self.motion_estimation(flow=flow1[t], original=x[t])
-
-                #error1 = torch.abs(x[0] - registered1)
-                #error2 = torch.abs(x[t] - registered2)
-
-                #error1 = self.ncc(registered1, x[0])
-                #error2 = self.ncc(registered2, x[t])
-
-                error1 = x[t] - registered1
-                error2 = x[t + 1] - registered2
-
-                x1 = torch.cat([cumulated, x[t], x[0], registered1, error1], dim=1)
-                x2 = torch.cat([flow1[t], x[t + 1], x[t], registered2, error2], dim=1)
-
-                x_input = torch.stack([x2, x1], dim=0)
-
-                out = self.model2(x_input, inference=inference)
-                cumulated = cumulated + out['flow'][0]
-                cumulated_list.append(cumulated)
-
-            out2['flow'] = cumulated
-
-            cumulated_list = torch.stack(cumulated_list, dim=0)
-            out2['cumulated'] = cumulated_list
-
-        return out1, out2
-    
-
-
-    def forward_from_ed_segmentation(self, x, inference=False):
-        T, B, C, H, W = x.shape
-        out2 = {}
-        out1 = self.model1(x)
-        if len(x) == 2:
+        x_label = torch.cat([x, label], dim=2)
+        out1 = self.model1(x_label)
+        if len(x_label) == 2:
             out2['flow'] = out1['flow'][0]
         else:
             flow1 = out1['flow']
-            seg1 = out1['seg']
-            assert len(flow1) == len(x) - 1
+            assert len(flow1) == len(x_label) - 1
             cumulated = flow1[0]
             cumulated_list = [cumulated]
             for t in range(1, len(flow1)):
@@ -204,14 +152,21 @@ class ModelWrap(SegmentationNetwork):
                 registered1 = self.motion_estimation(flow=cumulated, original=x[t])
                 registered2 = self.motion_estimation(flow=flow1[t], original=x[t + 1])
 
-                error1 = torch.abs(registered1 - x[0])
-                error2 = torch.abs(registered2 - x[t])
+                #error1 = torch.abs(x[0] - registered1)
+                #error2 = torch.abs(x[t] - registered2)
 
-                #x1 = torch.cat([cumulated, x[t], x[0], registered1, error1, seg1[t]], dim=1)
-                #x2 = torch.cat([flow1[t], x[t + 1], x[t], registered2, error2, seg1[t + 1]], dim=1)
+                #error1 = self.ncc(registered1, x[0])
+                #error2 = self.ncc(registered2, x[t])
 
-                x1 = torch.cat([cumulated, x[t], x[0], registered1, error1, seg1[t], seg1[0]], dim=1)
-                x2 = torch.cat([flow1[t], x[t + 1], x[t], registered2, error2, seg1[t + 1], seg1[t]], dim=1)
+                error1 = x[0] - registered1
+                error2 = x[t] - registered2
+
+                if self.no_error:
+                    x1 = torch.cat([cumulated, x[t], x[0], label[t], label[0]], dim=1)
+                    x2 = torch.cat([flow1[t], x[t + 1], x[t], label[t + 1], label[t]], dim=1)
+                else:
+                    x1 = torch.cat([cumulated, x[t], x[0], registered1, error1, label[t], label[0]], dim=1)
+                    x2 = torch.cat([flow1[t], x[t + 1], x[t], registered2, error2, label[t + 1], label[t]], dim=1)
 
                 x_input = torch.stack([x1, x2], dim=0)
 
@@ -225,6 +180,7 @@ class ModelWrap(SegmentationNetwork):
             out2['cumulated'] = cumulated_list
 
         return out1, out2
+    
 
 
 class OpticalFlowModelSuccessive(SegmentationNetwork):
@@ -249,6 +205,7 @@ class OpticalFlowModelSuccessive(SegmentationNetwork):
                 conv_bottleneck,
                 nb_conv,
                 backward,
+                downsample_conv,
                 norm,
                 one_to_all,
                 all_to_all,
@@ -273,6 +230,7 @@ class OpticalFlowModelSuccessive(SegmentationNetwork):
         self.backward = backward
         self.segmentation = segmentation
         self.conv_bottleneck = conv_bottleneck
+        self.downsample_conv = downsample_conv
         
         self.num_classes = 4
         self.alpha = 0.5
@@ -292,7 +250,7 @@ class OpticalFlowModelSuccessive(SegmentationNetwork):
 
         #encoder_in_dims = in_dims[:]
         #encoder_in_dims[0] = 2
-        self.encoder = Encoder2D(out_dims=out_encoder_dims, in_dims=in_dims, conv_depth=conv_depth, norm=norm, legacy=legacy, nb_conv=nb_conv, nb_extra_block=0, residual=False)
+        self.encoder = Encoder2D(out_dims=out_encoder_dims, in_dims=in_dims, conv_depth=conv_depth, norm=norm, legacy=legacy, nb_conv=nb_conv, expand=False, extra_block=False, residual=False, nhead=self.bottleneck_heads, d_model=self.d_model, downsample_conv=downsample_conv)
         #self.encoder = Encoder3D(out_dims=out_encoder_dims, in_dims=in_dims, conv_depth=conv_depth)
         
         decoder_in_dims = in_dims[:]
@@ -307,7 +265,7 @@ class OpticalFlowModelSuccessive(SegmentationNetwork):
             self.flow_decoder = sfb.Decoder2D(dot_multiplier=dot_multiplier, deep_supervision=deep_supervision, conv_depth=conv_depth_decoder, in_encoder_dims=decoder_in_dims[::-1], out_encoder_dims=out_encoder_dims[::-1], num_classes=2, img_size=image_size, norm=norm, last_activation='identity')
             #self.seg_decoder = sfb.Decoder2D(dot_multiplier=2, deep_supervision=deep_supervision, conv_depth=conv_depth_decoder, in_encoder_dims=decoder_in_dims[::-1], out_encoder_dims=out_encoder_dims[::-1], num_classes=4, img_size=image_size, norm=norm, last_activation='identity')
         else:
-            self.flow_decoder = decoder_alt.Decoder2D(dot_multiplier=dot_multiplier, deep_supervision=deep_supervision, conv_depth=conv_depth_decoder, in_encoder_dims=decoder_in_dims[::-1], out_encoder_dims=out_encoder_dims[::-1], num_classes=2, img_size=image_size, norm=norm, last_activation='identity', legacy=legacy, nb_conv=nb_conv, nb_extra_block=0)
+            self.flow_decoder = decoder_alt.Decoder2D(dot_multiplier=dot_multiplier, deep_supervision=deep_supervision, conv_depth=conv_depth_decoder, in_encoder_dims=decoder_in_dims[::-1], out_encoder_dims=out_encoder_dims[::-1], num_classes=2, img_size=image_size, norm=norm, last_activation='identity', legacy=legacy, nb_conv=nb_conv, d_model=self.d_model, residual=False)
             if self.segmentation:
                 self.segmentation_decoder = decoder_alt.Decoder2D(dot_multiplier=dot_multiplier, deep_supervision=deep_supervision, conv_depth=conv_depth_decoder, in_encoder_dims=decoder_in_dims[::-1], out_encoder_dims=out_encoder_dims[::-1], num_classes=4, img_size=image_size, norm=norm, last_activation='identity', legacy=legacy, nb_conv=nb_conv, nb_extra_block=0)
             if self.backward:
@@ -355,6 +313,100 @@ class OpticalFlowModelSuccessive(SegmentationNetwork):
 
 
     def forward(self, unlabeled, inference=False):
+        out = {'flow': []}
+
+        #matplotlib.use('QtAgg')
+        #fig, ax = plt.subplots(1, unlabeled.shape[2])
+        #for t in range(unlabeled.shape[2]):
+        #    ax[t].imshow(unlabeled[0, 0, t].cpu(), cmap='gray')
+        #plt.show()
+
+        #matplotlib.use('QtAgg')
+        #fig, ax = plt.subplots(1, len(unlabeled))
+        #for u in range(len(unlabeled)):
+        #    ax[u].imshow(unlabeled[u, 0, 0].cpu(), cmap='gray')
+        #plt.show()
+
+        unlabeled_feature_list = []
+        unlabeled_skip_co_list = []
+        
+        for t in range(len(unlabeled)):
+            unlabeled_features, unlabeled_skip_connections = self.encoder(unlabeled[t])
+            unlabeled_skip_co_list.append(unlabeled_skip_connections)
+            unlabeled_feature_list.append(unlabeled_features)
+        unlabeled_features = torch.stack(unlabeled_feature_list, dim=0) # T, B, C, H, W
+        T, B, C, H, W = unlabeled_features.shape
+
+        if self.conv_bottleneck:
+            first_list = []
+            for t in range(T - 1):
+                cated = torch.cat([unlabeled_features[t], unlabeled_features[t + 1]], dim=1)
+                cated = self.bottleneck(cated)
+                first_list.append(cated)
+            forward = torch.stack(first_list)
+        else:
+            forward = self.bottleneck(unlabeled_features)
+
+
+        if self.segmentation:
+            out['seg'] = []
+            #seg = self.segmentation_decoder(forward[0], unlabeled_skip_co_list[0])
+            #out['seg'].append(seg)
+        
+        if self.backward:
+            out['backward_flow'] = []
+
+        for t in range(len(forward)):
+            flow_skip_co_forward = []
+            for s in range(self.num_stages):
+                concatenated = torch.cat([unlabeled_skip_co_list[t][s], unlabeled_skip_co_list[t + 1][s]], dim=1)
+                concatenated = self.skip_co_reduction_list[s](concatenated)
+                flow_skip_co_forward.append(concatenated)
+
+            current_global_motion_forward = self.flow_decoder(forward[t], flow_skip_co_forward)[0]
+            out['flow'].append(current_global_motion_forward)
+
+            if self.segmentation:
+                seg = self.segmentation_decoder(forward[t], unlabeled_skip_co_list[t + 1])
+                out['seg'].append(seg)
+            
+            if self.backward:
+                backward_motion = self.backward_decoder(forward[t], flow_skip_co_forward)
+                out['backward_flow'].append(backward_motion)
+        
+        out['flow'] = torch.stack(out['flow'], dim=0)
+
+        #out['flow'] = self.organize_deep_supervision(out['flow'])
+        #if self.segmentation:
+        #    out['seg'] = self.organize_deep_supervision(out['seg'])
+        #if self.backward:
+        #    out['backward_flow'] = self.organize_deep_supervision(out['backward_flow'])
+#
+        #for k in out.keys():
+        #    if not self.do_ds:
+        #        out[k] = out[k][0]
+
+        if inference:
+            #integration_list = []
+            #integration_list.append(out['flow'][0])
+            #for t in range(1, len(out['flow']) - 1):
+            #    averaged = (out['flow'][t - 1] + out['flow'][t] + out['flow'][t + 1]) / 3
+            #    averaged = self.integration(averaged)
+            #    integration_list.append(averaged)
+            #integration_list.append(out['flow'][-1])
+            #out['flow'] = torch.stack(integration_list, dim=0)
+
+            integration_list = []
+            for t in range(len(out['flow'])):
+                averaged = self.integration(out['flow'][t])
+                integration_list.append(averaged)
+            out['flow'] = torch.stack(integration_list, dim=0)
+
+        return out
+    
+
+
+    def forward_label(self, unlabeled, inference=False):
         out = {'flow': []}
 
         #matplotlib.use('QtAgg')

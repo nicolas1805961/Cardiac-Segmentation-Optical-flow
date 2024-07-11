@@ -193,7 +193,9 @@ def main():
             print(f'My config file is {args.config}')
             config = read_config_video(os.path.join(Path.cwd(), args.config))
     else:
-        config = read_config(os.path.join(Path.cwd(), 'adversarial_acdc.yaml'), middle=False, video=False)
+        print(f'My config file is {args.config}')
+        config = read_config(os.path.join(Path.cwd(), args.config), middle=False, video=False)
+        #config = read_config(os.path.join(Path.cwd(), 'adversarial_acdc.yaml'), middle=False, video=False)
 
 
     plans_file, output_folder_name, dataset_directory, batch_dice, stage, \

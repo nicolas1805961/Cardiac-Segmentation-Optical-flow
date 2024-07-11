@@ -68,14 +68,13 @@ if __name__ == "__main__":
 
     # Raw here
     #dir_path = r"C:\Users\Portal\Documents\voxelmorph\results\VM-NCC\Lib\test\Raw\Flow"
-    dir_path = r"C:\Users\Portal\Documents\voxelmorph\multi_task\2024-04-21_06H12_01s_902005\Task045_Lib\fold_0\Lib\val\Raw\Backward_flow"
+    dir_path = r"C:\Users\Portal\Documents\voxelmorph\exposant\2024-07-10_18H07_32s_654193\Task032_Lib\fold_0\Lib\val\Raw\Backward_flow"
 
     if dir_path.split(os.sep)[-3] == 'val':
-        pkl_dirname = 'voxelmorph_Lib_2D'
-        gt_dirname = 'voxelmorph_Lib_2D_gt'
+        gt_dirname = 'Lib_resampling_training_mask'
     else:
-        pkl_dirname = 'voxelmorph_Lib_2D_testing'
-        gt_dirname = 'voxelmorph_Lib_2D_gt_testing'
+        gt_dirname = 'Lib_resampling_testing_mask'
+    pkl_dirname = 'custom_lib_t_4'
 
     path_list = glob(os.path.join(dir_path, "**", "*.npz"), recursive=True)
 
@@ -106,8 +105,8 @@ if __name__ == "__main__":
     
     for patient_path in tqdm(all_patient_paths):
 
-        filename = os.path.basename(patient_path[0])[:-4] + '.pkl'
-        pkl_path = os.path.join(pkl_dirname, filename)
+        patient_nb = os.path.basename(os.path.dirname(patient_path[0]))
+        pkl_path = os.path.join(pkl_dirname, patient_nb, "info_01.pkl")
 
         with open(pkl_path, 'rb') as f:
             data = pickle.load(f)
@@ -122,11 +121,11 @@ if __name__ == "__main__":
         video_flow_gt = []
         for i, path in enumerate(patient_path):
 
-            filename = os.path.basename(path)[:-4] + '.nii.gz'
+            filename = os.path.basename(path)[:-4] + '.npy'
 
             corresponding_gt_path = os.path.join(gt_dirname, filename)
-            data = nib.load(corresponding_gt_path)
-            arr = data.get_fdata()
+            data = np.load(corresponding_gt_path)
+            arr = data[1]
             video_flow_gt.append(arr)
 
             if path == es_path:
@@ -140,6 +139,8 @@ if __name__ == "__main__":
         T, H, W, D, C = video_flow.shape
 
         for d in range(video_flow.shape[3]):
+            if 'patient029' in patient_path[0] and d == 0:
+                continue
             slice_gt = video_flow_gt[:, :, :, d]
             slice_flow = video_flow[:, :, :, d]
             gradient = spatial_gradient3d(torch.from_numpy(slice_flow.transpose(3, 0, 1, 2)[None])).double().numpy()
@@ -184,9 +185,15 @@ if __name__ == "__main__":
                 if t == es_idx:
                     current_res['ES_negative_%'] = current_res['negative_%']
                     current_res['ES_negative_%_average'] = current_res['negative_%_average']
+                    current_res['ES_negative_%_average_RV'] = current_res['negative_%_RV']
+                    current_res['ES_negative_%_average_MYO'] = current_res['negative_%_MYO']
+                    current_res['ES_negative_%_average_LV'] = current_res['negative_%_LV']
                 else:
                     current_res['ES_negative_%'] = np.nan
                     current_res['ES_negative_%_average'] = np.nan
+                    current_res['ES_negative_%_average_RV'] = np.nan
+                    current_res['ES_negative_%_average_MYO'] = np.nan
+                    current_res['ES_negative_%_average_LV'] = np.nan
 
                 all_results['all'].append(current_res)
 
@@ -210,6 +217,7 @@ if __name__ == "__main__":
         all_results['mean']['negative_%_' + k] = (all_results['mean']['negative_sum_' + k] / all_results['mean']['total_sum_' + k]) * 100
         all_results['mean']['negative_%_mean_' + k] = np.array([x['negative_%_' + k] for x in all_results['all']]).mean()
         all_results['mean']['abs(Mean jacobian - 1)_' + k] = np.array([x['abs(Mean jacobian - 1)_' + k] for x in all_results['all']]).mean()
+        all_results['mean']['ES_negative_%_average_' + k] = np.array([x['ES_negative_%_average_' + k] for x in all_results['all']]).mean()
 
     save_json(all_results, os.path.join(dir_path, 'jacobian.json'))
 

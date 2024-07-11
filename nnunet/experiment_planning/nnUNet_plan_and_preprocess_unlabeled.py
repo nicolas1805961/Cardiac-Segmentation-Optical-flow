@@ -111,11 +111,11 @@ def main():
         #maybe_mkdir_p(join(preprocessing_output_dir_this_task, "imagesTr"))
         #maybe_mkdir_p(join(preprocessing_output_dir_this_task, "imagesTs"))
         #maybe_mkdir_p(join(preprocessing_output_dir_this_task, "labelsTr"))
-        maybe_mkdir_p(join(preprocessing_output_dir_this_task, "strain", "LV", "radial"))
-        maybe_mkdir_p(join(preprocessing_output_dir_this_task, "strain", "LV", "tangential"))
-        maybe_mkdir_p(join(preprocessing_output_dir_this_task, "strain", "RV", "tangential"))
-        maybe_mkdir_p(join(preprocessing_output_dir_this_task, "contour", "RV"))
-        maybe_mkdir_p(join(preprocessing_output_dir_this_task, "contour", "LV"))
+        #maybe_mkdir_p(join(preprocessing_output_dir_this_task, "strain", "LV", "radial"))
+        #maybe_mkdir_p(join(preprocessing_output_dir_this_task, "strain", "LV", "tangential"))
+        #maybe_mkdir_p(join(preprocessing_output_dir_this_task, "strain", "RV", "tangential"))
+        #maybe_mkdir_p(join(preprocessing_output_dir_this_task, "contour", "RV"))
+        #maybe_mkdir_p(join(preprocessing_output_dir_this_task, "contour", "LV"))
 
         if len(next(os.walk(os.path.join(nnUNet_raw_data, task_name)))[1]) > 3:
             npy_paths = glob(os.path.join(nnUNet_raw_data, task_name, '**', '*.npy'), recursive=True)
@@ -201,7 +201,7 @@ def main():
         #    if not dont_run_preprocessing:  # double negative, yooo
         #        exp_planner.run_preprocessing(threads)
 
-        keep_spacing = True
+        keep_spacing = False
         #if '45' in task_ids[0] or '46' in task_ids[0]:
         #    keep_spacing = True
         #else:

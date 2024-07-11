@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 
 from timm.models.layers import trunc_normal_
-from mmcv.runner import load_checkpoint
 import swin_transformer_3d
 from utils import ConvUpBlock_3d, DeepSupervision, get_root_logger, GetSimilarityMatrix, PatchExpandSwin, ToGrayscale, ConvLayerAdaIN, ConvLayer, PatchExpandConv, PatchExpandConv_3d, concat_merge_linear_rescale, concat_merge_conv_rescale, concat_merge_linear
 from einops import rearrange

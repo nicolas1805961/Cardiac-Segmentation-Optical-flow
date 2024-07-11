@@ -625,7 +625,7 @@ class SegmentationNetwork(NeuralNetwork):
                                           pad_border_mode: str, pad_kwargs: dict, all_in_gpu: bool,
                                           verbose: bool,
                                           get_flops,
-                                          binary=False) -> Tuple[np.ndarray, np.ndarray]:
+                                          binary=False, normalize=False) -> Tuple[np.ndarray, np.ndarray]:
         # better safe than sorry
         assert len(x.shape) == 3, "x must be (c, x, y)"
 
@@ -717,7 +717,7 @@ class SegmentationNetwork(NeuralNetwork):
                 ub_y = y + patch_size[1]
                 predicted_patch, out_flop, inference_time = self._internal_maybe_mirror_and_pred_2D(
                     data[None, :, lb_x:ub_x, lb_y:ub_y], mirror_axes, get_flops, binary, do_mirroring,
-                    gaussian_importance_map)
+                    gaussian_importance_map, normalize=normalize)
 
                 predicted_patch = predicted_patch[0]
 
@@ -818,7 +818,7 @@ class SegmentationNetwork(NeuralNetwork):
                                           all_in_gpu: bool = False,
                                           verbose: bool = True,
                                           get_flops = False,
-                                          binary=False) -> Tuple[np.ndarray, np.ndarray]:
+                                          binary=False, normalize=False) -> Tuple[np.ndarray, np.ndarray]:
         if all_in_gpu:
             raise NotImplementedError
         
@@ -839,7 +839,7 @@ class SegmentationNetwork(NeuralNetwork):
 
             pred_seg, softmax_pres, flop_list, inference_time = self._internal_predict_2D_2Dconv_tiled(
                 x[:, s], step_size, do_mirroring, mirror_axes, patch_size, regions_class_order, use_gaussian,
-                pad_border_mode, pad_kwargs, all_in_gpu, verbose, get_flops, binary=binary)
+                pad_border_mode, pad_kwargs, all_in_gpu, verbose, get_flops, binary=binary, normalize=normalize)
 
             if s == 0:
                 out_flop = flop_list

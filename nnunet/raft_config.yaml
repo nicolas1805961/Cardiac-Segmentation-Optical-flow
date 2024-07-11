@@ -1,0 +1,154 @@
+pretrained_folder: pretrained_acdc
+use_sfb: false
+
+strain_loss_weight: 0.0 # 100.0
+forward_flow_loss_weight: 0.0 #1.0
+
+global_motion_forward_loss_weight: 1.0 # 0.1
+cycle_registered_loss_weight: 0.0
+cycle_flow_loss_weight: 0.1
+
+interpolation_loss_weight: 0.0
+prediction_loss_weight: 0.0
+#attention_gradient_loss_weight: 1.0
+
+regularization_weight_xy_small: 0.0
+regularization_weight_z_small: 0.0
+image_flow_loss_weight_global_small: 0.0
+
+seg_registered_loss_weight: 0.0
+segmentation_loss_weight: 0.0 # 0.1
+
+also_start_es: false
+motion_appearance: true
+supervised: false
+distance_map_power: 0
+dim_feedforward: 3072
+label_input: false
+append_cat: true
+match_first: true
+no_label: false
+cross_attn_before_corr: false
+memory_attn: false
+correlation_value: false
+cat_correlation: true
+use_context_encoder: false
+remove_GRU: false
+skip_co_type: both #[past, current, both, no_conv]
+downsample_conv: 2
+transformer: false
+memory_read: true
+raft_iters: 12
+warp: false
+stride: [4, 2, 1, 1]
+radius: [4, 4, 4, 4]
+cost_volume: true
+extra_block: true
+residual: true
+raft: false
+mamba: false
+deformable: true
+fine_tuning: false
+pos_2d: false
+eta_min: 1e-7
+conv_bottleneck: false
+nb_merging_blocks: 0
+dropout: false
+query_type: double #[simple, double, triple]
+cycle_consistency: true
+small_memory: false
+no_skip_co: false
+no_residual: false
+logits_input: false
+backward_flow: true
+gaussian_type: query # [query, memory]
+nb_inputs: small #[small, big, normal]
+nb_inputs_memory: big #[small, big, normal]
+kernel_size: 7
+dumb: false
+gaussian: false
+timesformer: false
+marginal: true
+supervise_iterations: false
+P: 0
+shrink_select: false
+distance: cos # [cos, l2]
+bottleneck_type: transformer_two_memory # [memory_update, memory_update_decoder, big, segmentation, transformer, transformer_two_memory]
+topk: false
+pos_1d: sin # [sin, learn, learnable_sin]
+pretrained_first_label: true
+pretrained_2d_folder_path: Quorum_cardioTrack_all_phases
+nb_conv: 2
+flow_model_path: flow_model_500
+interpolator_model_path: interpolator_model_500
+registration_loss: ncc
+backward: false
+motion_from_ed: true
+training_modality: forward   # ['backward', 'forward', 'forward_no_sum']
+dataloader_modality: other   # ['all_first', 'all_adjacent', 'regular', 'other']
+legacy: true
+final_stride: 1
+do_data_aug: true
+all_data_lib: false
+dataloader_not_random: false
+nb_iters: 1
+nb_interp_frame: 0
+only_first: false
+split: true
+padding: false
+all_to_all: true
+one_to_all: false
+inference_mode: one_step   # sliding_window, one_step, overlap
+regularization_weight_xy: 1.0 #0.01
+regularization_weight_z: 0.0 #0.001
+nb_tokens: 1
+image_flow_loss_weight_global: 0.5 # 0.5
+image_flow_loss_weight_local: 0.0 # 0.5
+force_one_label: true
+feature_extractor: false
+video_length: 2
+crop: true
+nb_layers: 1
+
+log_images: false
+device: cuda:0
+deep_supervision: false
+log_stats: true
+overfit_log: 550 #10
+epoch_log: 550 #10
+scheduler: cosine
+optimizer: adam
+initial_lr: 0.0001 #0.0001
+weight_decay: 0.0001 #0.0001
+warmup_percent: 0.1
+max_num_epochs: 180 #400
+#window_size: 7
+#image_size: 224
+norm: group   # 'group', 'batch'
+bottleneck_heads: 4 # [8, 4]
+activation: gelu
+conv_layer: other
+conv_depth: [1, 1, 1]
+skip_co_depth: [1, 1, 1]
+transformer_depth: [] #[2, 2, 2], [2]
+num_heads: [] #[3, 6, 12], [8] [12]
+spatial_cross_attention_num_heads: [8, 8, 8] #[2, 4, 6, 8, 12] [12, 8, 6, 4, 2] [bottom, ..., top] [3, 6, 12] [4, 4, 8, 8, 16]
+batch_size: 2 #16
+drop_path_rate: 0.0
+in_encoder_dims: [6, 128, 256] #[1, 128, 256] [1, 96, 384] [1, 24, 96] [1, 32, 128] [1, 32, 128, 256, 512] [1, 48, 192] [1, 96, 192]
+out_encoder_dims: [64, 128, 256] #[64, 128, 256] [96, 192, 384] [24, 48, 96] [32, 64, 128] [32, 64, 128, 256, 512] [48, 96, 192] [96, 192, 384]
+d_model: 256
+loss: ce_and_dice   # ['ce_and_dice', 'focal_and_dice', 'topk_and_dice', 'ce']
+
+do_adv: false
+adversarial_weight: 0.0
+discriminator_depth: [2, 2, 2]
+discriminator_in_dims: [4, 128, 256]
+discriminator_out_dims: [64, 128, 256]
+discriminator_lr: 0.00001 # 0.00005
+discriminator_decay: 0.0001
+
+reinforcement: false
+policy_net_learning_rate: 0.0001
+number_of_intervals: 20
+number_of_steps: 200

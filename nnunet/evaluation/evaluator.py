@@ -381,6 +381,11 @@ def aggregate_scores(test_ref_pairs,
     p.close()
     p.join()
 
+    #all_res = []
+    #for i in range(len(test)):
+    #    out = run_evaluation([test[i], ref[i], evaluator, metric_kwargs, metadata_list[i], binary])
+    #    all_res.append(out)
+
     for i in range(len(all_res)):
         all_scores["all"].append(all_res[i])
 
@@ -479,7 +484,7 @@ def evaluate_folder(folder_with_gts: str, folder_with_predictions: str, labels: 
     assert all([i in files_gt for i in files_pred]), "files missing in folder_with_gts"
     test_ref_pairs = [(join(folder_with_predictions, i), join(folder_with_gts, i)) for i in files_pred]
     res = aggregate_scores(test_ref_pairs, json_output_file=join(folder_with_predictions, "summary.json"),
-                           num_threads=8, labels=labels, advanced=True, **metric_kwargs)
+                           num_threads=8, labels=labels, advanced=True, rv_rejection=True, **metric_kwargs)
     return res
 
 

@@ -71,15 +71,17 @@ class NCC(torch.nn.Module):
         if self.reduction == 'mean':
             return 1-torch.mean(cc)
         else:
+            cc = cc.view(T, B, C, H, W)
             return 1-cc
 
     
 
 
 class SpatialSmoothingLoss(nn.Module):
-    def __init__(self):
+    def __init__(self, reduction='mean'):
         super(SpatialSmoothingLoss, self).__init__()
         self.epsilon = torch.Tensor([0.01]).float().to('cuda')
+        self.reduction = reduction
 
     def forward(self, flow):
         if flow.dim() == 4:
@@ -111,7 +113,12 @@ class SpatialSmoothingLoss(nn.Module):
         #    plt.show()
 
         gradient = gradient.pow(2)
-        gradient_xy = gradient[:, :, :2].mean()
+
+        if self.reduction == 'mean':
+            gradient_xy = gradient[:, :, :2].mean()
+        else:
+            gradient_xy = gradient[:, :, :2].mean(1).mean(1)
+            gradient_xy = gradient_xy.permute(1, 0, 2, 3).contiguous()[:, :, None, :, :]
 
 
         #huber_xy = torch.sqrt(self.epsilon + torch.sum(gradient[:, :, 0].pow(2) + gradient[:, :, 1].pow(2)))
@@ -121,9 +128,10 @@ class SpatialSmoothingLoss(nn.Module):
         return gradient_xy
 
 class TemporalSmoothingLoss(nn.Module):
-    def __init__(self):
+    def __init__(self, reduction='mean'):
         super(TemporalSmoothingLoss, self).__init__()
         self.epsilon = torch.Tensor([0.01]).float().to('cuda')
+        self.reduction = reduction
 
     def forward(self, flow):
         if flow.dim() == 4:
@@ -155,7 +163,12 @@ class TemporalSmoothingLoss(nn.Module):
         #    plt.show()
 
         gradient = gradient.pow(2)
-        gradient_z = gradient[:, :, 2].mean()
+
+        if self.reduction == 'mean':
+            gradient_z = gradient[:, :, 2].mean()
+        else:
+            gradient_z = gradient[:, :, 2].mean(1)
+            gradient_z = gradient_z.permute(1, 0, 2, 3).contiguous()[:, :, None, :, :]
 
 
         #huber_xy = torch.sqrt(self.epsilon + torch.sum(gradient[:, :, 0].pow(2) + gradient[:, :, 1].pow(2)))

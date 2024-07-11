@@ -1,0 +1,143 @@
+model: 'swin' #'swin'
+separability: False
+separability_loss_weight: 1.0
+convolutional_patch_embedding: True
+
+cropper: False
+filter_phase: False
+log_images: True
+transformer_bottleneck: True
+device: 'cuda:0'
+simple_decoder: False
+deep_supervision: True
+add_extra_bottleneck_blocks: True
+affinity: False
+affinity_loss_weight: 0.0001 # 0.001
+unlabeled_loss_weight: 2
+unlabeled: False
+progressive_similarity_growing: False
+classification_weight: 0.1 #1.45
+classification: False
+similarity: False
+asymmetric_unet: True
+epoch_log: 100 #10
+scheduler: 'cosine'
+optimizer: 'adam'
+adversarial_loss: False
+alpha_discriminator: 0.10 #0.125
+adversarial_weight: 1.0 #0.1
+discriminator_lr: 0.00001 # 0.00005
+initial_lr: 0.0001 #0.0001
+discriminator_decay: 0.0001
+weight_decay: 0.0001 #0.0001
+warmup_percent: 0.1
+smoothing: 0.0
+max_num_epochs: 1000 #1000
+patch_size: [288, 288] # dynamic_mri=384, quorum=288 [224, 224]
+norm: 'BatchNorm2d' # 'InstanceNorm2d', 'BatchNorm2d', ''
+filter_skip_co_reconstruction: False
+filter_skip_co_segmentation: True
+bottleneck_heads: 8 # 16, 8
+dim_feedforward: 3072
+activation: 'gelu'
+conv_layer: 'other'
+num_bottleneck_layers: 1
+dropout: 0
+conv_depth: [2, 2, 2]
+transformer_depth: [] #[2, 2, 2], [2]
+num_heads: [] #[3, 6, 12], [8] [12]
+spatial_cross_attention_num_heads: [2, 4, 8] #[2, 4, 6, 8, 12] [12, 8, 6, 4, 2] [bottom, ..., top] [3, 6, 12] [4, 4, 8, 8, 16]
+batch_size: 6 #16
+bottleneck: 'swin' # ['vit', 'swin', 'factorized', 'vit_3d', 'swin_3d']
+rpe_mode: 'bias' # ['contextual', 'bias', 'None']
+rpe_contextual_tensors: 'qkv'
+drop_path_rate: 0.0
+autoencoder_dim: 64
+in_encoder_dims: [1, 128, 256] #[1, 24, 96, 192, 384] [1, 96, 384] [1, 24, 96] [1, 32, 128] [1, 32, 128, 256, 512] [1, 48, 192] [1, 96, 192]
+out_encoder_dims: [64, 128, 256] #[24, 48, 96, 192, 384] [96, 192, 384] [24, 48, 96] [32, 64, 128] [32, 64, 128, 256, 512] [48, 96, 192] [96, 192, 384]
+merge: 'linear' # ['linear', 'rescale_linear', 'rescale_conv']
+zoom_p: 0.25
+rotation_p: 0.25
+shear_p: 0.0
+translate_p: 0.25
+flipv_p: 0.0
+fliph_p: 0.0
+sharp_p: 0.25
+noise_p: 0.25
+gamma_p: 0.25
+mixup_p: 0.0
+cutmix_p: 0.0
+cowmix_p: 0.0
+elastic_p: 0.25
+brightness_p: 0.25
+my_augmentation_p: 0.0
+rotation_degree: [-45, 45] # [-90, 45]
+elastic_std: 5.0
+zoom_scale: [0.7, 1.3]
+shear_range: [20.0, 20.0] # angle
+translate_scale: [5.0, 5.0] # pixels [5.0, 5.0]
+sharp_range: [0.0, 2.0]
+brightness_range: [0.7, 1.2]
+std_noise: 0.01
+gamma_range: [0.7, 1.3]
+cowmix_sigma_range: [3.0, 5.0]
+cowmix_proportion_range: [0.5, 0.7]
+cowmix_kernel_size: 15.0
+lambda_start: 0.01
+lambda_end: 0.99
+spatial_transformer_loss: 'focal_and_dice'
+loss: 'ce_and_dice' # ['ce_and_dice', 'focal_and_dice', 'topk_and_dice', 'ce']
+unlabeled_loss: 'focal_and_dice' # ['dice', 'dice_and_boundary', 'dice_and_perimeter', 'generalized_dice', 'cross_entropy', 'generalized_dice_and_boundary', 'cross_entropy', 'topk_and_dice', 'topk_and_generalized_dice', 'focal_and_dice', 'focal_and_generalized_dice']
+semi_supervised: False
+topk_percent: 0.1
+unlabeled_loss_weight_start: 0.0
+unlabeled_loss_weight_end: 1.0
+swin_abs_pos: False
+load_weights: False
+blur: False
+blur_kernel: [1, 2, 1]
+use_spatial_transformer: False
+localization_weight: 1
+mlp_intermediary_dim: 256
+use_conv_mlp: True
+proj: 'linear' # 'linear', 'conv'
+plot_gradient_iter_number: 100000000000
+shortcut: False
+encoder_attention_type: [] #['channel', 'spatial', 'identity']
+reconstruction_attention_type: [] #['channel', 'spatial', 'identity']
+concat_spatial_cross_attention: True
+directional_field: False
+directional_field_weight: 1.0
+
+learn_transforms: False
+use_cropped_images: True
+
+reconstruction: False
+reconstruction_skip: False
+reconstruction_loss_weight: 1.0 #2.65
+similarity_weight: 0.1 #0.0001
+similarity_down_scale: 8
+uncertainty_weighting: False
+dynamic_weight_averaging: False
+
+rotation_loss_weight: 0.3
+scaling_loss_weight: 0.3
+reconstruction_rotation_loss_weight: 0.001
+reconstruction_scaling_loss_weight: 0.001
+target_ratio: 0.15
+
+adversarial: False
+image_or_label: 'image'
+discriminator_depth: [2, 2, 2]
+seg_in_discriminator_dims: [5, 64, 128]
+rec_in_discriminator_dims: [1, 64, 128]
+out_discriminator_dims: [64, 128, 256]
+discriminator_learning_rate: 0.0005
+discriminator_weight_decay: 0.0001
+r1_penalty_iteration: 1
+adversarial_loss_weight: 1.0
+
+reinforcement: False
+policy_net_learning_rate: 0.0001
+number_of_intervals: 20
+number_of_steps: 200

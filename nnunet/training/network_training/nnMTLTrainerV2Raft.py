@@ -69,7 +69,7 @@ from nnunet.network_architecture.initialization import InitWeights_He
 from nnunet.network_architecture.neural_network import SegmentationNetwork
 from nnunet.training.data_augmentation.default_data_augmentation import default_2D_augmentation_params, \
     get_patch_size, default_3D_augmentation_params
-from nnunet.training.dataloading.dataset_loading import DataLoaderFlowTrain5LibProgressive, DataLoaderAugment, DataLoaderFlowTrain5LibProgressiveNoSorting, DataLoaderFlowTrainRecursiveVideoLib, DataLoaderFlowTrainPredictionVal, DataLoaderFlowTrainPredictionValLib, DataLoader2DMiddleUnlabeled, unpack_dataset, DataLoaderVideoUnlabeled
+from nnunet.training.dataloading.dataset_loading import DataLoaderPreprocessed, DataLoaderAugment, DataLoaderFlowTrain5LibProgressiveNoSorting, DataLoaderFlowTrainRecursiveVideoLib, DataLoaderFlowTrainPredictionVal, DataLoaderFlowTrainPredictionValLib, DataLoader2DMiddleUnlabeled, unpack_dataset, DataLoaderVideoUnlabeled
 from nnunet.training.network_training.nnUNetTrainer import nnUNetTrainer
 from nnunet.utilities.nd_softmax import softmax_helper
 from sklearn.model_selection import KFold
@@ -116,8 +116,8 @@ class ModelWrap(SegmentationNetwork):
 
     def forward(self, x):
         flow_list = self.network(x[0].repeat(1, 3, 1, 1), x[1].repeat(1, 3, 1, 1))
-        flow = flow_list[-1]
-        return flow
+        #flow = flow_list[-1]
+        return flow_list
 
 
 class nnMTLTrainerV2Raft(nnUNetTrainer):
@@ -133,16 +133,12 @@ class nnMTLTrainerV2Raft(nnUNetTrainer):
         self.task = os.path.basename(dataset_directory)
 
         self.cropper_config = read_config(os.path.join(Path.cwd(), 'adversarial_acdc.yaml'), False, False)
-        if config is None:
-            self.inference = False
-            self.config = read_config_video(os.path.join(Path.cwd(), 'video.yaml'))
-        else:
-            self.inference = True
-            self.config = config
+        self.inference = False
+        self.config = config
         self.video_length = self.config['video_length']
-        assert self.video_length == 2
         self.crop = self.config['crop']
         self.feature_extractor = self.config['feature_extractor']
+        self.pretrained_folder = self.config['pretrained_folder']
 
         if any([x in self.task for x in ['31', '35']]):
             self.crop_size = 128
@@ -179,8 +175,11 @@ class nnMTLTrainerV2Raft(nnUNetTrainer):
         self.training_modality = self.config['training_modality']
         self.motion_from_ed = self.config['motion_from_ed']
         self.backward = self.config['backward']
-        self.segmentation = self.config['segmentation']
-        self.no_error = self.config['no_error']
+        self.also_start_es = self.config['also_start_es']
+
+        self.raft_iters = 12
+        exponents = torch.arange(self.raft_iters - 1, -1, -1, device='cuda:0')
+        self.raft_gamma = (0.8 ** exponents) / len(exponents)
 
         if self.dataloader_modality == 'regular':
             assert self.config['global_motion_forward_loss_weight'] == 0.0
@@ -192,9 +191,6 @@ class nnMTLTrainerV2Raft(nnUNetTrainer):
         self.segmentation_loss_weight = self.config['segmentation_loss_weight']
         self.regularization_weight_xy = self.config['regularization_weight_xy']
         self.regularization_weight_z = self.config['regularization_weight_z']
-        self.adversarial_weight = self.config['adversarial_weight']
-        self.consistency_loss_weight = self.config['consistency_loss_weight']
-        self.do_adv = self.config['do_adv']
 
         self.discriminator_lr = self.config['discriminator_lr']
         self.discriminator_decay = self.config['discriminator_decay']
@@ -212,7 +208,7 @@ class nnMTLTrainerV2Raft(nnUNetTrainer):
         self.image_flow_loss_weight_local = self.config['image_flow_loss_weight_local']
         self.global_motion_forward_loss_weight = self.config['global_motion_forward_loss_weight']
 
-        timestr = strftime("%Y-%m-%d_%HH%M")
+        timestr = datetime.now().strftime("%Y-%m-%d_%HH%M_%Ss_%f")
         self.log_dir = os.path.join(copy(self.output_folder), timestr)
         self.writer = SummaryWriter(log_dir=self.log_dir)
 
@@ -226,10 +222,7 @@ class nnMTLTrainerV2Raft(nnUNetTrainer):
                                     writer=self.writer,
                                     crop_size=self.crop_size)
             
-        if config is None:
-            self.output_folder = self.log_dir
-        else:
-            self.output_folder = output_folder
+        self.output_folder = self.log_dir
 
         #if output_folder.count(os.sep) < 2:
         #    self.output_folder = output_folder
@@ -250,11 +243,11 @@ class nnMTLTrainerV2Raft(nnUNetTrainer):
     def setup_loss_data(self):
         loss_data = {}
         
-        loss_data['global_flow_regularization'] = [self.regularization_weight_xy, float('nan')]
-        loss_data['global_image_flow'] = [self.image_flow_loss_weight_global, float('nan')]
+        loss_data['global_flow_regularization'] = [self.regularization_weight_xy, []]
+        loss_data['global_image_flow'] = [self.image_flow_loss_weight_global, []]
         
         if self.dataloader_modality == 'other':
-            loss_data['global_motion_forward'] = [self.global_motion_forward_loss_weight, float('nan')]
+            loss_data['global_motion_forward'] = [self.global_motion_forward_loss_weight, []]
         return loss_data
     
     def setup_loss_functions(self):
@@ -468,14 +461,6 @@ class nnMTLTrainerV2Raft(nnUNetTrainer):
         
         conv_layer_2d, conv_layer_1d = self.get_conv_layer(self.config)
 
-        if self.do_adv:
-            self.discriminator = build_discriminator(config=self.config, conv_layer=conv_layer_2d, norm=norm_2d, image_size=self.crop_size)
-            if self.fine_tuning:
-                self.print_to_log_file("Loading weights from pretrained discriminator")
-                self.load_video_weights(self.discriminator, file_name='discriminator_final_checkpoint.model')
-            discriminator_input = torch.randn(self.config['batch_size'], 4, self.crop_size, self.crop_size)
-            models['discriminator'] = (self.discriminator, discriminator_input)
-
         in_shape_crop = torch.randn(self.config['batch_size'], 1, self.image_size, self.image_size)
         cropping_conv_layer, _ = self.get_conv_layer(self.cropper_config)
         cropping_network = build_2d_model(self.cropper_config, conv_layer=cropping_conv_layer, norm=getattr(torch.nn, self.cropper_config['norm']), log_function=self.print_to_log_file, image_size=self.image_size, window_size=self.window_size, middle=False, num_classes=2, processor=False)
@@ -531,8 +516,6 @@ class nnMTLTrainerV2Raft(nnUNetTrainer):
         assert self.network is not None, "self.initialize_network must be called first"
         self.optimizer, self.lr_scheduler = self.get_optimizer_scheduler(net=self.network, lr=self.initial_lr, decay=self.weight_decay)
 
-        if self.do_adv:
-            self.discriminator_optimizer, self.discriminator_scheduler = self.get_optimizer_scheduler(net=self.discriminator, lr=self.discriminator_lr, decay=self.discriminator_decay)
 
     def compute_dice(self, target, num_classes, output_seg, key):
         axes = tuple(range(1, len(target.shape)))
@@ -1213,8 +1196,7 @@ class nnMTLTrainerV2Raft(nnUNetTrainer):
 
 
 
-
-    def compute_losses_recursive_2(self, target_mask, unlabeled, flow, target):
+    def compute_losses_recursive_2(self, unlabeled, flow, target):
 
         #seg_loss_l = self.segmentation_loss(out['seg'][t_indices - 1, b_indices], target[t_indices, b_indices])
         #self.loss_data['segmentation'][1] = seg_loss_l
@@ -1224,10 +1206,9 @@ class nnMTLTrainerV2Raft(nnUNetTrainer):
             initial_target = target[-1]
             initial_target = torch.nn.functional.one_hot(initial_target[:, 0].long(), num_classes=4).permute(0, 3, 1, 2).contiguous().float()
             registered = self.motion_estimation(flow=flow, original=initial_target, mode='bilinear')
-            #registered = self.motion_estimation(flow=flow[t_indices - 2, b_indices], original=initial_target, mode='bilinear')
 
             global_motion_loss = self.segmentation_loss(registered, target[0])
-            self.loss_data['global_motion_forward'][1] = global_motion_loss
+            self.loss_data['global_motion_forward'][1].append(global_motion_loss)
 
         #semi_supervised_target = torch.softmax(out['seg'], dim=2)
         #semi_supervised_target = torch.argmax(semi_supervised_target, dim=2, keepdim=True)
@@ -1238,8 +1219,8 @@ class nnMTLTrainerV2Raft(nnUNetTrainer):
         registered = self.motion_estimation(flow=flow, original=unlabeled[-1])
         global_flow_loss = self.registration_loss(registered, unlabeled[0])
         global_flow_regularization_loss = self.spatial_smoothing_loss(flow=flow[None])
-        self.loss_data['global_image_flow'][1] = global_flow_loss
-        self.loss_data['global_flow_regularization'][1] = global_flow_regularization_loss
+        self.loss_data['global_image_flow'][1].append(global_flow_loss)
+        self.loss_data['global_flow_regularization'][1].append(global_flow_regularization_loss)
     
 
 
@@ -1266,7 +1247,6 @@ class nnMTLTrainerV2Raft(nnUNetTrainer):
         data_dict = next(data_generator)
         unlabeled = data_dict['unlabeled']
         target = data_dict['target']
-        target_mask = data_dict['target_mask'] # T, B
 
         #matplotlib.use('QtAgg')
         #fig, ax = plt.subplots(1, len(unlabeled))
@@ -1294,7 +1274,7 @@ class nnMTLTrainerV2Raft(nnUNetTrainer):
 
         #unlabeled.requires_grad = True
 
-        flow = self.network(unlabeled)
+        flow_list = self.network(unlabeled)
         #unlabeled = unlabeled.permute(2, 0, 1, 3, 4).contiguous()
         self.optimizer.zero_grad()
 
@@ -1318,8 +1298,12 @@ class nnMTLTrainerV2Raft(nnUNetTrainer):
         #unlabeled = Variable(unlabeled, requires_grad=True)
         #unlabeled = unlabeled.cuda()
         #unlabeled.retain_grad()
+
+        for i in range(len(flow_list)):
+            # one iter
+            self.loss_function(unlabeled=unlabeled, flow=flow_list[i], target=target)
 #
-        self.loss_function(target_mask=target_mask, unlabeled=unlabeled, flow=flow, target=target)
+        #self.loss_function(target_mask=target_mask, unlabeled=unlabeled, flow=flow, target=target)
         l = self.consolidate_only_one_loss_data(self.loss_data, log=True)
 
         #if self.iter_nb > 500:
@@ -1343,9 +1327,6 @@ class nnMTLTrainerV2Raft(nnUNetTrainer):
                                 print(param_name)
                                 print(param.is_leaf)
                                 print(param.requires_grad)
-        
-        if self.do_adv:
-            self.train_discriminator(target, out, data_dict['target_mask'])
         
             #decoder_nb = 0
             #spatio_temporal_nb = 0
@@ -1378,13 +1359,12 @@ class nnMTLTrainerV2Raft(nnUNetTrainer):
         data_dict = next(data_generator)
         unlabeled = data_dict['unlabeled'] # T, B, 1, H, W
         target = data_dict['target'] # T, B, 1, H, W
-        target_mask = data_dict['target_mask'] # T, B
 
 
         with torch.no_grad():
-            flow = self.network(unlabeled)
+            flow_list = self.network(unlabeled)
 
-        seg_dice = self.get_stats(flow=flow, 
+        seg_dice = self.get_stats(flow=flow_list[-1], 
                                   target=target,
                                   padding=data_dict['padding_need'])
 
@@ -1405,9 +1385,14 @@ class nnMTLTrainerV2Raft(nnUNetTrainer):
         target = data_dict['target'] # T, B, 1, H, W
         target_mask = data_dict['target_mask'] # T, B
 
-        flow = self.network(unlabeled)
+        flow_list = self.network(unlabeled)
+
+        for i in range(len(flow_list)):
+            # one iter
+            self.loss_function(unlabeled=unlabeled, flow=flow_list[i], target=target)
+
         #unlabeled = unlabeled.permute(2, 0, 1, 3, 4).contiguous()
-        self.loss_function(target_mask=target_mask, unlabeled=unlabeled, flow=flow, target=target)
+        #self.loss_function(target_mask=target_mask, unlabeled=unlabeled, flow=flow, target=target)
         l = self.consolidate_only_one_loss_data(self.loss_data, log=False)
         self.val_loss.append(l.mean().detach().cpu())
 
@@ -1438,13 +1423,9 @@ class nnMTLTrainerV2Raft(nnUNetTrainer):
     
 
 
-    def warp_linear(self, target, flow):
-        if self.motion_from_ed:
-            from_frame = target[:, -1]
-            to_frame = target[:, 0]
-        else:
-            from_frame = target[:, 0]
-            to_frame = target[:, -1]
+    def warp_linear_backward(self, target, flow):
+        from_frame = target[:, -1]
+        to_frame = target[:, 0]
 
         from_frame = torch.nn.functional.one_hot(from_frame[:, 0].long(), num_classes=4).permute(0, 3, 1, 2).contiguous().float()
         predicted = self.motion_estimation(flow=flow, original=from_frame, mode='bilinear')
@@ -1455,23 +1436,6 @@ class nnMTLTrainerV2Raft(nnUNetTrainer):
         registered = registered[:, 0]
         assert torch.all(torch.isfinite(flow_target))
         return registered, flow_target
-
-    
-    def warp_linear_Lib(self, target, flow):
-        registered_list = []
-        flow_target_list = []
-        ed_target = target[:, 0]
-        ed_target = torch.nn.functional.one_hot(ed_target[:, 0].long(), num_classes=4).permute(0, 3, 1, 2).contiguous().float()
-        for t in range(1, target.shape[1]):
-            es_target = target[:, t]
-            es_pred = self.motion_estimation(flow=flow[:, t - 1], original=ed_target, mode='bilinear')
-            registered_list.append(es_pred)
-            flow_target_list.append(es_target)
-        registered = torch.stack(registered_list, dim=1) # B, T, 4, H, W
-        registered = torch.argmax(registered, dim=2, keepdim=True) # B, T, 1, H, W
-        flow_target = torch.stack(flow_target_list, dim=1) # B, T, 1, H, W
-        assert torch.all(torch.isfinite(flow_target))
-        return registered, flow_target
     
 
     def get_stats(self, flow, target, padding):
@@ -1479,12 +1443,12 @@ class nnMTLTrainerV2Raft(nnUNetTrainer):
         #out['forward_flow'] = out['forward_flow'][::step]
 
         #seg = out['seg'].permute(1, 0, 2, 3, 4).contiguous()
-        target = target.permute(1, 0, 2, 3, 4).contiguous()
+        target = target.permute(1, 0, 2, 3, 4).contiguous() # B, T, 1, H, W
         num_classes = 4
 
         #flow = torch.nn.functional.pad(flow, pad=(0, 0, 0, 0, 0, 0, 1, 0))
 
-        registered, flow_target = self.warp_linear(target, flow) # B, H, W
+        registered, flow_target = self.warp_linear_backward(target, flow) # B, H, W
         #if '31' in self.task:
         #    registered, flow_target = self.warp_linear(target, flow, and_mask) # B, H, W
         #elif '32' in self.task:
@@ -1554,6 +1518,8 @@ class nnMTLTrainerV2Raft(nnUNetTrainer):
     def consolidate_only_one_loss_data(self, loss_data, log, database=None):
         loss = 0.0
         for key, value in loss_data.items():
+            value[1] = torch.stack(value[1], dim=0)
+            value[1] = (value[1] * self.raft_gamma).sum()
             if log:
                 self.writer.add_scalar('Iteration/' + key + ' loss', value[1].mean(), self.iter_nb)
             loss += value[0] * value[1].mean()
@@ -1561,6 +1527,9 @@ class nnMTLTrainerV2Raft(nnUNetTrainer):
         if log:
             self.writer.add_scalars('Iteration/loss weights', {key:value[0] for key, value in loss_data.items()}, self.iter_nb)
             self.writer.add_scalar('Iteration/Training loss', loss.mean(), self.iter_nb)
+        
+        self.loss_data = self.setup_loss_data()
+        
         return loss
 
     def consolidate_loss_data(self, loss_data1, loss_data2, log, description=None, w1=1, w2=1):
@@ -1884,23 +1853,14 @@ class nnMTLTrainerV2Raft(nnUNetTrainer):
             ep = self.epoch + 1
             if self.config['scheduler'] == 'cosine':
                 self.lr_scheduler.step()
-                if self.do_adv:
-                    self.discriminator_scheduler.step()
             else:
                 self.optimizer.param_groups[0]['lr'] = poly_lr(ep, self.max_num_epochs, self.initial_lr, 0.9)
-                if self.do_adv:
-                    self.discriminator_optimizer.param_groups[0]['lr'] = poly_lr(ep, self.max_num_epochs, self.discriminator_lr, 0.9)
-            if self.do_adv:
-                lrs = {'Flow_lr': self.optimizer.param_groups[0]['lr'], 'Discriminator_lr': self.discriminator_optimizer.param_groups[0]['lr']}
-                self.writer.add_scalars('Epoch/Learning rate', lrs, self.epoch)
-            else:
-                self.writer.add_scalar('Epoch/Learning rate', self.optimizer.param_groups[0]['lr'], self.epoch)
+            
+            self.writer.add_scalar('Epoch/Learning rate', self.optimizer.param_groups[0]['lr'], self.epoch)
         else:
             ep = epoch
             if not self.config['scheduler'] == 'cosine':
                 self.optimizer.param_groups[0]['lr'] = poly_lr(ep, self.max_num_epochs, self.initial_lr, 0.9)
-                if self.do_adv:
-                    self.discriminator_optimizer.param_groups[0]['lr'] = poly_lr(ep, self.max_num_epochs, self.discriminator_lr, 0.9)
 
         self.print_to_log_file("lr:", np.round(self.optimizer.param_groups[0]['lr'], decimals=6))
 
@@ -1941,11 +1901,7 @@ class nnMTLTrainerV2Raft(nnUNetTrainer):
             self.print_to_log_file("saving scheduled checkpoint file...")
             if not self.save_latest_only:
                 self.save_checkpoint(join(self.output_folder, "model_ep_%03.0d.model" % (self.epoch + 1)))
-                if self.do_adv:
-                    self.save_checkpoint_discriminator(join(self.output_folder, "discriminator_ep_%03.0d.model" % (self.epoch + 1)))
             self.save_checkpoint(join(self.output_folder, "model_latest.model"))
-            if self.do_adv:
-                self.save_checkpoint_discriminator(join(self.output_folder, "discriminator_latest.model"))
             self.print_to_log_file("done")
     
 
@@ -1979,8 +1935,6 @@ class nnMTLTrainerV2Raft(nnUNetTrainer):
 
             # train one epoch
             self.network.train()
-            if self.do_adv:
-                self.discriminator.train()
 
             if self.fine_tuning:
                 self.freeze_batchnorm_layers(self.network)
@@ -2031,8 +1985,6 @@ class nnMTLTrainerV2Raft(nnUNetTrainer):
 
                     if self.also_val_in_tr_mode:
                         self.network.train()
-                        if self.do_adv:
-                            self.discriminator.train()
                         if self.fine_tuning:
                             self.freeze_batchnorm_layers(self.network)
                         # validation with train=True
@@ -2076,8 +2028,6 @@ class nnMTLTrainerV2Raft(nnUNetTrainer):
         self.epoch -= 1  # if we don't do this we can get a problem with loading model_final_checkpoint.
 
         if self.save_final_checkpoint: self.save_checkpoint(join(self.output_folder, "model_final_checkpoint.model"))
-        if self.do_adv and self.save_final_checkpoint:
-            self.save_checkpoint_discriminator(join(self.output_folder, "discriminator_final_checkpoint.model"))
         # now we can delete latest as it will be identical with final
         if isfile(join(self.output_folder, "model_latest.model")):
             os.remove(join(self.output_folder, "model_latest.model"))
@@ -2245,20 +2195,20 @@ class nnMTLTrainerV2Raft(nnUNetTrainer):
             elif self.dataloader_modality == 'regular':
                 dataloader_class = DataLoaderFlowTrain5LibRegular
             elif self.dataloader_modality == 'other':
-                dataloader_class = DataLoaderAugment
+                dataloader_class = DataLoaderPreprocessed
                 #dataloader_class = DataLoaderFlowTrain5LibProgressive
                 #dataloader_class = DataLoaderFlowTrain5LibProgressiveNoSorting
 
             dl_val = dataloader_class(self.dataset_val, self.patch_size, self.patch_size, self.batch_size, do_data_aug=False, video_length=self.video_length,
-                                    crop_size=self.crop_size, processor=self.processor, is_val=True, oversample_foreground_percent=self.oversample_foreground_percent,
+                                    crop_size=self.crop_size, processor=self.processor, is_val=True, data_path=r'Lib_resampling_training_mask', distance_map_power=0, also_start_es=self.also_start_es, oversample_foreground_percent=self.oversample_foreground_percent,
                                     pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
             
             dl_tr = dataloader_class(self.dataset_tr, self.basic_generator_patch_size, self.patch_size, self.batch_size, do_data_aug=self.do_data_aug, video_length=self.video_length,
-                                            crop_size=self.crop_size, processor=self.processor, is_val=False, oversample_foreground_percent=self.oversample_foreground_percent,
+                                            crop_size=self.crop_size, processor=self.processor, is_val=False, data_path=r'Lib_resampling_training_mask', distance_map_power=0, also_start_es=self.also_start_es, oversample_foreground_percent=self.oversample_foreground_percent,
                                             pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
                 
             dl_overfitting = dataloader_class(self.dataset_val, self.basic_generator_patch_size, self.patch_size, self.batch_size, do_data_aug=False, video_length=self.video_length,
-                                            crop_size=self.crop_size, processor=self.processor, is_val=True, oversample_foreground_percent=self.oversample_foreground_percent,
+                                            crop_size=self.crop_size, processor=self.processor, is_val=True, data_path=r'Lib_resampling_training_mask', distance_map_power=0, also_start_es=self.also_start_es, oversample_foreground_percent=self.oversample_foreground_percent,
                                             pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
         else:
 

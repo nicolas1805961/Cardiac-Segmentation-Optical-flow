@@ -71,7 +71,7 @@ from nnunet.network_architecture.initialization import InitWeights_He
 from nnunet.network_architecture.neural_network import SegmentationNetwork
 from nnunet.training.data_augmentation.default_data_augmentation import default_2D_augmentation_params, \
     get_patch_size, default_3D_augmentation_params
-from nnunet.training.dataloading.dataset_loading import DataLoaderAugmentValidation, DataLoaderAugmentValidationPreTrained, DataLoaderAugment, DataLoaderFlowTrainRecursiveVideoLib, DataLoaderFlowTrainPredictionVal, DataLoaderFlowTrainPredictionValLib, DataLoader2DMiddleUnlabeled, unpack_dataset, DataLoaderVideoUnlabeled
+from nnunet.training.dataloading.dataset_loading import DataLoaderPreprocessedAdjacent, DataLoaderPreprocessedValidation, DataLoaderPreprocessed, DataLoaderAugmentValidation, DataLoaderAugmentValidationPreTrained, DataLoaderAugment, DataLoaderFlowTrainRecursiveVideoLib, DataLoaderFlowTrainPredictionVal, DataLoaderFlowTrainPredictionValLib, DataLoader2DMiddleUnlabeled, unpack_dataset, DataLoaderVideoUnlabeled
 from nnunet.training.network_training.nnUNetTrainer import nnUNetTrainer
 from nnunet.utilities.nd_softmax import softmax_helper
 from sklearn.model_selection import KFold
@@ -86,7 +86,7 @@ from monai.losses import DiceFocalLoss, DiceLoss
 from torch.utils.tensorboard import SummaryWriter
 from nnunet.training.loss_functions.dice_loss import DC_and_CE_loss, DC_and_focal_loss, DC_and_topk_loss, DC_and_CE_loss_Weighted, SoftDiceLoss
 from nnunet.training.loss_functions.crossentropy import RobustCrossEntropyLoss, WeightedRobustCrossEntropyLoss
-from nnunet.training.dataloading.dataset_loading import PreTrainedDataloader, DataLoaderAugmentRegular, DataLoaderFlowTrain5LibRegular, DataLoaderFlowACDCProgressiveAllDataAdjacent, DataLoaderFlowLibProgressiveAllDataFirst, DataLoaderFlowLibProgressiveAllDataAdjacent, DataLoaderFlowTrainPredictionVal, DataLoaderFlowTrain5Progressive, DataLoaderFlowTrain5, DataLoaderFlowTrain5Lib, DataLoaderFlowTrainRecursiveVideo, DataLoaderFlowValidationOneStep
+from nnunet.training.dataloading.dataset_loading import PreTrainedDataloader, DataLoaderAugmentRegular, DataLoaderPreprocessedSupervised, DataLoaderFlowACDCProgressiveAllDataAdjacent, DataLoaderFlowLibProgressiveAllDataFirst, DataLoaderFlowLibProgressiveAllDataAdjacent, DataLoaderFlowTrainPredictionVal, DataLoaderFlowTrain5Progressive, DataLoaderFlowTrain5, DataLoaderFlowTrain5Lib, DataLoaderFlowTrainRecursiveVideo, DataLoaderFlowValidationOneStep
 from nnunet.training.dataloading.dataset_loading import load_dataset, load_unlabeled_dataset
 from nnunet.lib.utils import RFR, ConvBlocks2DGroup, Resblock, LayerNorm, RFR_1d, Resblock1D, ConvBlocks1D
 from nnunet.lib.loss import SeparabilityLoss, ContrastiveLoss, NCC, TemporalSmoothingLoss
@@ -95,6 +95,7 @@ import shutil
 from nnunet.visualization.visualization import Visualizer
 from nnunet.training.network_training.processor import Processor
 from nnunet.network_architecture.integration import SpatialTransformer
+import kornia
 
 
 class SegFlowGaussian(nnUNetTrainer):
@@ -131,7 +132,7 @@ class SegFlowGaussian(nnUNetTrainer):
             self.crop_size = 192
             self.image_size = 384
             self.window_size = 8
-            self.cropper_weights_folder_path = 'binary_lib'
+            self.cropper_weights_folder_path = 'Quorum_cardioTrack_all_phases'
             
         self.force_one_label = self.config['force_one_label']
         self.binary = False
@@ -142,6 +143,7 @@ class SegFlowGaussian(nnUNetTrainer):
         self.nb_inter_frame = self.config['nb_interp_frame']
         self.dataloader_not_random = self.config['dataloader_not_random']
         self.deformable = self.config['deformable']
+        self.mamba = self.config['mamba']
 
         self.logits_input = self.config['logits_input']
         self.pretrained_2d_folder_path = self.config['pretrained_2d_folder_path']
@@ -161,7 +163,18 @@ class SegFlowGaussian(nnUNetTrainer):
         self.dataloader_modality = self.config['dataloader_modality']
         self.training_modality = self.config['training_modality']
         self.motion_from_ed = self.config['motion_from_ed']
-        self.learn_seg = self.config['learn_seg']
+        self.memory_read = self.config['memory_read']
+        self.use_context_encoder = self.config['use_context_encoder']
+        self.small_large = False
+        self.seg = False
+        self.label_input = self.config['label_input']
+        self.distance_map_power = self.config['distance_map_power']
+        self.binary_distance = self.config['binary_distance']
+        if self.video_length == 2:
+            assert self.dataloader_modality == 'all_adjacent'
+        if self.video_length > 2:
+            assert self.dataloader_modality == 'other'
+        
         #self.attention_gradient = self.config['attention_gradient']
 
         #if self.dataloader_modality == 'regular':
@@ -170,6 +183,11 @@ class SegFlowGaussian(nnUNetTrainer):
         #self.fine_tuning = True if self.video_length > 2 and not self.inference else False
         self.fine_tuning = self.config['fine_tuning']
 
+        self.regularization_weight_xy_small = self.config['regularization_weight_xy_small']
+        self.regularization_weight_z_small = self.config['regularization_weight_z_small']
+        self.image_flow_loss_weight_global_small = self.config['image_flow_loss_weight_global_small']
+
+
         self.deep_supervision = self.config['deep_supervision']
         self.segmentation_loss_weight = self.config['segmentation_loss_weight']
         self.regularization_weight_xy = self.config['regularization_weight_xy']
@@ -177,6 +195,10 @@ class SegFlowGaussian(nnUNetTrainer):
         self.adversarial_weight = self.config['adversarial_weight']
         self.do_adv = self.config['do_adv']
         self.cycle_consistency = self.config['cycle_consistency']
+        self.raft = self.config['raft']
+        self.raft_iters = self.config['raft_iters']
+        exponents = torch.arange(self.raft_iters - 1, -1, -1, device='cuda:0')
+        self.raft_gamma = (0.8 ** exponents) / len(exponents)
         #self.attention_gradient_loss_weight = self.config['attention_gradient_loss_weight']
 
         self.discriminator_lr = self.config['discriminator_lr']
@@ -201,9 +223,16 @@ class SegFlowGaussian(nnUNetTrainer):
         self.image_flow_loss_weight_global = self.config['image_flow_loss_weight_global']
         self.image_flow_loss_weight_local = self.config['image_flow_loss_weight_local']
         self.global_motion_forward_loss_weight = self.config['global_motion_forward_loss_weight']
-        self.seg_registered_loss_weight = self.config['seg_registered_loss_weight']
         self.cycle_registered_loss_weight = self.config['cycle_registered_loss_weight']
         self.cycle_flow_loss_weight = self.config['cycle_flow_loss_weight']
+        self.seg_registered_loss_weight = self.config['seg_registered_loss_weight']
+        self.supervised = self.config['supervised']
+
+        if self.video_length == 2:
+            assert not self.supervised
+
+        if self.mamba:
+            assert self.seg_registered_loss_weight == 0.0
 
         #timestr = strftime("%Y-%m-%d_%HH%M_%S")
         timestr = datetime.now().strftime("%Y-%m-%d_%HH%M_%Ss_%f")
@@ -237,16 +266,21 @@ class SegFlowGaussian(nnUNetTrainer):
         self.loss_data = self.setup_loss_data()
 
         self.loss_function = self.choose_loss()
+        self.save_every = self.config['overfit_log']
+        self.save_latest_only = False
 
     def setup_loss_data(self):
         loss_data = {}
         if self.dataloader_modality == 'other':
             loss_data['seg_registered_memory'] = [self.global_motion_forward_loss_weight, float('nan')]
+        #if self.label_input:
+        #    loss_data['memory_flow_outside'] = [0.0, float('nan')]
         loss_data['memory_flow_regularization'] = [self.regularization_weight_xy, float('nan')]
         loss_data['memory_flow'] = [self.image_flow_loss_weight_global, float('nan')]
-        loss_data['temporal_regularization'] = [self.regularization_weight_z, float('nan')]
+        if self.video_length > 2:
+            loss_data['temporal_regularization'] = [self.regularization_weight_z, float('nan')]
         
-        if self.cycle_consistency and not self.deformable:
+        if self.cycle_consistency and not (self.deformable or self.mamba):
             #loss_data['seg_registered_cycle'] = [self.cycle_registered_loss_weight, float('nan')]
             loss_data['cycle_flow'] = [self.cycle_flow_loss_weight, float('nan')]
 
@@ -266,16 +300,15 @@ class SegFlowGaussian(nnUNetTrainer):
         elif self.config['loss'] == 'dice':
             self.segmentation_loss = SoftDiceLoss(apply_nonlin=softmax_helper, batch_dice=True, smooth=1e-5, do_bg=False)
         #self.image_flow_loss = ImageFlowLoss(alpha=1.0, beta=1.0)
-        self.spatial_smoothing_loss = SpatialSmoothingLoss()
-        self.temporal_smoothing_loss = TemporalSmoothingLoss()
         self.seg_flow_loss = self.segmentation_loss
-        self.temporal_smoothing_loss = TemporalSmoothingLoss()
         self.l1_loss = nn.L1Loss()
         self.mse_loss = nn.MSELoss()
         self.adv_loss = nn.BCELoss()
         self.cross_entropy_loss = nn.CrossEntropyLoss()
         if self.config['registration_loss'] == 'ncc':
-            self.registration_loss = NCC()
+            self.spatial_smoothing_loss = SpatialSmoothingLoss(reduction=None)
+            self.temporal_smoothing_loss = TemporalSmoothingLoss(reduction=None)
+            self.registration_loss = NCC(reduction=None)
         elif self.config['registration_loss'] == 'mse':
             self.registration_loss = nn.MSELoss()
 
@@ -366,11 +399,12 @@ class SegFlowGaussian(nnUNetTrainer):
         self.was_initialized = True
 
     def choose_loss(self):
-        if self.deformable:
-            return self.compute_losses_backward_only
+        if self.supervised:
+            return self.compute_losses_label_supervised
+        elif self.video_length == 2:
+            return self.compute_losses_pair
         else:
-            return self.compute_losses_backward
-        #return self.compute_losses_recursive_adjacent
+            return self.compute_losses_label
     
     def count_parameters(self, config, models):
         if not self.inference:
@@ -478,21 +512,24 @@ class SegFlowGaussian(nnUNetTrainer):
 
         in_shape_crop = torch.randn(self.config['batch_size'], 1, self.image_size, self.image_size)
         cropping_conv_layer, _ = self.get_conv_layer(self.cropper_config)
-        cropping_network = build_2d_model(self.cropper_config, conv_layer=cropping_conv_layer, norm=getattr(torch.nn, self.cropper_config['norm']), log_function=self.print_to_log_file, image_size=self.image_size, window_size=self.window_size, middle=False, num_classes=2, processor=None)
+        cropping_network = build_2d_model(self.cropper_config, conv_layer=cropping_conv_layer, norm=getattr(torch.nn, self.cropper_config['norm']), log_function=self.print_to_log_file, image_size=self.image_size, window_size=self.window_size, middle=False, num_classes=4, processor=None)
         cropping_network.load_state_dict(torch.load(os.path.join(self.cropper_weights_folder_path, 'model_final_checkpoint.model'))['state_dict'], strict=True)
         cropping_network.eval()
         cropping_network.do_ds = False
         models['cropping_model'] = (cropping_network, in_shape_crop)
-
-        if self.logits_input:
-            in_shape_pretrained = torch.randn(self.config['batch_size'], 1, self.crop_size, self.crop_size)
-            pretrained_conv_layer, _ = self.get_conv_layer(self.pretrained_config)
-            self.pretrained_network = build_2d_model(self.pretrained_config, conv_layer=pretrained_conv_layer, norm=getattr(torch.nn, self.pretrained_config['norm']), log_function=self.print_to_log_file, image_size=self.crop_size, window_size=self.window_size, middle=False, num_classes=4, processor=None)
-            self.pretrained_network.load_state_dict(torch.load(os.path.join(self.pretrained_2d_folder_path, 'model_final_checkpoint.model'))['state_dict'], strict=True)
-            self.pretrained_network.eval()
-            self.pretrained_network.do_ds = False
-            models['pretrained_model'] = (self.pretrained_network, in_shape_pretrained)
         
+        if self.label_input:
+            #in_shape_pretrained = torch.randn(self.config['batch_size'], 1, self.crop_size, self.crop_size)
+            #pretrained_conv_layer, _ = self.get_conv_layer(self.pretrained_config)
+            #self.pretrained_network = build_2d_model(self.pretrained_config, conv_layer=pretrained_conv_layer, norm=getattr(torch.nn, self.pretrained_config['norm']), log_function=self.print_to_log_file, image_size=self.crop_size, window_size=self.window_size, middle=False, num_classes=4, processor=None)
+            #self.pretrained_network.load_state_dict(torch.load(os.path.join(self.pretrained_2d_folder_path, 'model_final_checkpoint.model'))['state_dict'], strict=True)
+            #self.pretrained_network.eval()
+            #self.pretrained_network.do_ds = False
+            #models['pretrained_model'] = (self.pretrained_network, in_shape_pretrained)
+            label_data = torch.zeros(size=(self.video_length, self.config['batch_size'], 3, self.crop_size, self.crop_size)).float()
+        else:
+            label_data = torch.zeros(size=(self.config['batch_size'], 4, self.crop_size, self.crop_size)).float()
+            
         self.network = build_seg_flow_gaussian_model(self.config, image_size=self.crop_size, log_function=self.print_to_log_file)
 
         if self.fine_tuning:
@@ -501,7 +538,6 @@ class SegFlowGaussian(nnUNetTrainer):
             #self.load_video_weights(self.network, file_name='model_final_checkpoint.model')
         
         unlabeled_input_data = torch.randn(self.video_length, self.config['batch_size'], 1, self.crop_size, self.crop_size)
-        label_data = torch.zeros(size=(self.config['batch_size'], 4, self.crop_size, self.crop_size)).float()
         if self.config['no_label']:
             models['temporal_model'] = (self.network, unlabeled_input_data)
         else:
@@ -697,6 +733,8 @@ class SegFlowGaussian(nnUNetTrainer):
         #                       if not np.isnan(i)]
                 
         self.log_dice('backward_flow')
+        if self.seg:
+            self.log_dice('seg')
 
         if self.log_images:
             cmap, norm = self.vis.get_custom_colormap()
@@ -1382,7 +1420,22 @@ class SegFlowGaussian(nnUNetTrainer):
 
 
     
-    def compute_losses_backward_only(self, unlabeled, out, target):
+    def compute_losses_pair(self, unlabeled, out, target, label_list):
+
+        registered = self.motion_estimation(flow=out['backward_flow'][0], original=unlabeled[-1])
+        global_flow_loss = self.registration_loss(registered[None], unlabeled[0][None])
+        global_flow_loss_inside = global_flow_loss * label_list[0][None]
+        global_flow_regularization_loss = self.spatial_smoothing_loss(flow=out['backward_flow'])
+        global_flow_regularization_loss_inside = global_flow_regularization_loss * label_list[0][None]
+        self.loss_data['memory_flow'][1] = global_flow_loss_inside
+        self.loss_data['memory_flow_regularization'][1] = global_flow_regularization_loss_inside
+
+        return out
+    
+
+
+
+    def compute_losses_label(self, unlabeled, out, target, label_list):
 
         if self.dataloader_modality == 'other':
 
@@ -1404,28 +1457,210 @@ class SegFlowGaussian(nnUNetTrainer):
             #    self.loss_data['seg_registered_cycle'][1] = (global_motion_loss_cycle1 + global_motion_loss_cycle2) / 2
 
 
-        loss_list = []
+        registered_list = []
         for i in range(len(out['backward_flow'])):
             registered = self.motion_estimation(flow=out['backward_flow'][i], original=unlabeled[i + 1])
+            registered_list.append(registered)
+        registered = torch.stack(registered_list, dim=0)
+        intermediate_loss = self.registration_loss(registered, unlabeled[0][None].repeat(len(registered), 1, 1, 1, 1))
+
+        #matplotlib.use('QtAgg')
+        #fig, ax = plt.subplots(1, 3)
+        #ax[0].imshow(intermediate_loss[0, 0, 0].detach().cpu(), cmap='hot')
+        #ax[1].imshow(label_list[0, 0, 0].detach().cpu(), cmap='hot', vmin=0.0, vmax=1.0)
+        #ax[2].imshow((intermediate_loss * label_list[0][None].repeat(len(registered), 1, 1, 1, 1))[0, 0, 0].detach().cpu(), cmap='hot')
+        #plt.show()
+
+        intermediate_loss_inside = intermediate_loss * label_list[0][None].repeat(len(registered), 1, 1, 1, 1)
+        #intermediate_loss_outside = intermediate_loss * (1 - label_list[0][None].repeat(len(registered), 1, 1, 1, 1))
+
+        self.loss_data['memory_flow'][1] = intermediate_loss_inside.mean()
+        #self.loss_data['memory_flow_outside'][1] = intermediate_loss_outside.mean()
+
+        cumulated_flow_regularization_loss = self.spatial_smoothing_loss(flow=out['backward_flow'])
+        cumulated_flow_regularization_loss = cumulated_flow_regularization_loss * label_list[0][None].repeat(len(registered), 1, 1, 1, 1)
+        self.loss_data['memory_flow_regularization'][1] = cumulated_flow_regularization_loss
+
+        temporal_regu_loss = self.temporal_smoothing_loss(out['backward_flow'])
+        temporal_regu_loss = temporal_regu_loss * label_list[0][None].repeat(len(registered), 1, 1, 1, 1)
+
+        self.loss_data['temporal_regularization'][1] = temporal_regu_loss
+
+        return out
+    
+
+
+    def compute_losses_label_supervised(self, unlabeled, out, target, label_list):
+
+        registered_list = []
+        registered_list_label = []
+        for i in range(len(out['backward_flow'])):
+            initial_target_backward = target[i + 1]
+            initial_target_backward = torch.nn.functional.one_hot(initial_target_backward[:, 0].long(), num_classes=4).permute(0, 3, 1, 2).contiguous().float()
+            registered_backward_label = self.motion_estimation(flow=out['backward_flow'][i], original=initial_target_backward, mode='bilinear')
+            registered_list_label.append(registered_backward_label)
+
+            registered = self.motion_estimation(flow=out['backward_flow'][i], original=unlabeled[i + 1])
+            registered_list.append(registered)
+        registered = torch.stack(registered_list, dim=0)
+        registered_label = torch.stack(registered_list_label, dim=-1)
+
+        global_motion_loss2 = self.segmentation_loss(registered_label, target[0][:, :, :, :, None].repeat(1, 1, 1, 1, registered_label.shape[-1]))
+        self.loss_data['seg_registered_memory'][1] = global_motion_loss2
+        intermediate_loss = self.registration_loss(registered, unlabeled[0][None].repeat(len(registered), 1, 1, 1, 1))
+
+        #matplotlib.use('QtAgg')
+        #fig, ax = plt.subplots(1, 3)
+        #ax[0].imshow(intermediate_loss[0, 0, 0].detach().cpu(), cmap='hot')
+        #ax[1].imshow(label_list[0, 0, 0].detach().cpu(), cmap='hot', vmin=0.0, vmax=1.0)
+        #ax[2].imshow((intermediate_loss * label_list[0][None].repeat(len(registered), 1, 1, 1, 1))[0, 0, 0].detach().cpu(), cmap='hot')
+        #plt.show()
+
+        intermediate_loss_inside = intermediate_loss * label_list[0][None].repeat(len(registered), 1, 1, 1, 1)
+        #intermediate_loss_outside = intermediate_loss * (1 - label_list[0][None].repeat(len(registered), 1, 1, 1, 1))
+
+        self.loss_data['memory_flow'][1] = intermediate_loss_inside.mean()
+        #self.loss_data['memory_flow_outside'][1] = intermediate_loss_outside.mean()
+
+        cumulated_flow_regularization_loss = self.spatial_smoothing_loss(flow=out['backward_flow'])
+        cumulated_flow_regularization_loss = cumulated_flow_regularization_loss * label_list[0][None].repeat(len(registered), 1, 1, 1, 1)
+        self.loss_data['memory_flow_regularization'][1] = cumulated_flow_regularization_loss
+
+        temporal_regu_loss = self.temporal_smoothing_loss(out['backward_flow'])
+        temporal_regu_loss = temporal_regu_loss * label_list[0][None].repeat(len(registered), 1, 1, 1, 1)
+
+        self.loss_data['temporal_regularization'][1] = temporal_regu_loss
+
+        return out
+    
+
+
+    def compute_losses_raft(self, unlabeled, flow, target):
+
+        if self.dataloader_modality == 'other':
+
+            backward_flow = flow[-1]
+            initial_target_backward = target[-1]
+            initial_target_backward = torch.nn.functional.one_hot(initial_target_backward[:, 0].long(), num_classes=4).permute(0, 3, 1, 2).contiguous().float()
+            registered_backward = self.motion_estimation(flow=backward_flow, original=initial_target_backward, mode='bilinear')
+            global_motion_loss2 = self.segmentation_loss(registered_backward, target[0])
+
+            self.loss_data['seg_registered_memory'][1].append(global_motion_loss2)
+
+
+        loss_list = []
+        for i in range(len(flow)):
+            registered = self.motion_estimation(flow=flow[i], original=unlabeled[i + 1])
             intermediate_loss = self.registration_loss(registered, unlabeled[0])
             loss_list.append(intermediate_loss)
         loss_cumulated2 = torch.stack(loss_list, dim=0).mean()
 
-        self.loss_data['memory_flow'][1] = loss_cumulated2
+        self.loss_data['memory_flow'][1].append(loss_cumulated2)
+
+
+        cumulated_flow_regularization_loss2 = self.spatial_smoothing_loss(flow=flow)
+        self.loss_data['memory_flow_regularization'][1].append(cumulated_flow_regularization_loss2)
+
+        temporal_regu_loss2 = self.temporal_smoothing_loss(flow)
+        self.loss_data['temporal_regularization'][1].append(temporal_regu_loss2)
+    
+
+
+    def compute_losses_raft_seg(self, unlabeled, flow, seg, target):
+
+        if self.dataloader_modality == 'other':
+
+            backward_flow = flow[-1]
+            initial_target_backward = target[-1]
+            initial_target_backward = torch.nn.functional.one_hot(initial_target_backward[:, 0].long(), num_classes=4).permute(0, 3, 1, 2).contiguous().float()
+            registered_backward = self.motion_estimation(flow=backward_flow, original=initial_target_backward, mode='bilinear')
+            global_motion_loss2 = self.segmentation_loss(registered_backward, target[0])
+
+            self.loss_data['seg_registered_memory'][1].append(global_motion_loss2)
+
+        loss_list = []
+        for i in range(len(flow)):
+            registered = self.motion_estimation(flow=flow[i], original=unlabeled[i + 1])
+            intermediate_loss = self.registration_loss(registered, unlabeled[0])
+            loss_list.append(intermediate_loss)
+        loss_cumulated2 = torch.stack(loss_list, dim=0).mean()
+
+        self.loss_data['memory_flow'][1].append(loss_cumulated2)
+
+
+        cumulated_flow_regularization_loss2 = self.spatial_smoothing_loss(flow=flow)
+        self.loss_data['memory_flow_regularization'][1].append(cumulated_flow_regularization_loss2)
+
+        temporal_regu_loss2 = self.temporal_smoothing_loss(flow)
+        self.loss_data['temporal_regularization'][1].append(temporal_regu_loss2)
+
+        seg_loss = self.segmentation_loss(seg[-1], target[-1])
+        self.loss_data['segmentation'][1].append(seg_loss)
+
+        loss_list_seg = []
+        for i in range(len(flow)):
+            registered_seg = self.motion_estimation(flow=flow[i], original=seg[i])
+            intermediate_loss = self.segmentation_loss(registered_seg, target[0])
+            loss_list_seg.append(intermediate_loss)
+        loss_seg_registered = torch.stack(loss_list_seg, dim=0).mean()
+
+        self.loss_data['seg_registered'][1].append(loss_seg_registered)
+
+
+
+    def compute_losses_raft_sl(self, unlabeled, flow_large, flow_small, target):
+
+        if self.dataloader_modality == 'other':
+
+            backward_flow = flow_large[-1]
+            initial_target_backward = target[-1]
+            initial_target_backward = torch.nn.functional.one_hot(initial_target_backward[:, 0].long(), num_classes=4).permute(0, 3, 1, 2).contiguous().float()
+            registered_backward = self.motion_estimation(flow=backward_flow, original=initial_target_backward, mode='bilinear')
+            global_motion_loss2 = self.segmentation_loss(registered_backward, target[0])
+
+            self.loss_data['seg_registered_memory'][1].append(global_motion_loss2)
+
+            #if self.cycle_consistency:
+            #    registered_cycle1 = self.motion_estimation(flow=backward_flow, original=registered_forward, mode='bilinear')
+            #    global_motion_loss_cycle1 = self.segmentation_loss(registered_cycle1, target[0])
+#
+            #    registered_cycle2 = self.motion_estimation(flow=forward_flow, original=registered_backward, mode='bilinear')
+            #    global_motion_loss_cycle2 = self.segmentation_loss(registered_cycle2, target[-1])
+#
+            #    self.loss_data['seg_registered_cycle'][1] = (global_motion_loss_cycle1 + global_motion_loss_cycle2) / 2
+
+
+        loss_list_large = []
+        loss_list_small = []
+        for i in range(len(flow_large)):
+            registered_large = self.motion_estimation(flow=flow_large[i], original=unlabeled[i + 1])
+            registered_small = self.motion_estimation(flow=flow_small[i], original=unlabeled[i + 1])
+            
+            intermediate_loss_large = self.registration_loss(registered_large, unlabeled[0])
+            intermediate_loss_small = self.registration_loss(registered_small, unlabeled[i])
+
+            loss_list_large.append(intermediate_loss_large)
+            loss_list_small.append(intermediate_loss_small)
+
+        loss_cumulated2_large = torch.stack(loss_list_large, dim=0).mean()
+        loss_cumulated2_small = torch.stack(loss_list_small, dim=0).mean()
+
+        self.loss_data['memory_flow_large'][1].append(loss_cumulated2_large)
+        self.loss_data['memory_flow_small'][1].append(loss_cumulated2_small)
 
 
             #if self.cycle_consistency:
             #    loss_list = []
             #    for i in range(len(out['forward_flow'])):
             #        registered_forward = self.motion_estimation(flow=out['forward_flow'][i], original=unlabeled[0])
-            #        registered = self.motion_estimation(flow=out['backward_flow'][i], original=registered_forward)
+            #        registered = self.motion_estimation(flow=flow[i], original=registered_forward)
             #        cycle_loss = self.registration_loss(registered, unlabeled[0])
             #        loss_list.append(cycle_loss)
             #    cycle_loss1 = torch.stack(loss_list, dim=0).mean()
 #
             #    loss_list = []
-            #    for i in range(len(out['backward_flow'])):
-            #        registered_backward = self.motion_estimation(flow=out['backward_flow'][i], original=unlabeled[i + 1])
+            #    for i in range(len(flow)):
+            #        registered_backward = self.motion_estimation(flow=flow[i], original=unlabeled[i + 1])
             #        registered = self.motion_estimation(flow=out['forward_flow'][i], original=registered_backward)
             #        cycle_loss = self.registration_loss(registered, unlabeled[i + 1])
             #        loss_list.append(cycle_loss)
@@ -1434,14 +1669,17 @@ class SegFlowGaussian(nnUNetTrainer):
             #    self.loss_data['cycle_flow'][1] = (cycle_loss1 + cycle_loss2) / 2
 
 
-        cumulated_flow_regularization_loss2 = self.spatial_smoothing_loss(flow=out['backward_flow'])
-        self.loss_data['memory_flow_regularization'][1] = cumulated_flow_regularization_loss2
+        cumulated_flow_regularization_loss2_large = self.spatial_smoothing_loss(flow=flow_large)
+        cumulated_flow_regularization_loss2_small = self.spatial_smoothing_loss(flow=flow_small)
+        self.loss_data['memory_flow_regularization_large'][1].append(cumulated_flow_regularization_loss2_large)
+        self.loss_data['memory_flow_regularization_small'][1].append(cumulated_flow_regularization_loss2_small)
 
-        temporal_regu_loss2 = self.temporal_smoothing_loss(out['backward_flow'])
-        self.loss_data['temporal_regularization'][1] = temporal_regu_loss2
+        temporal_regu_loss2_large = self.temporal_smoothing_loss(flow_large)
+        temporal_regu_loss2_small = self.temporal_smoothing_loss(flow_small)
+        self.loss_data['temporal_regularization_large'][1].append(temporal_regu_loss2_large)
+        self.loss_data['temporal_regularization_small'][1].append(temporal_regu_loss2_small)
 
-        return out
-    
+
 
 
     def compute_losses_recursive_adjacent(self, unlabeled, out, target):
@@ -1622,7 +1860,7 @@ class SegFlowGaussian(nnUNetTrainer):
         init_x_coord = H2 // 2
         init_y_coord = W2 // 2
 
-        scaling_ratio = 2 if (self.deformable3 or self.deformable6) else 8
+        scaling_ratio = 2
 
         sampling_locations = sampling_locations[:, 0, init_x_coord, init_y_coord, :, :] # T, h, P, 2
         attention_weights = attention_weights[:, 0, init_x_coord, init_y_coord, :] # T, h, P
@@ -1657,6 +1895,33 @@ class SegFlowGaussian(nnUNetTrainer):
 
         plt.show()
 
+    
+
+    def handle_raft_iterations(self, unlabeled, out, target):
+        flow = out['backward_flow']
+        for i in range(len(flow)):
+            # one iter
+            self.loss_function(unlabeled=unlabeled, flow=flow[i], target=target)
+        return out
+    
+
+    def handle_raft_iterations_seg(self, unlabeled, out, target):
+        flow = out['backward_flow']
+        seg = out['seg']
+        for i in range(len(flow)):
+            # one iter
+            self.loss_function(unlabeled=unlabeled, flow=flow[i], seg=seg, target=target)
+        return out
+    
+    
+    def handle_raft_iterations_sl(self, unlabeled, out, target):
+        flow_large = out['backward_flow_large']
+        flow_small = out['backward_flow_small']
+        for i in range(len(flow_large)):
+            # one iter
+            self.loss_function(unlabeled=unlabeled, flow_large=flow_large[i], flow_small=flow_small[i], target=target)
+        return out
+
         
 
     def run_iteration_train(self, data_generator):
@@ -1669,20 +1934,26 @@ class SegFlowGaussian(nnUNetTrainer):
         :return:
         """
 
-        data_dict = next(data_generator)
+        if self.dataloader_modality == 'regular':
+            data_dict = data_generator.custom_next(self.epoch / self.max_num_epochs)
+        else:
+            data_dict = next(data_generator)
+
+
         unlabeled = data_dict['unlabeled']
         target = data_dict['target']
-        target_mask = data_dict['target_mask'] # T, B
-        try:
-            distances = data_dict['distances'] # T-1, B
-        except:
-            distances=None
+        strain_mask = data_dict['strain_mask']
+        strain_mask_one_hot = data_dict['strain_mask_one_hot']
 
         #matplotlib.use('QtAgg')
-        #fig, ax = plt.subplots(2, len(unlabeled))
+        #fig, ax = plt.subplots(6, len(unlabeled))
         #for k in range(len(unlabeled)):
         #    ax[0, k].imshow(unlabeled[k, 0, 0].cpu(), cmap='gray')
         #    ax[1, k].imshow(target[k, 0, 0].cpu(), cmap='gray')
+        #    ax[2, k].imshow(strain_mask_one_hot[k, 0, 0].cpu(), cmap='hot', vmin=0.0, vmax=1.0)
+        #    ax[3, k].imshow(strain_mask_one_hot[k, 0, 1].cpu(), cmap='hot', vmin=0.0, vmax=1.0)
+        #    ax[4, k].imshow(strain_mask_one_hot[k, 0, 2].cpu(), cmap='hot', vmin=0.0, vmax=1.0)
+        #    ax[5, k].imshow(strain_mask[k, 0, 0].cpu(), cmap='hot', vmin=0.0, vmax=1.0)
         #plt.show()
 
         #matplotlib.use('QtAgg')
@@ -1695,41 +1966,23 @@ class SegFlowGaussian(nnUNetTrainer):
         #ax[1, 2].imshow(labeled[1, 0].cpu(), cmap='gray')
         #plt.show()
 
-        #labeled = maybe_to_torch(labeled)
-        #unlabeled = maybe_to_torch(unlabeled)
-        #target = maybe_to_torch(target)
-        #if torch.cuda.is_available():
-        #    labeled = to_cuda(labeled)
-        #    unlabeled = to_cuda(unlabeled)
-        #    target = to_cuda(target)
-
-        #unlabeled.requires_grad = True
-            
-        if self.config['no_label']:
-            out = self.network(unlabeled, label=None)
-        elif self.config['dataloader_modality'] == 'regular':
-            out = self.network(unlabeled, label=None)
+        if self.label_input:
+            out = self.network(unlabeled, label=strain_mask_one_hot.float())
         else:
-            if self.logits_input:
-                with torch.no_grad():
-                    label = self.pretrained_network(unlabeled[0])['pred'].detach()
+            out = self.network(unlabeled)
 
-                    #matplotlib.use('QtAgg')
-                    #fig, ax = plt.subplots(1, 2)
-                    #ax[0].imshow(torch.argmax(label, dim=1)[0].cpu(), cmap='gray')
-                    #ax[1].imshow(target[0, 0, 0].cpu(), cmap='gray')
-                    #plt.show()
-            else: 
-                label = torch.nn.functional.one_hot(target[0, :, 0].long(), num_classes=4).permute(0, 3, 1, 2).contiguous().float()
-            out = self.network(unlabeled, label=label)
-        #unlabeled = unlabeled.permute(2, 0, 1, 3, 4).contiguous()
         self.optimizer.zero_grad()
 
-        if not self.deformable and not self.deformable2 and not self.deformable3 and not self.deformable4 and not self.deformable5 and not self.deformable6:
-            self.writer.add_scalars('Iteration/attn_weights', {'frame_' + str(i):torch.abs(out['weights'][i].mean()) for i in range(len(out['weights']))}, self.iter_nb)
-        else:
-            self.writer.add_scalars('Iteration/attn_weights', {'frame_' + str(i):torch.abs(out['attention_weights'][i].mean()) for i in range(len(out['attention_weights']))}, self.iter_nb)
-            self.writer.add_scalars('Iteration/offsets', {'frame_' + str(i):torch.abs(out['offsets'][i].mean()) for i in range(len(out['offsets']))}, self.iter_nb)
+        #if not self.mamba and not self.raft and not self.use_context_encoder and self.memory_read:
+        #    self.writer.add_scalars('Iteration/attn_weights', {'frame_' + str(i):torch.abs(out['weights'][i].mean()) for i in range(len(out['weights']))}, self.iter_nb)
+            #if not self.deformable:
+            #    self.writer.add_scalars('Iteration/attn_weights', {'frame_' + str(i):torch.abs(out['weights'][i].mean()) for i in range(len(out['weights']))}, self.iter_nb)
+            #else:
+#
+            #    self.writer.add_scalars('Iteration/attn_weights', {'frame_' + str(i):torch.abs(out['attention_weights'][i].mean()) for i in range(len(out['attention_weights']))}, self.iter_nb)
+            #    self.writer.add_scalars('Iteration/offsets', {'frame_' + str(i):torch.abs(out['offsets'][i].mean()) for i in range(len(out['offsets']))}, self.iter_nb)
+            
+            
             #self.writer.add_scalar('Iteration/offsets', torch.abs(out['offsets']).mean(), self.iter_nb)
         # Assertion with variable check
         #try:
@@ -1761,8 +2014,8 @@ class SegFlowGaussian(nnUNetTrainer):
         #unlabeled = Variable(unlabeled, requires_grad=True)
         #unlabeled = unlabeled.cuda()
         #unlabeled.retain_grad()
-#
-        out = self.loss_function(unlabeled=unlabeled, out=out, target=target)
+
+        out = self.loss_function(unlabeled=unlabeled, out=out, target=target, label_list=strain_mask)
         l = self.consolidate_only_one_loss_data(self.loss_data, log=True)
 
         #if self.iter_nb > 500:
@@ -1819,49 +2072,53 @@ class SegFlowGaussian(nnUNetTrainer):
         """
 
         data_dict = next(data_generator)
+
         unlabeled = data_dict['unlabeled'] # T, B, 1, H, W
         target = data_dict['target'] # T, B, 1, H, W
         target_mask = data_dict['target_mask'] # T, B
-        try:
-            distances = data_dict['distances'] # T-1, B
-        except:
-            distances=None
+        strain_mask = data_dict['strain_mask']
+        strain_mask_one_hot = data_dict['strain_mask_one_hot']
 
 
         with torch.no_grad():
-            if self.config['no_label']:
-                out = self.network(unlabeled, label=None)
+            if self.label_input:
+                out = self.network(unlabeled, label=strain_mask_one_hot.float())
             else:
-                if self.logits_input:
-                    with torch.no_grad():
-                        label = self.pretrained_network(unlabeled[0])['pred']
-                else: 
-                    label = torch.nn.functional.one_hot(target[0, :, 0].long(), num_classes=4).permute(0, 3, 1, 2).contiguous().float()
-                out = self.network(unlabeled, label=label)
+                out = self.network(unlabeled)
+
+
+        #with torch.no_grad():
+        #    if self.config['no_label']:
+        #        out = self.network(unlabeled, label=None)
+        #    else:
+        #        if self.logits_input:
+        #            with torch.no_grad():
+        #                label = self.pretrained_network(unlabeled[0])['pred']
+        #        else: 
+        #            label = torch.nn.functional.one_hot(target[0, :, 0].long(), num_classes=4).permute(0, 3, 1, 2).contiguous().float()
+        #        out = self.network(unlabeled, label=label)
 
         
-        #if self.epoch > -1:
-        #    if self.deformable2:
-        #        step = len(unlabeled) / self.video_length
-        #        right_frames = []
-        #        for t in range(self.video_length):
-        #            index = int(t * step)
-        #            right_frames.append(unlabeled[index])
-        #        right_frames = torch.stack(right_frames, dim=0)
-        #        self.plot_coords_deformable(out['sampling_locations'], out['attention_weights'], images=right_frames)
-        #    elif self.deformable or self.deformable3 or self.deformable4 or self.deformable6:
+        #if self.epoch > 3:
+        #    if self.deformable:
         #        self.plot_coords_deformable(out['sampling_locations'], out['attention_weights'], images=unlabeled)
 
+        if self.raft:
+            if self.small_large:
+                flow = out['backward_flow_large'][-1, -1]
+            else:
+                flow = out['backward_flow'][-1, -1]
+        else:
+            flow = out['backward_flow'][-1]
         
-        if self.config['backward_flow']:
-            seg_dice = self.get_stats_flow_backward(out=out, 
+        seg_dice = self.get_stats_flow_backward(flow=flow, 
                                        target=target,
                                        padding=data_dict['padding_need'])
         
-        if self.learn_seg:
+        if self.seg:
             seg_dice = self.get_stats_seg(out=out, 
-                                          target=target,
-                                          padding=data_dict['padding_need'])
+                                       target=target,
+                                       padding=data_dict['padding_need'])
 
         if self.log_images:
 
@@ -1891,26 +2148,34 @@ class SegFlowGaussian(nnUNetTrainer):
         :return:
         """
 
-        data_dict = next(data_generator)
+        if self.dataloader_modality == 'regular':
+            data_dict = data_generator.custom_next(self.epoch / self.max_num_epochs)
+        else:
+            data_dict = next(data_generator)
+
         unlabeled = data_dict['unlabeled'] # T, B, 1, H, W
         target = data_dict['target'] # T, B, 1, H, W
         target_mask = data_dict['target_mask'] # T, B
-        try:
-            distances = data_dict['distances'] # T-1, B
-        except:
-            distances=None
+        strain_mask = data_dict['strain_mask']
+        strain_mask_one_hot = data_dict['strain_mask_one_hot']
 
-        if self.config['no_label']:
-            out = self.network(unlabeled, label=None)
-        else:
-            if self.logits_input:
-                with torch.no_grad():
-                    label = self.pretrained_network(unlabeled[0])['pred']
-            else: 
-                label = torch.nn.functional.one_hot(target[0, :, 0].long(), num_classes=4).permute(0, 3, 1, 2).contiguous().float()
-            out = self.network(unlabeled, label=label)
+        with torch.no_grad():
+            if self.label_input:
+                out = self.network(unlabeled, label=strain_mask_one_hot.float())
+            else:
+                out = self.network(unlabeled)
+
+        #if self.config['no_label']:
+        #    out = self.network(unlabeled, label=None)
+        #else:
+        #    if self.logits_input:
+        #        with torch.no_grad():
+        #            label = self.pretrained_network(unlabeled[0])['pred']
+        #    else: 
+        #        label = torch.nn.functional.one_hot(target[0, :, 0].long(), num_classes=4).permute(0, 3, 1, 2).contiguous().float()
+        #    out = self.network(unlabeled, label=label)
         #unlabeled = unlabeled.permute(2, 0, 1, 3, 4).contiguous()
-        out = self.loss_function(unlabeled=unlabeled, out=out, target=target)
+        out = self.loss_function(unlabeled=unlabeled, out=out, target=target, label_list=strain_mask)
         l = self.consolidate_only_one_loss_data(self.loss_data, log=False)
         self.val_loss.append(l.mean().detach().cpu())
 
@@ -2056,13 +2321,12 @@ class SegFlowGaussian(nnUNetTrainer):
 
 
 
-    def get_stats_flow_backward(self, out, target, padding):
+    def get_stats_flow_backward(self, flow, target, padding):
         #step = int(len(out['forward_flow']) / len(target))
         #out['forward_flow'] = out['forward_flow'][::step]
 
         #seg = out['seg'].permute(1, 0, 2, 3, 4).contiguous()
         target = target.permute(1, 0, 2, 3, 4).contiguous()
-        flow = out['backward_flow'][-1]
         num_classes = 4
 
         #flow = torch.nn.functional.pad(flow, pad=(0, 0, 0, 0, 0, 0, 1, 0))
@@ -2177,6 +2441,9 @@ class SegFlowGaussian(nnUNetTrainer):
     def consolidate_only_one_loss_data(self, loss_data, log):
         loss = 0.0
         for key, value in loss_data.items():
+            if self.raft:
+                value[1] = torch.stack(value[1], dim=0)
+                value[1] = (value[1] * self.raft_gamma).sum()
             #value[1] = torch.tensor([torch.nan], requires_grad=True)
             #if not torch.isfinite(value[1]):
             #    self.print_to_log_file(key, also_print_to_console=False)
@@ -2187,6 +2454,9 @@ class SegFlowGaussian(nnUNetTrainer):
         if log:
             self.writer.add_scalars('Iteration/loss weights', {key:value[0] for key, value in loss_data.items()}, self.iter_nb)
             self.writer.add_scalar('Iteration/Training loss', loss.mean(), self.iter_nb)
+        
+        if self.raft:
+            self.loss_data = self.setup_loss_data()
         
         #assert torch.isfinite(loss)
 
@@ -2570,11 +2840,7 @@ class SegFlowGaussian(nnUNetTrainer):
             self.print_to_log_file("saving scheduled checkpoint file...")
             if not self.save_latest_only:
                 self.save_checkpoint(join(self.output_folder, "model_ep_%03.0d.model" % (self.epoch + 1)))
-                if self.do_adv:
-                    self.save_checkpoint_discriminator(join(self.output_folder, "discriminator_ep_%03.0d.model" % (self.epoch + 1)))
             self.save_checkpoint(join(self.output_folder, "model_latest.model"))
-            if self.do_adv:
-                self.save_checkpoint_discriminator(join(self.output_folder, "discriminator_latest.model"))
             self.print_to_log_file("done")
     
 
@@ -2868,24 +3134,24 @@ class SegFlowGaussian(nnUNetTrainer):
                 dataloader_class = DataLoaderFlowLibProgressiveAllDataFirst
             elif self.dataloader_modality == 'all_adjacent':
                 assert self.video_length == 2
-                dataloader_class = DataLoaderFlowLibProgressiveAllDataAdjacent
+                dataloader_class = DataLoaderPreprocessedAdjacent
             elif self.dataloader_modality == 'regular':
                 dataloader_class = DataLoaderAugmentRegular
             elif self.dataloader_modality == 'other':
-                dataloader_class = DataLoaderAugment
+                dataloader_class = DataLoaderPreprocessed if not self.supervised else DataLoaderPreprocessedSupervised
                 #dataloader_class = DataLoaderFlowTrainPrediction
                 #dataloader_class = DataLoaderFlowTrain5LibProgressive
 
-            dl_val = DataLoaderAugmentValidation(self.dataset_val, self.patch_size, self.patch_size, 1, do_data_aug=False, video_length=self.video_length,
-                                    crop_size=self.crop_size, processor=self.processor, is_val=True, oversample_foreground_percent=self.oversample_foreground_percent,
+            dl_val = DataLoaderPreprocessedValidation(self.dataset_val, self.patch_size, self.patch_size, 1, do_data_aug=False, video_length=self.video_length,
+                                    crop_size=self.crop_size, processor=self.processor, is_val=True, distance_map_power=self.distance_map_power, binary_distance=self.binary_distance, oversample_foreground_percent=self.oversample_foreground_percent,
                                     pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
             
             dl_tr = dataloader_class(self.dataset_tr, self.basic_generator_patch_size, self.patch_size, self.batch_size, do_data_aug=self.do_data_aug, video_length=self.video_length,
-                                            crop_size=self.crop_size, processor=self.processor, is_val=False, oversample_foreground_percent=self.oversample_foreground_percent,
+                                            crop_size=self.crop_size, processor=self.processor, is_val=False, data_path=r'Lib_resampling_training_mask', distance_map_power=self.distance_map_power, binary_distance=self.binary_distance, oversample_foreground_percent=self.oversample_foreground_percent,
                                             pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
                 
             dl_overfitting = dataloader_class(self.dataset_val, self.basic_generator_patch_size, self.patch_size, self.batch_size, do_data_aug=False, video_length=self.video_length,
-                                            crop_size=self.crop_size, processor=self.processor, is_val=True, oversample_foreground_percent=self.oversample_foreground_percent,
+                                            crop_size=self.crop_size, processor=self.processor, is_val=True, data_path=r'Lib_resampling_training_mask', distance_map_power=self.distance_map_power, binary_distance=self.binary_distance, oversample_foreground_percent=self.oversample_foreground_percent,
                                             pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
         else:
 

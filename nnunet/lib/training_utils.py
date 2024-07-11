@@ -5,7 +5,6 @@ from nnunet.network_architecture.MTL_model import MTLmodel, PolicyNet
 from nnunet.network_architecture.Optical_flow_model_label import OpticalFlowModelLabeled
 from nnunet.network_architecture.Optical_flow_model_prediction import OpticalFlowModelPrediction
 from nnunet.network_architecture.Optical_flow_model_recursive import OpticalFlowModelRecursive
-from nnunet.network_architecture.Optical_flow_model_variable_length import OpticalFlowModelVariableLength
 from nnunet.network_architecture.Optical_flow_model_recursive_video import OpticalFlowModelRecursiveVideo
 from nnunet.network_architecture.Optical_flow_model_successive import OpticalFlowModelSuccessive
 from nnunet.network_architecture.Optical_flow_model_successive_other import OpticalFlowModelSuccessiveOther
@@ -1261,6 +1260,7 @@ def build_flow_model_successive(config, image_size, log_function, nb_channels, b
              norm=config['norm'],
              legacy=config['legacy'],
              segmentation=segmentation,
+             downsample_conv=config['downsample_conv'],
              nb_channels=nb_channels,
              motion_from_ed=config['motion_from_ed'],
              one_to_all=config['one_to_all'],
@@ -1465,18 +1465,36 @@ def build_seg_flow_gaussian_model(config, image_size, log_function):
 
     model = SegFlowGaussian(deep_supervision=config['deep_supervision'],
              no_residual=config['no_residual'],
-             small_memory=config['small_memory'],
-             conv_bottleneck=config['conv_bottleneck'],
-             multiplier=config['multiplier'],
-             pos_2d=config['pos_2d'],
+             memory_attn=config['memory_attn'],
+             motion_appearance=config['motion_appearance'],
+             dim_feedforward=config['dim_feedforward'],
+             label_pretrained=config['label_input'],
+             cross_attn_before_corr=config['cross_attn_before_corr'],
+             correlation_value=config['correlation_value'],
+             downsample_conv=config['downsample_conv'],
+             use_context_encoder=config['use_context_encoder'],
+             append_cat=config['append_cat'],
+             match_first=config['match_first'],
+             raft_iters=config['raft_iters'],
+             cat_correlation=config['cat_correlation'],
+             stride=config['stride'],
+             transformer=config['transformer'],
+             radius=config['radius'],
+             remove_GRU=config['remove_GRU'],
              warp=config['warp'],
+             memory_read=config['memory_read'],
+             small_memory=config['small_memory'],
+             cost_volume=config['cost_volume'],
+             conv_bottleneck=config['conv_bottleneck'],
+             raft=config['raft'],
+             skip_co_depth=config['skip_co_depth'],
+             d_model=config['d_model'],
+             mamba=config['mamba'],
              memory_length=config['video_length'],
-             add_motion_cues=config['add_motion_cues'],
              nb_conv=config['nb_conv'],
-             dropout=config['dropout'],
              residual=config['residual'],
              query_type=config['query_type'],
-             nb_extra_block=config['nb_extra_block'],
+             extra_block=config['extra_block'],
              nb_merging_block=config['nb_merging_blocks'],
              no_skip_co=config['no_skip_co'],
              P=config['P'],
@@ -1485,10 +1503,6 @@ def build_seg_flow_gaussian_model(config, image_size, log_function):
              nb_inputs=config['nb_inputs'],
              nb_inputs_memory=config['nb_inputs_memory'],
              backward_flow=config['backward_flow'],
-             learn_seg=config['learn_seg'],
-             gaussian_type=config['gaussian_type'],
-             dumb=config['dumb'],
-             kernel_size=config['kernel_size'],
              gaussian=config['gaussian'],
              timesformer=config['timesformer'],
              supervise_iterations=config['supervise_iterations'],
@@ -1499,7 +1513,6 @@ def build_seg_flow_gaussian_model(config, image_size, log_function):
              marginal=config['marginal'],
              topk=config['topk'],
              pos_1d=config['pos_1d'],
-             distance=config['distance'],
              norm=config['norm'],
              legacy=config['legacy'],
              motion_from_ed=config['motion_from_ed'],
@@ -1515,8 +1528,7 @@ def build_seg_flow_gaussian_model(config, image_size, log_function):
              bottleneck_heads=config['bottleneck_heads'],
              drop_path_rate=config['drop_path_rate'],
              log_function=log_function,
-             only_first=config['only_first'],
-             dot_multiplier=2)
+             only_first=config['only_first'])
         
     model = model.to(config['device'])
 

@@ -57,7 +57,7 @@ from nnunet.network_architecture.initialization import InitWeights_He
 from nnunet.network_architecture.neural_network import SegmentationNetwork
 from nnunet.training.data_augmentation.default_data_augmentation import default_2D_augmentation_params, \
     get_patch_size, default_3D_augmentation_params
-from nnunet.training.dataloading.dataset_loading import DataLoader2D, DataLoader2DMiddleUnlabeled, unpack_dataset
+from nnunet.training.dataloading.dataset_loading import DataLoader2D, DataLoader2DCropped, DataLoader2DMiddleUnlabeled, unpack_dataset
 from nnunet.training.network_training.nnUNetTrainer import nnUNetTrainer
 from nnunet.utilities.nd_softmax import softmax_helper
 from sklearn.model_selection import KFold
@@ -88,17 +88,20 @@ class nnMTLTrainerV2(nnUNetTrainer):
     """
 
     def __init__(self, plans_file, fold, output_folder=None, dataset_directory=None, batch_dice=True, stage=None,
-                 unpack_data=True, deterministic=True, fp16=False, middle=False, video=False, binary=False, config=None):
+                 unpack_data=True, deterministic=True, fp16=False, binary=False, config=None, inference=False):
         super().__init__(plans_file, fold, output_folder, dataset_directory, batch_dice, stage, unpack_data,
                          deterministic, fp16)
         
         self.task = os.path.basename(dataset_directory)
-        if config is None:
-            self.inference = False
-            self.config = read_config(os.path.join(Path.cwd(), 'adversarial_acdc.yaml'), False, False)
-        else:
-            self.inference = True
-            self.config = config
+        self.config = config
+        self.inference = inference
+
+        #if config is None:
+        #    self.inference = False
+        #    self.config = read_config(os.path.join(Path.cwd(), 'adversarial_acdc.yaml'), False, False)
+        #else:
+        #    self.inference = True
+        #    self.config = config
 
         self.cropper = self.config['cropper']
         if self.config['cropper']:
@@ -115,7 +118,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
                 self.cropper_weights_folder_path = 'binary_lib'
         
         self.image_size = self.config['patch_size'][0]
-        self.window_size = 7 if self.image_size == 224 else 9 if self.image_size == 288 else 8 if self.image_size == 384 else None
+        self.window_size = 7 if self.image_size == 224 else 9 if self.image_size == 288 else 8 if self.image_size == 384 else 8 if self.image_size == 192 else None
 
         self.max_num_epochs = self.config['max_num_epochs']
         self.log_images = self.config['log_images']
@@ -161,7 +164,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
                                     registered_seg=self.registered_seg,
                                     writer=self.writer)
 
-        if config is None:
+        if not inference:
             self.output_folder = self.log_dir
         else:
             self.output_folder = output_folder
@@ -488,8 +491,20 @@ class nnMTLTrainerV2(nnUNetTrainer):
 
         params_sum = 0
         for k, v in models.items():
+            out_dict = {'encoder.layers.0': 0, 'encoder.layers.1': 0, 'encoder.layers.2': 0, 'encoder.downsample_layers.0': 0, 'encoder.downsample_layers.1': 0, 'encoder.downsample_layers.2': 0, 'decoder.layers.0': 0, 'decoder.layers.1': 0, 'decoder.layers.2': 0, 'decoder.upsample_layers.0': 0, 'decoder.upsample_layers.1': 0, 'decoder.upsample_layers.2': 0, 'decoder.encoder_skip_layers.1': 0, 'decoder.encoder_skip_layers.0': 0, 'decoder.encoder_skip_layers.2': 0, 'extra_bottleneck_block_1': 0, 'extra_bottleneck_block_2': 0, 'bottleneck.layers.0': 0}
+            for name, param in v[0].named_parameters():
+                for match in list(out_dict.keys()):
+                    if match in name:
+                        out_dict[match] += param.numel()
+                
+            #all_params =  sum(p.numel() for p in v[0].parameters())
             nb_params =  sum(p.numel() for p in v[0].parameters() if p.requires_grad)
-            self.print_to_log_file(f"{k} has {nb_params:,} parameters")
+            #nb_params_non_trainable =  sum(p.numel() for p in v[0].parameters() if not p.requires_grad)
+            #buffers =  sum(p.numel() for p in v[0].buffers())
+            self.print_to_log_file(f"{k} has {nb_params:,} learnable parameters")
+            #self.print_to_log_file(f"{k} has {nb_params_non_trainable:,} non learnable parameters")
+            #self.print_to_log_file(f"{k} has {buffers:,} buffers")
+            #self.print_to_log_file(f"{k} has {all_params:,} total params")
             params_sum += nb_params
 
             model_stats = summary(v[0], input_data=v[1], 
@@ -499,7 +514,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
             model_stats.formatting.verbose = 1
             self.print_to_log_file(model_stats, also_print_to_console=False)
         
-        self.print_to_log_file("The Whole model has", "{:,}".format(params_sum), "parameters")
+        self.print_to_log_file("The Whole model has", "{:,}".format(params_sum), "learnable parameters")
     
     def get_conv_layer(self, config):
         if config['conv_layer'] == 'RFR':
@@ -1287,6 +1302,11 @@ class nnMTLTrainerV2(nnUNetTrainer):
             for b in range(len(x_in)):
                 temp_list.append(self.normalizer(x_in[b]))
             x_in = torch.stack(temp_list, dim=0)
+        
+        #matplotlib.use('QtAgg')
+        #fig, ax = plt.subplots(1, 1)
+        #ax.imshow(x_in[0, 0].cpu(), cmap='gray')
+        #plt.show()
     
         output = self.network(x_in)
         self.compute_losses(x=data, output=output, target=target, gt_df=gt_df, do_backprop=do_backprop, gt_classification=gt_classification)
@@ -2320,34 +2340,48 @@ class nnMTLTrainerV2(nnUNetTrainer):
         if self.unlabeled or self.middle_unlabeled:
             self.unlabeled_dataset = load_unlabeled_dataset(self.folder_with_preprocessed_data)
     
+    #def get_basic_generators(self):
+    #    self.load_dataset()
+    #    self.do_split()
+    #    dl_un_tr = None
+    #    dl_un_val = None
+    #    if self.binary:
+    #        dl_tr = DataLoader2DBinary(self.dataset_tr, self.basic_generator_patch_size, self.patch_size, self.batch_size, self.deep_supervision,
+    #                            isval=False,
+    #                            oversample_foreground_percent=self.oversample_foreground_percent,
+    #                            pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
+    #        dl_val = DataLoader2DBinary(self.dataset_val, self.patch_size, self.patch_size, self.batch_size, self.deep_supervision,
+    #                            isval=True,
+    #                            oversample_foreground_percent=self.oversample_foreground_percent,
+    #                            pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
+    #    else:
+    #        dl_tr = DataLoader2D(self.dataset_tr, self.basic_generator_patch_size, self.patch_size, self.batch_size,
+    #                            oversample_foreground_percent=self.oversample_foreground_percent,
+    #                            pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r', filter_phase=self.filter_phase)
+    #        dl_val = DataLoader2D(self.dataset_val, self.patch_size, self.patch_size, self.batch_size,
+    #                            oversample_foreground_percent=self.oversample_foreground_percent,
+    #                            pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r', filter_phase=False)
+    #        if self.unlabeled:
+    #            dl_un_tr = DataLoader2DUnlabeled(self.dataset_un_tr, self.basic_generator_patch_size, self.patch_size, self.batch_size,
+    #                                        oversample_foreground_percent=self.oversample_foreground_percent,
+    #                                        pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
+    #            dl_un_val = DataLoader2DUnlabeled(self.dataset_un_val, self.basic_generator_patch_size, self.patch_size, self.batch_size,
+    #                                        oversample_foreground_percent=self.oversample_foreground_percent,
+    #                                        pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
+    #    return dl_tr, dl_val, dl_un_tr, dl_un_val
+    
+
     def get_basic_generators(self):
         self.load_dataset()
         self.do_split()
         dl_un_tr = None
         dl_un_val = None
-        if self.binary:
-            dl_tr = DataLoader2DBinary(self.dataset_tr, self.basic_generator_patch_size, self.patch_size, self.batch_size, self.deep_supervision,
-                                isval=False,
-                                oversample_foreground_percent=self.oversample_foreground_percent,
-                                pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
-            dl_val = DataLoader2DBinary(self.dataset_val, self.patch_size, self.patch_size, self.batch_size, self.deep_supervision,
-                                isval=True,
-                                oversample_foreground_percent=self.oversample_foreground_percent,
-                                pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
-        else:
-            dl_tr = DataLoader2D(self.dataset_tr, self.basic_generator_patch_size, self.patch_size, self.batch_size,
-                                oversample_foreground_percent=self.oversample_foreground_percent,
-                                pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r', filter_phase=self.filter_phase)
-            dl_val = DataLoader2D(self.dataset_val, self.patch_size, self.patch_size, self.batch_size,
-                                oversample_foreground_percent=self.oversample_foreground_percent,
-                                pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r', filter_phase=False)
-            if self.unlabeled:
-                dl_un_tr = DataLoader2DUnlabeled(self.dataset_un_tr, self.basic_generator_patch_size, self.patch_size, self.batch_size,
-                                            oversample_foreground_percent=self.oversample_foreground_percent,
-                                            pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
-                dl_un_val = DataLoader2DUnlabeled(self.dataset_un_val, self.basic_generator_patch_size, self.patch_size, self.batch_size,
-                                            oversample_foreground_percent=self.oversample_foreground_percent,
-                                            pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
+        dl_tr = DataLoader2DCropped(self.dataset_tr, self.patch_size, self.patch_size, self.batch_size,
+                            oversample_foreground_percent=self.oversample_foreground_percent,
+                            pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r', filter_phase=self.filter_phase)
+        dl_val = DataLoader2DCropped(self.dataset_val, self.patch_size, self.patch_size, self.batch_size,
+                            oversample_foreground_percent=self.oversample_foreground_percent,
+                            pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r', filter_phase=False)
         return dl_tr, dl_val, dl_un_tr, dl_un_val
 
 

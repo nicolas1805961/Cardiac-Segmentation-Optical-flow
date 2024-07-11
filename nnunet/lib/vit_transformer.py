@@ -26,8 +26,96 @@ from einops import rearrange
 from einops.layers.torch import Rearrange
 from torch.nn import init
 from torch.nn.functional import affine_grid
+from torch import nn, einsum
 
 from nnunet.lib.spacetimeAttention import AttentionLearnedSin
+
+
+class Attention(nn.Module):
+    def __init__(self, dim, heads, dim_head, rel_pos, h, w, dropout = 0.):
+        super().__init__()
+        self.rel_pos = rel_pos
+        if rel_pos:
+            self.pos_emb = RelPosEmb(160, dim_head, h=h, w=w)
+
+        inner_dim = dim_head *  heads
+        project_out = not (heads == 1 and dim_head == dim)
+
+        self.heads = heads
+        self.scale = dim_head ** -0.5
+
+        self.norm = nn.LayerNorm(dim)
+
+        self.attend = nn.Softmax(dim = -1)
+        self.dropout = nn.Dropout(dropout)
+
+        self.to_q = nn.Linear(dim, inner_dim, bias = False)
+        self.to_k = nn.Linear(dim, inner_dim, bias = False)
+        self.to_v = nn.Linear(dim, inner_dim, bias = False)
+
+        self.to_out = nn.Sequential(
+            nn.Linear(inner_dim, dim),
+            nn.Dropout(dropout)
+        ) if project_out else nn.Identity()
+
+    def forward(self, query, key, value):
+        query = self.norm(query)
+
+        q = self.to_q(query)
+        k = self.to_k(key)
+        v = self.to_v(value)
+
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), [q, k, v])
+
+
+        if self.rel_pos:
+            q = self.scale * q
+            dots = torch.matmul(q, k.transpose(-1, -2))
+            sim_pos = self.pos_emb(q)
+            dots = dots + sim_pos
+        else:
+            dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+
+        attn = self.attend(dots)
+        attn = self.dropout(attn)
+
+        out = torch.matmul(attn, v)
+        out = rearrange(out, 'b h n d -> b n (h d)')
+        return self.to_out(out)
+
+
+class RelPosEmb(nn.Module):
+    def __init__(
+            self,
+            max_pos_size,
+            dim_head,
+            h,
+            w
+    ):
+        super().__init__()
+        self.h = h
+        self.w = w
+        self.rel_height = nn.Embedding(2 * max_pos_size - 1, dim_head)
+        self.rel_width = nn.Embedding(2 * max_pos_size - 1, dim_head)
+
+        deltas = torch.arange(max_pos_size).view(1, -1) - torch.arange(max_pos_size).view(-1, 1)
+        rel_ind = deltas + max_pos_size - 1
+        self.register_buffer('rel_ind', rel_ind)
+
+    def forward(self, q):
+        height_emb = self.rel_height(self.rel_ind[:self.h, :self.h].reshape(-1))
+        width_emb = self.rel_width(self.rel_ind[:self.w, :self.w].reshape(-1))
+
+        height_emb = rearrange(height_emb, '(x u) d -> x u () d', x=self.h)
+        width_emb = rearrange(width_emb, '(y v) d -> y () v d', y=self.w)
+
+        B, nb_heads, L, C = q.shape
+        height_score = einsum('b h n d, x u v d -> b h n u v', q, height_emb)
+        width_score = einsum('b h n d, y u v d -> b h n u v', q, width_emb)
+        out = height_score + width_score
+        out = out.view(B, nb_heads, L, L)
+
+        return out
 
 
 class GaussianSmoothing(nn.Module):
@@ -1134,7 +1222,8 @@ class TransformerFlowLayerOneWay(nn.Module):
 
     def forward(self, query, key, query_pos, key_pos):
         return self.forward_post(query, key, query_pos, key_pos)
-    
+
+
 
 class TransformerFlowLayer(nn.Module):
 
@@ -1161,23 +1250,70 @@ class TransformerFlowLayer(nn.Module):
     def with_pos_embed(self, tensor, pos: Optional[Tensor]):
         return tensor if pos is None else tensor + pos
 
-    def forward_post(self, myself, context, myself_pos, context_pos):
-        q = k = self.with_pos_embed(myself, myself_pos)
-        tgt2 = self.self_attn(q, k, value=myself)[0]
-        myself = myself + self.dropout1(tgt2)
-        myself = self.norm1(myself)
+    def forward_post(self, query, key, value, query_pos, key_pos):
+        q = k = self.with_pos_embed(query, query_pos)
+        tgt2 = self.self_attn(q, k, value=query)[0]
+        query = query + self.dropout1(tgt2)
+        query = self.norm1(query)
 
-        tgt2, weights = self.cross_attn(query=self.with_pos_embed(myself, myself_pos), key=self.with_pos_embed(context, context_pos), value=context)
-        myself = myself + self.dropout2(tgt2)
-        myself = self.norm2(myself)
+        tgt2, weights = self.cross_attn(query=self.with_pos_embed(query, query_pos), key=self.with_pos_embed(key, key_pos), value=value)
+        query = query + self.dropout2(tgt2)
+        query = self.norm2(query)
 
-        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(myself))))
-        myself = myself + self.dropout3(tgt2)
-        myself = self.norm3(myself)
-        return myself
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(query))))
+        query = query + self.dropout3(tgt2)
+        query = self.norm3(query)
+        return query
 
-    def forward(self, query, key, query_pos, key_pos):
-        return self.forward_post(query, key, query_pos, key_pos)
+    def forward(self, query, key, value, query_pos, key_pos):
+        return self.forward_post(query, key, value, query_pos, key_pos)
+    
+
+#class TransformerFlowLayer(nn.Module):
+#
+#    def __init__(self, d_model, nhead, rel_pos, h, w, dim_feedforward=2048, dropout=0.0,
+#                 activation="relu", normalize_before=False):
+#        super().__init__()
+#        self.self_attn = Attention(d_model, nhead, dim_head=d_model//nhead, rel_pos=rel_pos, h=h, w=w)
+#        self.cross_attn = Attention(d_model, nhead, dim_head=d_model//nhead, rel_pos=rel_pos, h=h, w=w)
+#
+#        #self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+#        #self.cross_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+#        # Implementation of Feedforward model
+#        self.linear1 = nn.Linear(d_model, dim_feedforward)
+#        self.dropout = nn.Dropout(dropout)
+#        self.linear2 = nn.Linear(dim_feedforward, d_model)
+#
+#        self.norm1 = nn.LayerNorm(d_model)
+#        self.norm2 = nn.LayerNorm(d_model)
+#        self.norm3 = nn.LayerNorm(d_model)
+#        self.dropout1 = nn.Dropout(dropout)
+#        self.dropout2 = nn.Dropout(dropout)
+#        self.dropout3 = nn.Dropout(dropout)
+#
+#        self.activation = nn.GELU()
+#        self.normalize_before = normalize_before
+#
+#    def with_pos_embed(self, tensor, pos: Optional[Tensor]):
+#        return tensor if pos is None else tensor + pos
+#
+#    def forward_post(self, query, key, value, query_pos, key_pos):
+#        q = k = self.with_pos_embed(query, query_pos)
+#        tgt2 = self.self_attn(q, k, value=query)
+#        query = query + self.dropout1(tgt2)
+#        query = self.norm1(query)
+#
+#        tgt2 = self.cross_attn(query=self.with_pos_embed(query, query_pos), key=self.with_pos_embed(key, key_pos), value=value)
+#        query = query + self.dropout2(tgt2)
+#        query = self.norm2(query)
+#
+#        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(query))))
+#        query = query + self.dropout3(tgt2)
+#        query = self.norm3(query)
+#        return query
+#
+#    def forward(self, query, key, value, query_pos, key_pos):
+#        return self.forward_post(query, key, value, query_pos, key_pos)
     
 
 
@@ -3494,7 +3630,7 @@ class TransformerFlowEncoderSuccessiveNoEmb(nn.Module):
             concat0 = torch.cat([local_forward, local_backward], dim=0)
             concat1 = torch.cat([local_backward, local_forward], dim=0)
             pos = torch.cat([pos_2d, pos_2d], dim=0)
-            concat0 = self.bilateral_attention_layers[l](query=concat0, key=concat1, query_pos=pos, key_pos=pos)
+            concat0 = self.bilateral_attention_layers[l](query=concat0, key=concat1, value=concat1, query_pos=pos, key_pos=pos)
             local_forward, local_backward = torch.chunk(concat0, chunks=2, dim=0)
 
         local_forward = local_forward.view(T - 1, B, H * W, C)
@@ -4094,7 +4230,7 @@ class deformableAttention(nn.Module):
         self.to_q = nn.Linear(dim, dim)
         self.offsets = nn.Linear(dim, nhead * points * 2)
 
-        self.pos_1d = nn.Parameter(torch.randn(self.M, dim))
+        
         
         self.attention_weights = nn.Linear(dim, nhead * points)
 
@@ -4158,8 +4294,13 @@ class deformableAttention(nn.Module):
         value = value.view(B, self.heads, C // self.heads, T, H, W)
         value = value.view(B * self.heads, C // self.heads, T, H, W)
 
-        pos_1d = self.pos_1d[None].repeat(B, 1, 1) # B, M, C
-        pos_1d = pos_1d.permute(0, 2, 1).contiguous() # B, C, M
+        pos_1d_1 = self.pos_1d_1[None].repeat(B, 1, 1) # B, M, C
+        pos_1d_1 = pos_1d_1.permute(0, 2, 1).contiguous() # B, C, M
+
+        pos_1d_2 = self.pos_1d_2[None].repeat(B, 1, 1) # B, M, C
+        pos_1d_2 = pos_1d_2.permute(0, 2, 1).contiguous() # B, C, M
+
+        pos_1d = torch.cat([pos_1d_2, pos_1d_1], dim=-1)
 
         if not self.training:
             pos_1d = torch.nn.functional.interpolate(pos_1d, size=video_length, mode='linear')
@@ -4224,7 +4365,7 @@ class deformableAttention(nn.Module):
 
 
 class deformableAttention6(nn.Module):
-    def __init__(self, dim, nhead, memory_length, add_motion_cues, points=4):
+    def __init__(self, dim, nhead, memory_length, add_motion_cues, points):
         super().__init__()
 
         self.heads = nhead
@@ -4237,8 +4378,9 @@ class deformableAttention6(nn.Module):
         self.to_q = nn.Linear(dim, dim)
         self.offsets = nn.Linear(dim, nhead * points * 2)
 
-        self.pos_1d = nn.Parameter(torch.randn(self.M, dim))
-        
+        self.pos_1d_1 = nn.Parameter(torch.randn(1, dim))
+        self.pos_1d_2 = nn.Parameter(torch.zeros(size=(self.M-1, dim), device='cuda:0'))
+
         self.attention_weights = nn.Linear(dim, nhead * points)
 
         self.to_v = nn.Conv3d(in_channels=dim, out_channels=dim, kernel_size=1)
@@ -4297,11 +4439,12 @@ class deformableAttention6(nn.Module):
         return ref
     
 
-    def forward(self, query, value, key, video_length):
+    def forward(self, query, value, key, video_length, index):
         """query: B, HW, C,
         reference_points: B, HW, 2,
         key: B, C, T, H, W,
-        value: B, C, T, H, W"""
+        value: B, C, T, H, W,
+        pos_1d: B, C, M"""
 
         B, C, T, H, W = value.shape
         B, L, C = query.shape
@@ -4322,8 +4465,14 @@ class deformableAttention6(nn.Module):
             key = key.view(T, B, C, H*W).contiguous()
             key = key.permute(0, 1, 3, 2).contiguous() # T, B, H*W, C
 
-        pos_1d = self.pos_1d[None].repeat(B, 1, 1) # B, M, C
-        pos_1d = pos_1d.permute(0, 2, 1).contiguous() # B, C, M
+        
+        pos_1d_1 = self.pos_1d_1[None].repeat(B, 1, 1) # B, M, C
+        pos_1d_1 = pos_1d_1.permute(0, 2, 1).contiguous() # B, C, M
+
+        pos_1d_2 = self.pos_1d_2[None].repeat(B, 1, 1) # B, M, C
+        pos_1d_2 = pos_1d_2.permute(0, 2, 1).contiguous() # B, C, M
+
+        pos_1d = torch.cat([pos_1d_2, pos_1d_1], dim=-1)
 
         if not self.training:
             pos_1d = torch.nn.functional.interpolate(pos_1d, size=video_length, mode='linear')
@@ -4334,7 +4483,10 @@ class deformableAttention6(nn.Module):
         offset_list = []
         for t in range(T):
 
-            current_query = query + pos_1d[:, :, t][:, None, :]
+            current_index = t + (video_length - index)
+
+            current_query = query + pos_1d[:, :, current_index:].sum(-1)[:, None, :]
+            #current_query = query + pos_1d[:, :, current_index][:, None, :]
             current_query = self.to_q(current_query)
 
             if self.add_motion_cues:
@@ -4365,7 +4517,7 @@ class deformableAttention6(nn.Module):
         attention_weights = attention_weights.view(B * self.heads, 1, H*W, T * self.points)
         attention_weights = F.softmax(attention_weights, dim=-1)
 
-        out = (samples * attention_weights).sum(-1) # B*nh, hidden_dim, H*W
+        out = (samples * attention_weights).mean(-1) # B*nh, hidden_dim, H*W
         out = out.view(B, self.heads, C // self.heads, H*W)
         out = out.view(B, C, H*W)
         out = out.permute(0, 2, 1).contiguous() # B, L, C
@@ -4747,14 +4899,14 @@ class DeformableTransformer(nn.Module):
 
 
 class DeformableTransformer6(nn.Module):
-    def __init__(self, dim, nhead, num_layers, memory_length, add_motion_cues, self_attention):
+    def __init__(self, dim, nhead, num_layers, memory_length, add_motion_cues, self_attention, points):
         super().__init__()
         self.num_layers = num_layers
         self.dim = dim
         self.memory_length = memory_length
         self.add_motion_cues = add_motion_cues
 
-        bilateral_attention_layer = DeformableTransformerEncoderLayer6(d_model=dim, nhead=nhead, memory_length=memory_length, self_attention=self_attention, add_motion_cues=add_motion_cues)
+        bilateral_attention_layer = DeformableTransformerEncoderLayer6(d_model=dim, nhead=nhead, memory_length=memory_length, self_attention=self_attention, add_motion_cues=add_motion_cues, points=points)
 
         self.bilateral_attention_layers = _get_clones(bilateral_attention_layer, num_layers)
 
@@ -4763,7 +4915,7 @@ class DeformableTransformer6(nn.Module):
         self.pos_obj_1d = DynamicPositionalEmbedding(demb=dim)
     
     
-    def forward(self, query, value, key, video_length):
+    def forward(self, query, value, key, video_length, index):
         '''query: B, C, H, W,
         value: T, B, C, H, W'''
         
@@ -4800,7 +4952,8 @@ class DeformableTransformer6(nn.Module):
                                                                                               pos_cross=pos_cross,
                                                                                               value=value,
                                                                                               key=key,
-                                                                                              video_length=video_length)
+                                                                                              video_length=video_length,
+                                                                                              index=index)
         query = query.permute(0, 1, 2).contiguous()
         query = query.view(B, C, H, W)
 
@@ -5085,60 +5238,49 @@ class MemoryAttention(nn.Module):
 
 
 class CrossAttentionLayer(nn.Module):
-    def __init__(self, dim, nhead, topk, pos_1d, distance):
+    def __init__(self, dim, nhead, num_layers, dim_feedforward, expand_value=False):
         super().__init__()
-        self.pos_1d = pos_1d
-        self.topk = topk
         self.dim = dim
+        self.num_layers = num_layers
 
-        self.cross_attention_layer = CrossTransformerEncoderLayer(d_model=dim, nhead=nhead, distance=distance, topk=topk)
+        if expand_value:
+            self.expand = nn.Conv3d(in_channels=dim//2, out_channels=dim, kernel_size=1)
 
+        bilateral_attention_layer = TransformerFlowLayer(d_model=dim, nhead=nhead, dim_feedforward=dim_feedforward)
+        self.bilateral_attention_layers = _get_clones(bilateral_attention_layer, num_layers)
         self.pos_obj_2d = PositionEmbeddingSine2d(num_pos_feats=dim // 2, normalize=True)
-
-        if pos_1d:
-            self.pos_obj_1d = PositionEmbeddingSine1d(num_pos_feats=dim, normalize=True)
     
     
     def forward(self, query, key, value):
-        '''query: B, C, H, W,
-        key: T, B, C, H, W,
-        value: T, B, C, H, W'''
+        '''fmap1: B, C, H, W,
+        fmap2: B, C, H, W'''
         
-        T, B, C, H, W = key.shape
-
-        if self.pos_1d:
-            pos_1d = self.pos_obj_1d(shape_util=(B, T), device=query.device)
-
-            pos_1d = pos_1d[:, :, :, None, None].repeat(1, 1, 1, H, W)
-            pos_1d = pos_1d.view(B, C, T * H * W)
-            pos_1d = pos_1d.permute(0, 2, 1).contiguous()
-        else:
-            pos_1d = torch.zeros(size=(B, T * H * W, C), device=query.device)
+        B, C, H, W = query.shape
 
         query = query.permute(0, 2, 3, 1).contiguous() # B, H, W, C
         query = query.view(B, H * W, C)
-
-        key = key.permute(0, 3, 4, 1, 2).contiguous()
-        key = key.view(T * H * W, B, C)
-        key = key.permute(1, 0, 2).contiguous() # B, T * H * W, C
-
-        value = value.permute(0, 3, 4, 1, 2).contiguous()
-        value = value.view(T * H * W, B, C)
-        value = value.permute(1, 0, 2).contiguous() # B, T * H * W, C
 
         pos_2d = self.pos_obj_2d(shape_util=(B, H, W), device=query.device)
         pos_2d = pos_2d.permute(0, 2, 3, 1).contiguous()
         pos_2d = pos_2d.view(B, H * W, C)
 
-        pos_2d_key = pos_2d[:, None, :, :].repeat(1, T, 1, 1)
-        pos_2d_key = pos_2d_key.view(B, T * H * W, C)
-
-        #pos_2d_key = pos_2d_key
-        pos_2d_key = pos_2d_key + pos_1d
+        key = key.permute(0, 2, 3, 1).contiguous() # B, H, W, C
+        key = key.view(B, H * W, C)
         
-        query = self.cross_attention_layer(query=query, key=key, value=value, query_pos=pos_2d, key_pos=pos_2d_key)
+        value = value.permute(0, 2, 3, 1).contiguous() # B, H, W, C
+        value = value.view(B, H * W, C)
 
-        query = query.permute(0, 1, 2).contiguous()
+        pos_2d_key = pos_2d
+        
+        for l in range(self.num_layers):
+            query = self.bilateral_attention_layers[l](query=query, 
+                                                       key=key, 
+                                                       value=value, 
+                                                       query_pos=pos_2d, 
+                                                       key_pos=pos_2d_key)
+            
+
+        query = query.permute(0, 2, 1).contiguous()
         query = query.view(B, C, H, W)
 
         return query
@@ -5186,7 +5328,7 @@ class SpatioTemporalTransformerTwoMemory(nn.Module):
         self.topk = topk
         self.dim = dim
         self.dumb = dumb
-        self.memory_length = memory_length - 1
+        self.memory_length = memory_length
 
         if dumb:
             bilateral_attention_layer = TransformerFlowLayerSeparatedDumb(d_model=dim, nhead=nhead, distance=distance, topk=topk, kernel_size=kernel_size, pos_1d=pos_1d)
@@ -5201,7 +5343,7 @@ class SpatioTemporalTransformerTwoMemory(nn.Module):
             self.pos_obj_1d = DynamicPositionalEmbedding(demb=dim)
             #self.pos_obj_1d = PositionEmbeddingSine1d(num_pos_feats=dim, normalize=True)
         elif pos_1d == 'sin':
-            self.pos_obj_1d = PositionEmbeddingSine1d(num_pos_feats=dim, normalize=False)
+            self.pos_obj_1d = DynamicPositionalEmbedding(demb=dim)
         elif pos_1d == 'learn':
             self.pos_obj_1d = nn.Parameter(torch.randn(self.memory_length, dim))
     
@@ -5212,7 +5354,7 @@ class SpatioTemporalTransformerTwoMemory(nn.Module):
         value: T, B, C, H, W,
         max_idx: T, B, HW, 2'''
         
-        shape = key.shape
+        shape = value.shape
         T, B, C, H, W = shape
 
         if max_idx is not None:
@@ -5223,19 +5365,27 @@ class SpatioTemporalTransformerTwoMemory(nn.Module):
             #pos_1d = self.pos_obj_1d(shape_util=(B, T), device=query.device)
             #pos_1d = pos_1d[:, :, :, None, None].repeat(1, 1, 1, H, W)
 
-            pos_seq = torch.arange(T-1, -1, -1.0, device=query.device)
-            pos_1d = self.pos_obj_1d(pos_seq=pos_seq) # T, C
+            pos_seq = torch.arange(self.memory_length - 1, -1, -1.0, device=query.device)
+            pos_1d = self.pos_obj_1d(pos_seq=pos_seq) # M, C
             pos_1d = pos_1d.permute(1, 0).contiguous()
-            pos_1d = pos_1d[None, :, :, None, None].repeat(B, 1, 1, H, W)
+            pos_1d = pos_1d[None].repeat(B, 1, 1) # B, C, M
+            if not self.training:
+                pos_1d = torch.nn.functional.interpolate(pos_1d, size=video_length, mode='linear')
+            pos_1d = pos_1d[:, :, -T:, None, None].repeat(1, 1, 1, H, W)
         elif self.pos_1d == "sin":
-            pos_1d = self.pos_obj_1d(shape_util=(B, T), device=query.device)
-            pos_1d = pos_1d[:, :, :, None, None].repeat(1, 1, 1, H, W)
+            pos_seq = torch.arange(self.memory_length - 1, -1, -1.0, device=query.device)
+            pos_1d = self.pos_obj_1d(pos_seq=pos_seq) # M, C
+            pos_1d = pos_1d.permute(1, 0).contiguous()
+            pos_1d = pos_1d[None].repeat(B, 1, 1) # B, C, M
+            if not self.training:
+                pos_1d = torch.nn.functional.interpolate(pos_1d, size=video_length, mode='linear')
+            pos_1d = pos_1d[:, :, -T:, None, None].repeat(1, 1, 1, H, W)
         elif self.pos_1d == "learn":
             pos_1d = self.pos_obj_1d[None].repeat(B, 1, 1) # B, M, C
             pos_1d = pos_1d.permute(0, 2, 1).contiguous() # B, C, M
             if not self.training:
                 pos_1d = torch.nn.functional.interpolate(pos_1d, size=video_length, mode='linear')
-            pos_1d = pos_1d[:, :, :T, None, None].repeat(1, 1, 1, H, W)
+            pos_1d = pos_1d[:, :, -T:, None, None].repeat(1, 1, 1, H, W)
         else:
             pos_1d = torch.zeros(size=(B, C, T, H, W), device=query.device)
 
@@ -5245,9 +5395,14 @@ class SpatioTemporalTransformerTwoMemory(nn.Module):
         query = query.permute(0, 2, 3, 1).contiguous() # B, H, W, C
         query = query.view(B, H * W, C)
 
-        key = key.permute(0, 3, 4, 1, 2).contiguous()
-        key = key.view(T * H * W, B, C)
-        key = key.permute(1, 0, 2).contiguous() # B, T * H * W, C
+        if key.dim() == 5:
+            key = key.permute(0, 3, 4, 1, 2).contiguous()
+            key = key.view(T * H * W, B, C)
+            key = key.permute(1, 0, 2).contiguous() # B, T * H * W, C
+        elif key.dim() == 4:
+            key = key.permute(0, 2, 3, 1).contiguous() # B, H, W, C
+            key = key[:, None, :, :, :].repeat(1, T, 1, 1, 1)
+            key = key.view(B, T * H * W, C)
 
         value = value.permute(0, 3, 4, 1, 2).contiguous()
         value = value.view(T * H * W, B, C)
@@ -5278,7 +5433,7 @@ class SpatioTemporalTransformerTwoMemory(nn.Module):
                                                                 pos=learnable_pos)
         if not self.dumb:
             weights = weights.view(B, T, H*W, H*W)
-            weights = weights.mean((0, 2, 3))[1:]
+            weights = weights.mean((0, 2, 3))
         #weights = weights.view(B, T, H, W, H*W)
         #weights = weights.permute(0, 4, 1, 2, 3).contiguous()
         #weights = weights.view(B * H * W, T, H, W)
@@ -5296,10 +5451,146 @@ class SpatioTemporalTransformerTwoMemory(nn.Module):
         #        ax[i].imshow(temp[i].detach().cpu(), cmap='hot', vmin=temp.min(), vmax=temp.max())
         #plt.show()
 
-        query = query.permute(0, 1, 2).contiguous()
+        query = query.permute(0, 2, 1).contiguous()
         query = query.view(B, C, H, W)
 
         return query, weights
+    
+
+
+
+
+
+class SpecialLayer(nn.Module):
+    def __init__(self, dim, nhead, num_layers, topk, pos_1d, residual, dumb, gaussian_type, memory_length):
+        super().__init__()
+        self.num_layers = num_layers
+        self.pos_1d = pos_1d
+        self.topk = topk
+        self.dim = dim
+        self.dumb = dumb
+        self.memory_length = memory_length - 1
+        dropout = 0.0
+
+        self.cross_attention_2 = L2Attention(dim, nb_heads=nhead, topk=topk, pos_1d=pos_1d, gaussian_type=gaussian_type)
+
+        self.pos_obj_2d = PositionEmbeddingSine2d(num_pos_feats=dim // 2, normalize=True)
+        self.reduce = ConvBlocks2DGroupLegacy(in_dim=2 * dim, out_dim=dim, residual=residual, nb_blocks=1)
+
+        self.norm = nn.LayerNorm(dim)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+
+        self.activation = nn.GELU()
+
+        if pos_1d == 'learnable_sin':
+            self.pos_obj_1d = DynamicPositionalEmbedding(demb=dim)
+            #self.pos_obj_1d = PositionEmbeddingSine1d(num_pos_feats=dim, normalize=True)
+        elif pos_1d == 'sin':
+            self.pos_obj_1d = PositionEmbeddingSine1d(num_pos_feats=dim, normalize=False)
+        elif pos_1d == 'learn':
+            self.pos_obj_1d = nn.Parameter(torch.randn(self.memory_length, dim))
+    
+    
+    def forward(self, query, key, value, corr, video_length, max_idx=None):
+        '''query: B, C, H, W,
+        key: B, C, H, W,
+        value: T, B, C, H, W,
+        max_idx: T, B, HW, 2'''
+        
+        shape = value.shape
+        T, B, C, H, W = shape
+
+        if max_idx is not None:
+            max_idx = max_idx.permute(1, 0, 2, 3).contiguous()
+            max_idx = max_idx.view(B, T*H*W, 2)
+
+        if self.pos_1d == 'learnable_sin':
+            #pos_1d = self.pos_obj_1d(shape_util=(B, T), device=query.device)
+            #pos_1d = pos_1d[:, :, :, None, None].repeat(1, 1, 1, H, W)
+
+            pos_seq = torch.arange(T-1, -1, -1.0, device=query.device)
+            pos_1d = self.pos_obj_1d(pos_seq=pos_seq) # T, C
+            pos_1d = pos_1d.permute(1, 0).contiguous()
+            pos_1d = pos_1d[None, :, :, None, None].repeat(B, 1, 1, H, W)
+        elif self.pos_1d == "sin":
+            pos_1d = self.pos_obj_1d(shape_util=(B, self.memory_length), device=query.device)
+            if not self.training:
+                pos_1d = torch.nn.functional.interpolate(pos_1d, size=video_length, mode='linear')
+            pos_1d = pos_1d[:, :, -T:, None, None].repeat(1, 1, 1, H, W)
+        elif self.pos_1d == "learn":
+            pos_1d = self.pos_obj_1d[None].repeat(B, 1, 1) # B, M, C
+            pos_1d = pos_1d.permute(0, 2, 1).contiguous() # B, C, M
+            if not self.training:
+                pos_1d = torch.nn.functional.interpolate(pos_1d, size=video_length, mode='linear')
+            pos_1d = pos_1d[:, :, -T:, None, None].repeat(1, 1, 1, H, W)
+        else:
+            pos_1d = torch.zeros(size=(B, C, T, H, W), device=query.device)
+
+        pos_1d = pos_1d.view(B, C, T * H * W)
+        pos_1d = pos_1d.permute(0, 2, 1).contiguous()
+
+        query = query.permute(0, 2, 3, 1).contiguous() # B, H, W, C
+        query = query.view(B, H * W, C)
+
+        key = key.permute(0, 2, 3, 1).contiguous() # B, H, W, C
+        key = key[:, None, :, :, :].repeat(1, T, 1, 1, 1)
+        key = key.view(B, T * H * W, C)
+
+        value = value.permute(0, 3, 4, 1, 2).contiguous()
+        value = value.view(T * H * W, B, C)
+        value = value.permute(1, 0, 2).contiguous() # B, T * H * W, C
+
+        pos_2d = self.pos_obj_2d(shape_util=(B, H, W), device=query.device)
+        pos_2d = pos_2d.permute(0, 2, 3, 1).contiguous()
+        pos_2d = pos_2d.view(B, H * W, C)
+
+        pos_2d_key = pos_2d[:, None, :, :].repeat(1, T, 1, 1)
+        pos_2d_key = pos_2d_key.view(B, T * H * W, C)
+
+        if self.pos_1d == 'learnable_sin':
+            pos_2d_key = pos_2d_key
+            learnable_pos = pos_1d
+        else:
+            pos_2d_key = pos_2d_key + pos_1d
+            learnable_pos = None
+
+        query1 = query + pos_2d
+        key = key + pos_2d_key
+        
+        query1, weights = self.cross_attention_2(query=query1, key=key, value=value, shape=shape)
+
+        query1 = query1 + query
+        query1 = self.norm(query1)
+
+        query1 = query1.permute(0, 2, 1).contiguous()
+        query1 = query1.view(B, C, H, W)
+
+        out = torch.cat([query1, corr], dim=1)
+        out = self.reduce(out)
+
+        if not self.dumb:
+            weights = weights.view(B, T, H*W, H*W)
+            weights = weights.mean((0, 2, 3))
+        #weights = weights.view(B, T, H, W, H*W)
+        #weights = weights.permute(0, 4, 1, 2, 3).contiguous()
+        #weights = weights.view(B * H * W, T, H, W)
+
+        #matplotlib.use('QtAgg')
+        #weights = torch.nn.functional.pad(weights, (7, 7, 7, 7), mode='reflect')
+        #weights = GaussianSmoothing(channels=T, kernel_size=15, sigma=2.0)(weights) # B*H*W, T, H, W
+        #weights = weights.view(B, H, W, T, H, W).detach().cpu()
+        #temp = weights[0, 12, 12]
+        #fig, ax = plt.subplots(1, temp.shape[0])
+        #for i in range(temp.shape[0]):
+        #    if temp.shape[0] == 1:
+        #        ax.imshow(temp[i].detach().cpu(), cmap='hot', vmin=temp.min(), vmax=temp.max())
+        #    else:
+        #        ax[i].imshow(temp[i].detach().cpu(), cmap='hot', vmin=temp.min(), vmax=temp.max())
+        #plt.show()
+
+        return out, weights
 
 
 
@@ -8646,11 +8937,11 @@ class DeformableTransformerEncoderLayer(nn.Module):
 
 class DeformableTransformerEncoderLayer6(nn.Module):
 
-    def __init__(self, d_model, nhead, memory_length, self_attention, add_motion_cues, d_ffn=2048, dropout=0.0,
+    def __init__(self, d_model, nhead, memory_length, self_attention, add_motion_cues, points, d_ffn=2048, dropout=0.0,
                  activation="gelu", normalize_before=False):
         super().__init__()
         self.self_attention = self_attention
-        self.cross_attn = deformableAttention6(d_model, nhead, memory_length, add_motion_cues=add_motion_cues)
+        self.cross_attn = deformableAttention6(d_model, nhead, memory_length, add_motion_cues=add_motion_cues, points=points)
         # Implementation of Feedforward model
         # self attention
         self.dropout2 = nn.Dropout(dropout)
@@ -8681,7 +8972,7 @@ class DeformableTransformerEncoderLayer6(nn.Module):
         src = self.norm2(src)
         return src
 
-    def forward(self, src, pos_self, pos_cross, value, key, video_length):
+    def forward(self, src, pos_self, pos_cross, value, key, video_length, index):
         if self.self_attention:
             q = k = self.with_pos_embed(src, pos_self)
             tgt2 = self.self_attn(q, k, value=src)[0]
@@ -8692,7 +8983,8 @@ class DeformableTransformerEncoderLayer6(nn.Module):
         src2, sampling_locations, attention_weights, offsets = self.cross_attn(self.with_pos_embed(src, pos_cross), 
                                                                                value=value, 
                                                                                key=key, 
-                                                                               video_length=video_length)
+                                                                               video_length=video_length,
+                                                                               index=index)
         src = src + self.dropout2(src2)
         src = self.norm2(src)
 

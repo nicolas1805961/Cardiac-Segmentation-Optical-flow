@@ -652,6 +652,7 @@ def determine_postprocessing_custom_with_metrics(base, gt_labels_folder, raw_sub
     results = []
     pred_gt_tuples = []
     for f in tqdm(fnames):
+        log_function(f)
         predicted_segmentation = join(base, raw_subfolder_name, f)
         # now remove all but the largest connected component for each class
         output_file = join(folder_all_classes_as_fg, f)
@@ -664,6 +665,7 @@ def determine_postprocessing_custom_with_metrics(base, gt_labels_folder, raw_sub
     p.join()
 
     log_function("Computing metrics")
+    log_function(rv_rejection)
 
     _ = aggregate_scores(pred_gt_tuples, labels=[1, 2, 3],
                          json_output_file=join(folder_all_classes_as_fg, "summary.json"),

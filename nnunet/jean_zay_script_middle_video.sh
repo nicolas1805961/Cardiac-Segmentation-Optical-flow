@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --array=1-4   # Number of configuration files
+#SBATCH --array=1-13   # Number of configuration files
 #SBATCH --job-name=gpu_mono          # nom du job
 #SBATCH -C v100-16g                  # reserver des GPU 16 Go seulement
 ##SBATCH --partition=gpu_p2          # de-commente pour la partition gpu_p2
@@ -20,6 +20,7 @@ module purge
 
 # chargement des modules
 module load pytorch-gpu/py3/1.11.0
+#module load pytorch-gpu/py3/2.2.0
 
 # echo des commandes lancees
 set -x
@@ -27,6 +28,9 @@ set -x
 export nnUNet_raw_data_base="out/nnUNet_raw_data_base"
 export nnUNet_preprocessed="out/nnUNet_preprocessed"
 export RESULTS_FOLDER="out/nnUNet_trained_models"
+
+#squeue -p gpu_p13 --state=PD -q qos_gpu-t3 -h -o "%.18i %.20j %.10l %.6D %10Q %.30R"
+#squeue -t R -o "%.18i %.9P %.20j %.8u %.2t %.10M %.6D %S" --sort=S
 
 # execution du code
 #python run/run_training.py 2d nnMTLTrainerV2 Task026_MMs 0 -p custom_experiment_planner --deterministic
@@ -68,7 +72,9 @@ export RESULTS_FOLDER="out/nnUNet_trained_models"
 #python run/run_training.py 2d nnMTLTrainerV2FlowSuccessive Task032_Lib 0 -p custom_experiment_planner -config config9.yaml --deterministic
 #python run/run_training.py 2d FinalFlow Task045_Lib 0 -p custom_experiment_planner -config config${SLURM_ARRAY_TASK_ID}.yaml --deterministic
 #python run/run_training.py 2d SegPrediction Task045_Lib 0 -p custom_experiment_planner -config config${SLURM_ARRAY_TASK_ID}.yaml --deterministic
-python run/run_training.py 2d SegFlowGaussian Task045_Lib 0 -p custom_experiment_planner -config config${SLURM_ARRAY_TASK_ID}.yaml --deterministic
+python run/run_training.py 2d SegFlowGaussian Task032_Lib 0 -p custom_experiment_planner -config config${SLURM_ARRAY_TASK_ID}.yaml --deterministic
+#python run/run_training.py 2d nnMTLTrainerV2FlowSuccessive Task032_Lib 0 -p custom_experiment_planner -config config${SLURM_ARRAY_TASK_ID}.yaml --deterministic
+#python run/run_training.py 2d nnMTLTrainerV2Raft Task032_Lib 0 -p custom_experiment_planner -config config${SLURM_ARRAY_TASK_ID}.yaml --deterministic
 
 sleep 1
 
