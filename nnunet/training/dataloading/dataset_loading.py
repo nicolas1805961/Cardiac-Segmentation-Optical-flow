@@ -6116,7 +6116,7 @@ class DataLoaderAugment(SlimDataLoaderBase):
 
 
 class DataLoaderPreprocessed(SlimDataLoaderBase):
-    def __init__(self, data, patch_size, final_patch_size, batch_size, video_length, processor, crop_size, is_val, do_data_aug, data_path, distance_map_power, binary_distance, oversample_foreground_percent=0.0,
+    def __init__(self, data, patch_size, final_patch_size, batch_size, video_length, processor, crop_size, is_val, do_data_aug, data_path, distance_map_power, binary_distance, start_es, oversample_foreground_percent=0.0,
                  memmap_mode="r", pseudo_3d_slices=1, pad_mode="edge",
                  pad_kwargs_data=None, pad_sides=None):
         """
@@ -6167,13 +6167,14 @@ class DataLoaderPreprocessed(SlimDataLoaderBase):
         self.data_shape, self.seg_shape = self.determine_shapes()
         self.do_data_aug = do_data_aug
         self.distance_map_power = distance_map_power
-        self.binary_distance = binary_distance
 
         self.preprocessing_transform = self.set_up_preprocessing_pipeline()
         self.pixel_transform, self.spatial_transform = self.set_up_augmentation_pipeline()
 
         self.processor = processor
         self.data_path = data_path
+        self.start_es = start_es
+        self.binary_distance = binary_distance
         
 
     def determine_shapes(self):
@@ -6378,9 +6379,8 @@ class DataLoaderPreprocessed(SlimDataLoaderBase):
             assert possible_indices[0] == ed_idx
             assert possible_indices[-1] == es_idx
 
-            r2 = np.random.randint(0, 2)
-            #if self.also_start_es and r2 == 0:
-            #    possible_indices = np.flip(possible_indices)
+            if self.start_es:
+                possible_indices = np.flip(possible_indices)
 
             random_indices = np.random.choice(np.arange(0, len(possible_indices)), size=self.video_length - 2)
             target_mask = np.concatenate([np.array([True]), np.full_like(random_indices, fill_value=False), np.array([True])]).astype(bool)
@@ -6499,7 +6499,7 @@ class DataLoaderPreprocessed(SlimDataLoaderBase):
 
         strain_mask = torch.pow(strain_mask, self.distance_map_power)
         if self.binary_distance:
-            strain_mask = strain_mask.long()
+            strain_mask = strain_mask.long().float()
         strain_mask_not_one_hot = strain_mask[:, :, -1, :, :][:, :, None, :, :]
         strain_mask_one_hot = strain_mask[:, :, :-1, :, :]
 
@@ -6909,7 +6909,7 @@ class DataLoaderPreprocessedAdjacent(SlimDataLoaderBase):
 
 
 class DataLoaderPreprocessedSupervised(SlimDataLoaderBase):
-    def __init__(self, data, patch_size, final_patch_size, batch_size, video_length, processor, crop_size, is_val, do_data_aug, data_path, distance_map_power, binary_distance, oversample_foreground_percent=0.0,
+    def __init__(self, data, patch_size, final_patch_size, batch_size, video_length, processor, crop_size, is_val, do_data_aug, data_path, distance_map_power, binary_distance, start_es, oversample_foreground_percent=0.0,
                  memmap_mode="r", pseudo_3d_slices=1, pad_mode="edge",
                  pad_kwargs_data=None, pad_sides=None):
         """
@@ -6960,13 +6960,14 @@ class DataLoaderPreprocessedSupervised(SlimDataLoaderBase):
         self.data_shape, self.seg_shape = self.determine_shapes()
         self.do_data_aug = do_data_aug
         self.distance_map_power = distance_map_power
-        self.binary_distance = binary_distance
 
         self.preprocessing_transform = self.set_up_preprocessing_pipeline()
         self.pixel_transform, self.spatial_transform = self.set_up_augmentation_pipeline()
 
         self.processor = processor
         self.data_path = data_path
+        self.start_es = start_es
+        self.binary_distance = binary_distance
         
 
     def determine_shapes(self):
@@ -7171,6 +7172,9 @@ class DataLoaderPreprocessedSupervised(SlimDataLoaderBase):
             assert possible_indices[0] == ed_idx
             assert possible_indices[-1] == es_idx
 
+            if self.start_es:
+                possible_indices = np.flip(possible_indices)
+
             random_indices = np.random.choice(np.arange(0, len(possible_indices)), size=self.video_length - 2)
             target_mask = np.concatenate([np.array([True]), np.full_like(random_indices, fill_value=True), np.array([True])]).astype(bool)
             random_indices = np.concatenate([np.array([0]), random_indices, np.array([len(possible_indices) - 1])])
@@ -7282,7 +7286,7 @@ class DataLoaderPreprocessedSupervised(SlimDataLoaderBase):
 
         strain_mask = torch.pow(strain_mask, self.distance_map_power)
         if self.binary_distance:
-            strain_mask = strain_mask.long()
+            strain_mask = strain_mask.long().float()
         strain_mask_not_one_hot = strain_mask[:, :, -1, :, :][:, :, None, :, :]
         strain_mask_one_hot = strain_mask[:, :, :-1, :, :]
 
@@ -7308,7 +7312,7 @@ class DataLoaderPreprocessedSupervised(SlimDataLoaderBase):
 
 
 class DataLoaderPreprocessedValidation(SlimDataLoaderBase):
-    def __init__(self, data, patch_size, final_patch_size, batch_size, video_length, processor, crop_size, is_val, do_data_aug, distance_map_power, binary_distance, oversample_foreground_percent=0.0,
+    def __init__(self, data, patch_size, final_patch_size, batch_size, video_length, processor, crop_size, is_val, do_data_aug, distance_map_power, binary_distance, start_es, oversample_foreground_percent=0.0,
                  memmap_mode="r", pseudo_3d_slices=1, pad_mode="edge",
                  pad_kwargs_data=None, pad_sides=None):
         """
@@ -7358,13 +7362,14 @@ class DataLoaderPreprocessedValidation(SlimDataLoaderBase):
         self.pad_sides = pad_sides
         self.data_shape, self.seg_shape = self.determine_shapes()
         self.do_data_aug = do_data_aug
-        self.binary_distance = binary_distance
 
         self.preprocessing_transform = self.set_up_preprocessing_pipeline()
         self.pixel_transform, self.spatial_transform = self.set_up_augmentation_pipeline()
 
         self.processor = processor
         self.distance_map_power = distance_map_power
+        self.start_es = start_es
+        self.binary_distance = binary_distance
         
 
     def determine_shapes(self):
@@ -7566,6 +7571,9 @@ class DataLoaderPreprocessedValidation(SlimDataLoaderBase):
             assert possible_indices[0] == ed_idx
             assert possible_indices[-1] == es_idx
 
+            if self.start_es:
+                possible_indices = np.flip(possible_indices)
+
             target_mask = np.full_like(possible_indices, fill_value=False).astype(bool)
             target_mask[0] = True
             target_mask[-1] = True
@@ -7656,7 +7664,7 @@ class DataLoaderPreprocessedValidation(SlimDataLoaderBase):
 
         strain_mask = torch.pow(strain_mask, self.distance_map_power)
         if self.binary_distance:
-            strain_mask = strain_mask.long()
+            strain_mask = strain_mask.long().float()
         strain_mask_not_one_hot = strain_mask[:, :, -1, :, :][:, :, None, :, :]
         strain_mask_one_hot = strain_mask[:, :, :-1, :, :]
 

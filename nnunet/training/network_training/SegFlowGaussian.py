@@ -196,6 +196,8 @@ class SegFlowGaussian(nnUNetTrainer):
         self.do_adv = self.config['do_adv']
         self.cycle_consistency = self.config['cycle_consistency']
         self.raft = self.config['raft']
+
+
         self.raft_iters = self.config['raft_iters']
         exponents = torch.arange(self.raft_iters - 1, -1, -1, device='cuda:0')
         self.raft_gamma = (0.8 ** exponents) / len(exponents)
@@ -227,6 +229,10 @@ class SegFlowGaussian(nnUNetTrainer):
         self.cycle_flow_loss_weight = self.config['cycle_flow_loss_weight']
         self.seg_registered_loss_weight = self.config['seg_registered_loss_weight']
         self.supervised = self.config['supervised']
+
+        if self.supervised:
+            exponents = torch.arange(self.video_length - 2, -1, -1, device='cuda:0')
+            self.iter_gamma = (0.8 ** exponents) / len(exponents)
 
         if self.video_length == 2:
             assert not self.supervised
@@ -268,21 +274,29 @@ class SegFlowGaussian(nnUNetTrainer):
         self.loss_function = self.choose_loss()
         self.save_every = self.config['overfit_log']
         self.save_latest_only = False
+        self.start_es = self.config['start_es']
 
     def setup_loss_data(self):
         loss_data = {}
-        if self.dataloader_modality == 'other':
-            loss_data['seg_registered_memory'] = [self.global_motion_forward_loss_weight, float('nan')]
-        #if self.label_input:
-        #    loss_data['memory_flow_outside'] = [0.0, float('nan')]
-        loss_data['memory_flow_regularization'] = [self.regularization_weight_xy, float('nan')]
-        loss_data['memory_flow'] = [self.image_flow_loss_weight_global, float('nan')]
-        if self.video_length > 2:
-            loss_data['temporal_regularization'] = [self.regularization_weight_z, float('nan')]
-        
-        if self.cycle_consistency and not (self.deformable or self.mamba):
-            #loss_data['seg_registered_cycle'] = [self.cycle_registered_loss_weight, float('nan')]
-            loss_data['cycle_flow'] = [self.cycle_flow_loss_weight, float('nan')]
+        if self.supervised:
+            if self.dataloader_modality == 'other':
+                loss_data['seg_registered_memory'] = [self.global_motion_forward_loss_weight, []]
+            loss_data['memory_flow_regularization'] = [self.regularization_weight_xy, []]
+            loss_data['memory_flow'] = [self.image_flow_loss_weight_global, []]
+            loss_data['temporal_regularization'] = [self.regularization_weight_z, []]
+        else:
+            if self.dataloader_modality == 'other':
+                loss_data['seg_registered_memory'] = [self.global_motion_forward_loss_weight, float('nan')]
+            #if self.label_input:
+            #    loss_data['memory_flow_outside'] = [0.0, float('nan')]
+            loss_data['memory_flow_regularization'] = [self.regularization_weight_xy, float('nan')]
+            loss_data['memory_flow'] = [self.image_flow_loss_weight_global, float('nan')]
+            if self.video_length > 2:
+                loss_data['temporal_regularization'] = [self.regularization_weight_z, float('nan')]
+            
+            if self.cycle_consistency and not (self.deformable or self.mamba):
+                #loss_data['seg_registered_cycle'] = [self.cycle_registered_loss_weight, float('nan')]
+                loss_data['cycle_flow'] = [self.cycle_flow_loss_weight, float('nan')]
 
         return loss_data
     
@@ -1490,7 +1504,47 @@ class SegFlowGaussian(nnUNetTrainer):
     
 
 
-    def compute_losses_label_supervised(self, unlabeled, out, target, label_list):
+    def compute_losses_label_supervised(self, unlabeled_fixed, unlabeled_moving, flow, target_fixed, target_moving, distance_map):
+
+        if self.dataloader_modality == 'other':
+
+            initial_target = target_moving
+            initial_target = torch.nn.functional.one_hot(initial_target[:, 0].long(), num_classes=4).permute(0, 3, 1, 2).contiguous().float()
+            registered = self.motion_estimation(flow=flow, original=initial_target, mode='bilinear')
+
+            global_motion_loss = self.segmentation_loss(registered, target_fixed)
+            self.loss_data['seg_registered_memory'][1].append(global_motion_loss)
+
+
+        registered = self.motion_estimation(flow=flow, original=unlabeled_moving)
+
+        intermediate_loss = self.registration_loss(registered[None], unlabeled_fixed[None])[0]
+
+        #matplotlib.use('QtAgg')
+        #fig, ax = plt.subplots(1, 3)
+        #ax[0].imshow(intermediate_loss[0, 0, 0].detach().cpu(), cmap='hot')
+        #ax[1].imshow(label_list[0, 0, 0].detach().cpu(), cmap='hot', vmin=0.0, vmax=1.0)
+        #ax[2].imshow((intermediate_loss * label_list[0][None].repeat(len(registered), 1, 1, 1, 1))[0, 0, 0].detach().cpu(), cmap='hot')
+        #plt.show()
+
+        intermediate_loss_inside = intermediate_loss * distance_map
+        #intermediate_loss_outside = intermediate_loss * (1 - distance_map)
+
+        self.loss_data['memory_flow'][1].append(intermediate_loss_inside.mean())
+        #self.loss_data['memory_flow_outside'][1] = intermediate_loss_outside.mean()
+
+        cumulated_flow_regularization_loss = self.spatial_smoothing_loss(flow=flow[None])[0]
+        cumulated_flow_regularization_loss = cumulated_flow_regularization_loss * distance_map
+        self.loss_data['memory_flow_regularization'][1].append(cumulated_flow_regularization_loss.mean())
+
+        temporal_regu_loss = self.temporal_smoothing_loss(flow[None])[0]
+        temporal_regu_loss = temporal_regu_loss * distance_map
+
+        self.loss_data['temporal_regularization'][1].append(temporal_regu_loss.mean())
+    
+
+
+    def compute_losses_label_supervised_2(self, unlabeled, out, target, label_list):
 
         registered_list = []
         registered_list_label = []
@@ -1532,37 +1586,6 @@ class SegFlowGaussian(nnUNetTrainer):
         self.loss_data['temporal_regularization'][1] = temporal_regu_loss
 
         return out
-    
-
-
-    def compute_losses_raft(self, unlabeled, flow, target):
-
-        if self.dataloader_modality == 'other':
-
-            backward_flow = flow[-1]
-            initial_target_backward = target[-1]
-            initial_target_backward = torch.nn.functional.one_hot(initial_target_backward[:, 0].long(), num_classes=4).permute(0, 3, 1, 2).contiguous().float()
-            registered_backward = self.motion_estimation(flow=backward_flow, original=initial_target_backward, mode='bilinear')
-            global_motion_loss2 = self.segmentation_loss(registered_backward, target[0])
-
-            self.loss_data['seg_registered_memory'][1].append(global_motion_loss2)
-
-
-        loss_list = []
-        for i in range(len(flow)):
-            registered = self.motion_estimation(flow=flow[i], original=unlabeled[i + 1])
-            intermediate_loss = self.registration_loss(registered, unlabeled[0])
-            loss_list.append(intermediate_loss)
-        loss_cumulated2 = torch.stack(loss_list, dim=0).mean()
-
-        self.loss_data['memory_flow'][1].append(loss_cumulated2)
-
-
-        cumulated_flow_regularization_loss2 = self.spatial_smoothing_loss(flow=flow)
-        self.loss_data['memory_flow_regularization'][1].append(cumulated_flow_regularization_loss2)
-
-        temporal_regu_loss2 = self.temporal_smoothing_loss(flow)
-        self.loss_data['temporal_regularization'][1].append(temporal_regu_loss2)
     
 
 
@@ -1942,7 +1965,7 @@ class SegFlowGaussian(nnUNetTrainer):
 
         unlabeled = data_dict['unlabeled']
         target = data_dict['target']
-        strain_mask = data_dict['strain_mask']
+        strain_mask = data_dict['strain_mask'].long().float()
         strain_mask_one_hot = data_dict['strain_mask_one_hot']
 
         #matplotlib.use('QtAgg')
@@ -1953,7 +1976,7 @@ class SegFlowGaussian(nnUNetTrainer):
         #    ax[2, k].imshow(strain_mask_one_hot[k, 0, 0].cpu(), cmap='hot', vmin=0.0, vmax=1.0)
         #    ax[3, k].imshow(strain_mask_one_hot[k, 0, 1].cpu(), cmap='hot', vmin=0.0, vmax=1.0)
         #    ax[4, k].imshow(strain_mask_one_hot[k, 0, 2].cpu(), cmap='hot', vmin=0.0, vmax=1.0)
-        #    ax[5, k].imshow(strain_mask[k, 0, 0].cpu(), cmap='hot', vmin=0.0, vmax=1.0)
+        #    ax[5, k].imshow(strain_mask[k, 0, 0].cpu(), cmap='gray', vmin=0.0, vmax=1.0)
         #plt.show()
 
         #matplotlib.use('QtAgg')
@@ -2015,8 +2038,20 @@ class SegFlowGaussian(nnUNetTrainer):
         #unlabeled = unlabeled.cuda()
         #unlabeled.retain_grad()
 
-        out = self.loss_function(unlabeled=unlabeled, out=out, target=target, label_list=strain_mask)
-        l = self.consolidate_only_one_loss_data(self.loss_data, log=True)
+        if self.supervised:
+            flow_list = out['backward_flow']
+            for i in range(len(flow_list)):
+                # one iter
+                self.loss_function(unlabeled_fixed=unlabeled[0], 
+                                   unlabeled_moving=unlabeled[i+1], 
+                                   flow=flow_list[i], 
+                                   target_fixed=target[0], 
+                                   target_moving=target[i+1], 
+                                   distance_map=strain_mask[0])
+            l = self.consolidate_only_one_loss_data_supervised(self.loss_data, log=True)
+        else:
+            out = self.loss_function(unlabeled=unlabeled, out=out, target=target, label_list=strain_mask)
+            l = self.consolidate_only_one_loss_data(self.loss_data, log=True)
 
         #if self.iter_nb > 500:
         #    matplotlib.use('QtAgg')
@@ -2156,7 +2191,7 @@ class SegFlowGaussian(nnUNetTrainer):
         unlabeled = data_dict['unlabeled'] # T, B, 1, H, W
         target = data_dict['target'] # T, B, 1, H, W
         target_mask = data_dict['target_mask'] # T, B
-        strain_mask = data_dict['strain_mask']
+        strain_mask = data_dict['strain_mask'].long().float()
         strain_mask_one_hot = data_dict['strain_mask_one_hot']
 
         with torch.no_grad():
@@ -2175,8 +2210,20 @@ class SegFlowGaussian(nnUNetTrainer):
         #        label = torch.nn.functional.one_hot(target[0, :, 0].long(), num_classes=4).permute(0, 3, 1, 2).contiguous().float()
         #    out = self.network(unlabeled, label=label)
         #unlabeled = unlabeled.permute(2, 0, 1, 3, 4).contiguous()
-        out = self.loss_function(unlabeled=unlabeled, out=out, target=target, label_list=strain_mask)
-        l = self.consolidate_only_one_loss_data(self.loss_data, log=False)
+        if self.supervised:
+            flow_list = out['backward_flow']
+            for i in range(len(flow_list)):
+                # one iter
+                self.loss_function(unlabeled_fixed=unlabeled[0], 
+                                   unlabeled_moving=unlabeled[i+1], 
+                                   flow=flow_list[i], 
+                                   target_fixed=target[0], 
+                                   target_moving=target[i+1], 
+                                   distance_map=strain_mask[0])
+            l = self.consolidate_only_one_loss_data_supervised(self.loss_data, log=False)
+        else:
+            out = self.loss_function(unlabeled=unlabeled, out=out, target=target, label_list=strain_mask)
+            l = self.consolidate_only_one_loss_data(self.loss_data, log=False)
         self.val_loss.append(l.mean().detach().cpu())
 
         return l.mean().detach().cpu().numpy()
@@ -2441,9 +2488,25 @@ class SegFlowGaussian(nnUNetTrainer):
     def consolidate_only_one_loss_data(self, loss_data, log):
         loss = 0.0
         for key, value in loss_data.items():
-            if self.raft:
-                value[1] = torch.stack(value[1], dim=0)
-                value[1] = (value[1] * self.raft_gamma).sum()
+            if log:
+                self.writer.add_scalar('Iteration/' + key + ' loss', value[1].mean(), self.iter_nb)
+            loss += value[0] * value[1].mean()
+            #assert loss.numel() == 1
+        if log:
+            self.writer.add_scalars('Iteration/loss weights', {key:value[0] for key, value in loss_data.items()}, self.iter_nb)
+            self.writer.add_scalar('Iteration/Training loss', loss.mean(), self.iter_nb)
+        
+        #assert torch.isfinite(loss)
+
+        return loss
+    
+
+
+    def consolidate_only_one_loss_data_supervised(self, loss_data, log):
+        loss = 0.0
+        for key, value in loss_data.items():
+            value[1] = torch.stack(value[1], dim=0)
+            value[1] = (value[1] * self.iter_gamma).sum()
             #value[1] = torch.tensor([torch.nan], requires_grad=True)
             #if not torch.isfinite(value[1]):
             #    self.print_to_log_file(key, also_print_to_console=False)
@@ -2455,12 +2518,13 @@ class SegFlowGaussian(nnUNetTrainer):
             self.writer.add_scalars('Iteration/loss weights', {key:value[0] for key, value in loss_data.items()}, self.iter_nb)
             self.writer.add_scalar('Iteration/Training loss', loss.mean(), self.iter_nb)
         
-        if self.raft:
-            self.loss_data = self.setup_loss_data()
+        self.loss_data = self.setup_loss_data()
         
         #assert torch.isfinite(loss)
 
         return loss
+    
+
 
     def consolidate_loss_data(self, loss_data1, loss_data2, log, description=None, w1=1, w2=1):
         loss_data_consolidated = self.setup_loss_data()
@@ -3143,15 +3207,15 @@ class SegFlowGaussian(nnUNetTrainer):
                 #dataloader_class = DataLoaderFlowTrain5LibProgressive
 
             dl_val = DataLoaderPreprocessedValidation(self.dataset_val, self.patch_size, self.patch_size, 1, do_data_aug=False, video_length=self.video_length,
-                                    crop_size=self.crop_size, processor=self.processor, is_val=True, distance_map_power=self.distance_map_power, binary_distance=self.binary_distance, oversample_foreground_percent=self.oversample_foreground_percent,
+                                    crop_size=self.crop_size, processor=self.processor, is_val=True, distance_map_power=self.distance_map_power, binary_distance=self.binary_distance, start_es=self.start_es, oversample_foreground_percent=self.oversample_foreground_percent,
                                     pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
             
             dl_tr = dataloader_class(self.dataset_tr, self.basic_generator_patch_size, self.patch_size, self.batch_size, do_data_aug=self.do_data_aug, video_length=self.video_length,
-                                            crop_size=self.crop_size, processor=self.processor, is_val=False, data_path=r'Lib_resampling_training_mask', distance_map_power=self.distance_map_power, binary_distance=self.binary_distance, oversample_foreground_percent=self.oversample_foreground_percent,
+                                            crop_size=self.crop_size, processor=self.processor, is_val=False, data_path=r'Lib_resampling_training_mask', distance_map_power=self.distance_map_power, binary_distance=self.binary_distance, start_es=self.start_es, oversample_foreground_percent=self.oversample_foreground_percent,
                                             pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
                 
             dl_overfitting = dataloader_class(self.dataset_val, self.basic_generator_patch_size, self.patch_size, self.batch_size, do_data_aug=False, video_length=self.video_length,
-                                            crop_size=self.crop_size, processor=self.processor, is_val=True, data_path=r'Lib_resampling_training_mask', distance_map_power=self.distance_map_power, binary_distance=self.binary_distance, oversample_foreground_percent=self.oversample_foreground_percent,
+                                            crop_size=self.crop_size, processor=self.processor, is_val=True, data_path=r'Lib_resampling_training_mask', distance_map_power=self.distance_map_power, binary_distance=self.binary_distance, start_es=self.start_es, oversample_foreground_percent=self.oversample_foreground_percent,
                                             pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
         else:
 
