@@ -169,7 +169,8 @@ class SegFlowGaussian(nnUNetTrainer):
         self.seg = False
         self.label_input = self.config['label_input']
         self.distance_map_power = self.config['distance_map_power']
-        self.binary_distance = self.config['binary_distance']
+        self.binary_distance_loss = self.config['binary_distance_loss']
+        self.binary_distance_input = self.config['binary_distance_input']
         if self.video_length == 2:
             assert self.dataloader_modality == 'all_adjacent'
         if self.video_length > 2:
@@ -1965,7 +1966,7 @@ class SegFlowGaussian(nnUNetTrainer):
 
         unlabeled = data_dict['unlabeled']
         target = data_dict['target']
-        strain_mask = data_dict['strain_mask'].long().float()
+        strain_mask = data_dict['strain_mask'].float()
         strain_mask_one_hot = data_dict['strain_mask_one_hot']
 
         #matplotlib.use('QtAgg')
@@ -1976,7 +1977,7 @@ class SegFlowGaussian(nnUNetTrainer):
         #    ax[2, k].imshow(strain_mask_one_hot[k, 0, 0].cpu(), cmap='hot', vmin=0.0, vmax=1.0)
         #    ax[3, k].imshow(strain_mask_one_hot[k, 0, 1].cpu(), cmap='hot', vmin=0.0, vmax=1.0)
         #    ax[4, k].imshow(strain_mask_one_hot[k, 0, 2].cpu(), cmap='hot', vmin=0.0, vmax=1.0)
-        #    ax[5, k].imshow(strain_mask[k, 0, 0].cpu(), cmap='gray', vmin=0.0, vmax=1.0)
+        #    ax[5, k].imshow(strain_mask[k, 0, 0].cpu(), cmap='hot', vmin=0.0, vmax=1.0)
         #plt.show()
 
         #matplotlib.use('QtAgg')
@@ -2111,7 +2112,6 @@ class SegFlowGaussian(nnUNetTrainer):
         unlabeled = data_dict['unlabeled'] # T, B, 1, H, W
         target = data_dict['target'] # T, B, 1, H, W
         target_mask = data_dict['target_mask'] # T, B
-        strain_mask = data_dict['strain_mask']
         strain_mask_one_hot = data_dict['strain_mask_one_hot']
 
 
@@ -2191,7 +2191,7 @@ class SegFlowGaussian(nnUNetTrainer):
         unlabeled = data_dict['unlabeled'] # T, B, 1, H, W
         target = data_dict['target'] # T, B, 1, H, W
         target_mask = data_dict['target_mask'] # T, B
-        strain_mask = data_dict['strain_mask'].long().float()
+        strain_mask = data_dict['strain_mask'].float()
         strain_mask_one_hot = data_dict['strain_mask_one_hot']
 
         with torch.no_grad():
@@ -3207,15 +3207,15 @@ class SegFlowGaussian(nnUNetTrainer):
                 #dataloader_class = DataLoaderFlowTrain5LibProgressive
 
             dl_val = DataLoaderPreprocessedValidation(self.dataset_val, self.patch_size, self.patch_size, 1, do_data_aug=False, video_length=self.video_length,
-                                    crop_size=self.crop_size, processor=self.processor, is_val=True, distance_map_power=self.distance_map_power, binary_distance=self.binary_distance, start_es=self.start_es, oversample_foreground_percent=self.oversample_foreground_percent,
+                                    crop_size=self.crop_size, processor=self.processor, is_val=True, distance_map_power=self.distance_map_power, binary_distance_input=self.binary_distance_input, binary_distance_loss=self.binary_distance_loss, start_es=self.start_es, oversample_foreground_percent=self.oversample_foreground_percent,
                                     pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
             
             dl_tr = dataloader_class(self.dataset_tr, self.basic_generator_patch_size, self.patch_size, self.batch_size, do_data_aug=self.do_data_aug, video_length=self.video_length,
-                                            crop_size=self.crop_size, processor=self.processor, is_val=False, data_path=r'Lib_resampling_training_mask', distance_map_power=self.distance_map_power, binary_distance=self.binary_distance, start_es=self.start_es, oversample_foreground_percent=self.oversample_foreground_percent,
+                                            crop_size=self.crop_size, processor=self.processor, is_val=False, data_path=r'Lib_resampling_training_mask', distance_map_power=self.distance_map_power, binary_distance_input=self.binary_distance_input, binary_distance_loss=self.binary_distance_loss, start_es=self.start_es, oversample_foreground_percent=self.oversample_foreground_percent,
                                             pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
                 
             dl_overfitting = dataloader_class(self.dataset_val, self.basic_generator_patch_size, self.patch_size, self.batch_size, do_data_aug=False, video_length=self.video_length,
-                                            crop_size=self.crop_size, processor=self.processor, is_val=True, data_path=r'Lib_resampling_training_mask', distance_map_power=self.distance_map_power, binary_distance=self.binary_distance, start_es=self.start_es, oversample_foreground_percent=self.oversample_foreground_percent,
+                                            crop_size=self.crop_size, processor=self.processor, is_val=True, data_path=r'Lib_resampling_training_mask', distance_map_power=self.distance_map_power, binary_distance_input=self.binary_distance_input, binary_distance_loss=self.binary_distance_loss, start_es=self.start_es, oversample_foreground_percent=self.oversample_foreground_percent,
                                             pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
         else:
 
