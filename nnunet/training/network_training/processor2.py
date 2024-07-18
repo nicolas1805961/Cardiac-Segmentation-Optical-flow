@@ -580,11 +580,13 @@ class Processor2(object):
 
                 not_one_hot = distance_transform_edt(1 - mask)
 
-                #not_one_hot = 4 * np.exp(-not_one_hot) / (1 + np.exp(-not_one_hot))**2
-                not_one_hot = 1 / (1 + not_one_hot)
+                #not_one_hot = 4 * np.exp(-not_one_hot) / ((1 + np.exp(-not_one_hot))**2)
+                #not_one_hot_2 = 1 / (1 + not_one_hot)
 
-                #fig, ax = plt.subplots(1, 1)
-                #ax.imshow(not_one_hot, cmap='hot', vmin=0.0, vmax=1.0)
+                #fig, ax = plt.subplots(1, 3)
+                #ax[0].imshow(not_one_hot_1, cmap='hot', vmin=0.0, vmax=1.0)
+                #ax[1].imshow(not_one_hot_2, cmap='hot', vmin=0.0, vmax=1.0)
+                #ax[2].imshow(not_one_hot_1**0.01, cmap='hot', vmin=0.0, vmax=1.0)
                 #plt.show()
                 #while not plt.waitforbuttonpress(): pass
                 #plt.close(fig)
@@ -605,8 +607,8 @@ class Processor2(object):
 
                 for i in range(3):
                     distance = distance_transform_edt(1 - one_hot[i])
-                    #distance = 4 * np.exp(-distance) / (1 + np.exp(-distance))**2
-                    distance = 1 / (1 + distance)
+                    #distance = 4 * np.exp(-distance) / ((1 + np.exp(-distance))**2)
+                    #distance = 1 / (1 + distance)
                     one_hot[i] = distance
 
                 one_hot = np.concatenate([one_hot, not_one_hot[None]], axis=0)

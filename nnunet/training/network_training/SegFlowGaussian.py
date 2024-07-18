@@ -427,6 +427,11 @@ class SegFlowGaussian(nnUNetTrainer):
             with open(os.path.join(self.log_dir, 'config.yaml'), 'wb') as f:
                 yaml.dump(config, f)
                 self.print_to_log_file(config, also_print_to_console=False)
+        
+        #for name, param in models['temporal_model'][0].named_parameters():
+        #    if param.requires_grad:
+        #        print(name)
+        #        print(param.numel())
 
         params_sum = 0
         for k, v in models.items():

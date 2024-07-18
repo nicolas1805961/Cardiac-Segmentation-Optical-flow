@@ -6498,7 +6498,11 @@ class DataLoaderPreprocessed(SlimDataLoaderBase):
         target_mask = torch.stack(target_mask_list, dim=1) # T, B
         padding_need = torch.stack(padding_need_list, dim=0) # B, 4
 
-        strain_mask = torch.pow(strain_mask, self.distance_map_power)
+        if self.distance_map_power == 0:
+            strain_mask = torch.ones_like(strain_mask)
+        else:
+            strain_mask = 1 / (1 + torch.pow(strain_mask, self.distance_map_power))
+
         strain_mask_not_one_hot = strain_mask[:, :, -1, :, :][:, :, None, :, :]
         strain_mask_one_hot = strain_mask[:, :, :-1, :, :]
 
@@ -7289,7 +7293,11 @@ class DataLoaderPreprocessedSupervised(SlimDataLoaderBase):
         target_mask = torch.stack(target_mask_list, dim=1) # T, B
         padding_need = torch.stack(padding_need_list, dim=0) # B, 4
 
-        strain_mask = torch.pow(strain_mask, self.distance_map_power)
+        if self.distance_map_power == 0:
+            strain_mask = torch.ones_like(strain_mask)
+        else:
+            strain_mask = 1 / (1 + torch.pow(strain_mask, self.distance_map_power))
+
         strain_mask_not_one_hot = strain_mask[:, :, -1, :, :][:, :, None, :, :]
         strain_mask_one_hot = strain_mask[:, :, :-1, :, :]
 
@@ -7671,7 +7679,11 @@ class DataLoaderPreprocessedValidation(SlimDataLoaderBase):
         assert torch.all(padding_need_reduced == padding_need_reduced[0])
         padding_need = padding_need[0][None]
 
-        strain_mask = torch.pow(strain_mask, self.distance_map_power)
+        if self.distance_map_power == 0:
+            strain_mask = torch.ones_like(strain_mask)
+        else:
+            strain_mask = 1 / (1 + torch.pow(strain_mask, self.distance_map_power))
+
         strain_mask_not_one_hot = strain_mask[:, :, -1, :, :][:, :, None, :, :]
         strain_mask_one_hot = strain_mask[:, :, :-1, :, :]
 
