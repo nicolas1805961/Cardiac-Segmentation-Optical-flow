@@ -6323,6 +6323,7 @@ class DataLoaderPreprocessed(SlimDataLoaderBase):
         target_mask_list = []
         strain_mask_list = []
         database_list = []
+        distance_list = []
 
         case_properties = []
         for j, frames in enumerate(list_of_frames):
@@ -6388,15 +6389,20 @@ class DataLoaderPreprocessed(SlimDataLoaderBase):
             random_indices = np.concatenate([np.array([0]), random_indices, np.array([len(possible_indices) - 1])])
             sorted_indices = np.argsort(random_indices)
 
+            distance = np.diff(random_indices) / len(possible_indices)
+            distance = np.concatenate([distance, np.zeros(shape=(1,))])
+            distance = torch.from_numpy(distance).to('cuda:0').float()
+            distance_list.append(distance)
+
             random_indices = random_indices[sorted_indices]
             target_mask = target_mask[sorted_indices]
             target_mask = torch.from_numpy(target_mask).to('cuda:0')
 
             frame_indices = possible_indices[random_indices]
 
+
             assert len(frame_indices) == self.video_length
             video = frames[frame_indices]
-
 
             labeled_idx = np.where(np.isin(frame_indices, global_labeled_idx))[0]
 
@@ -6497,11 +6503,13 @@ class DataLoaderPreprocessed(SlimDataLoaderBase):
         strain_mask = torch.stack(strain_mask_list, dim=1) # T, B, 4, H, W
         target_mask = torch.stack(target_mask_list, dim=1) # T, B
         padding_need = torch.stack(padding_need_list, dim=0) # B, 4
+        distance = torch.stack(distance_list, dim=1) # T+1, B
 
         if self.distance_map_power == 0:
             strain_mask = torch.ones_like(strain_mask)
         else:
-            strain_mask = 1 / (1 + torch.pow(strain_mask, self.distance_map_power))
+            strain_mask = torch.pow(4 * torch.exp(-strain_mask) / ((1 + torch.exp(-strain_mask))**2), self.distance_map_power)
+            #strain_mask = 1 / (1 + torch.pow(strain_mask, self.distance_map_power))
 
         strain_mask_not_one_hot = strain_mask[:, :, -1, :, :][:, :, None, :, :]
         strain_mask_one_hot = strain_mask[:, :, :-1, :, :]
@@ -6521,7 +6529,7 @@ class DataLoaderPreprocessed(SlimDataLoaderBase):
 
         return {'unlabeled':unlabeled, 
                 'target': target,
-                'in_between': None,
+                'distance': distance,
                 'database': database_list,
                 'padding_need': padding_need,
                 'properties': case_properties,
@@ -7124,6 +7132,7 @@ class DataLoaderPreprocessedSupervised(SlimDataLoaderBase):
         target_mask_list = []
         strain_mask_list = []
         database_list = []
+        distance_list = []
 
         case_properties = []
         for j, frames in enumerate(list_of_frames):
@@ -7188,6 +7197,11 @@ class DataLoaderPreprocessedSupervised(SlimDataLoaderBase):
             target_mask = np.concatenate([np.array([True]), np.full_like(random_indices, fill_value=True), np.array([True])]).astype(bool)
             random_indices = np.concatenate([np.array([0]), random_indices, np.array([len(possible_indices) - 1])])
             sorted_indices = np.argsort(random_indices)
+
+            distance = np.diff(random_indices) / len(possible_indices)
+            distance = np.concatenate([distance, np.zeros(shape=(1,))])
+            distance = torch.from_numpy(distance).to('cuda:0').float()
+            distance_list.append(distance)
 
             random_indices = random_indices[sorted_indices]
             target_mask = target_mask[sorted_indices]
@@ -7292,11 +7306,13 @@ class DataLoaderPreprocessedSupervised(SlimDataLoaderBase):
         strain_mask = torch.stack(strain_mask_list, dim=1) # T, B, 4, H, W
         target_mask = torch.stack(target_mask_list, dim=1) # T, B
         padding_need = torch.stack(padding_need_list, dim=0) # B, 4
+        distance = torch.stack(distance_list, dim=1) # T+1, B
 
         if self.distance_map_power == 0:
             strain_mask = torch.ones_like(strain_mask)
         else:
-            strain_mask = 1 / (1 + torch.pow(strain_mask, self.distance_map_power))
+            strain_mask = torch.pow(4 * torch.exp(-strain_mask) / ((1 + torch.exp(-strain_mask))**2), self.distance_map_power)
+            #strain_mask = 1 / (1 + torch.pow(strain_mask, self.distance_map_power))
 
         strain_mask_not_one_hot = strain_mask[:, :, -1, :, :][:, :, None, :, :]
         strain_mask_one_hot = strain_mask[:, :, :-1, :, :]
@@ -7316,7 +7332,7 @@ class DataLoaderPreprocessedSupervised(SlimDataLoaderBase):
 
         return {'unlabeled':unlabeled, 
                 'target': target,
-                'in_between': None,
+                'distance': distance,
                 'database': database_list,
                 'padding_need': padding_need,
                 'properties': case_properties,
@@ -7534,6 +7550,7 @@ class DataLoaderPreprocessedValidation(SlimDataLoaderBase):
         target_mask_list = []
         strain_mask_list = []
         database_list = []
+        distance_list = []
 
         case_properties = []
         for j, frames in enumerate(list_of_frames):
@@ -7590,6 +7607,11 @@ class DataLoaderPreprocessedValidation(SlimDataLoaderBase):
 
             if self.start_es:
                 possible_indices = np.flip(possible_indices)
+            
+            distance = np.ones(shape=(len(possible_indices)-1,)) / len(possible_indices)
+            distance = np.concatenate([distance, np.zeros(shape=(1,))])
+            distance = torch.from_numpy(distance).to('cuda:0').float()
+            distance_list.append(distance)
 
             target_mask = np.full_like(possible_indices, fill_value=False).astype(bool)
             target_mask[0] = True
@@ -7674,6 +7696,7 @@ class DataLoaderPreprocessedValidation(SlimDataLoaderBase):
         strain_mask = torch.stack(strain_mask_list, dim=1) # T, B, 3, H, W
         target_mask = torch.stack(target_mask_list, dim=1) # T, B
         padding_need = torch.stack(padding_need_list, dim=0) # T, 4
+        distance = torch.stack(distance_list, dim=1) # T+1, B
 
         padding_need_reduced = padding_need.sum(-1)
         assert torch.all(padding_need_reduced == padding_need_reduced[0])
@@ -7682,7 +7705,8 @@ class DataLoaderPreprocessedValidation(SlimDataLoaderBase):
         if self.distance_map_power == 0:
             strain_mask = torch.ones_like(strain_mask)
         else:
-            strain_mask = 1 / (1 + torch.pow(strain_mask, self.distance_map_power))
+            strain_mask = torch.pow(4 * torch.exp(-strain_mask) / ((1 + torch.exp(-strain_mask))**2), self.distance_map_power)
+            #strain_mask = 1 / (1 + torch.pow(strain_mask, self.distance_map_power))
 
         strain_mask_not_one_hot = strain_mask[:, :, -1, :, :][:, :, None, :, :]
         strain_mask_one_hot = strain_mask[:, :, :-1, :, :]
@@ -7702,7 +7726,7 @@ class DataLoaderPreprocessedValidation(SlimDataLoaderBase):
 
         return {'unlabeled':unlabeled, 
                 'target': target,
-                'in_between': None,
+                'distance': distance,
                 'database': database_list,
                 'padding_need': padding_need,
                 'properties': case_properties,

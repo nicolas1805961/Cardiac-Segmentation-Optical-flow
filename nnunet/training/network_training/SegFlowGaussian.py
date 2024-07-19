@@ -248,6 +248,7 @@ class SegFlowGaussian(nnUNetTrainer):
 
         self.one_to_all = self.config['one_to_all']
         self.all_to_all = self.config['all_to_all']
+        self.prediction = self.config['prediction']
 
         if self.log_images:
             self.vis = Visualizer(unlabeled=False,
@@ -538,6 +539,7 @@ class SegFlowGaussian(nnUNetTrainer):
         cropping_network.do_ds = False
         models['cropping_model'] = (cropping_network, in_shape_crop)
         
+        distance_data = torch.zeros(size=(self.video_length, self.config['batch_size'])).float()
         if self.label_input:
             #in_shape_pretrained = torch.randn(self.config['batch_size'], 1, self.crop_size, self.crop_size)
             #pretrained_conv_layer, _ = self.get_conv_layer(self.pretrained_config)
@@ -547,6 +549,8 @@ class SegFlowGaussian(nnUNetTrainer):
             #self.pretrained_network.do_ds = False
             #models['pretrained_model'] = (self.pretrained_network, in_shape_pretrained)
             label_data = torch.zeros(size=(self.video_length, self.config['batch_size'], 3, self.crop_size, self.crop_size)).float()
+        elif self.prediction:
+            label_data = torch.zeros(size=(self.config['batch_size'], 4, self.crop_size, self.crop_size)).float()
         else:
             label_data = torch.zeros(size=(self.config['batch_size'], 4, self.crop_size, self.crop_size)).float()
             
@@ -561,7 +565,7 @@ class SegFlowGaussian(nnUNetTrainer):
         if self.config['no_label']:
             models['temporal_model'] = (self.network, unlabeled_input_data)
         else:
-            models['temporal_model'] = (self.network, [unlabeled_input_data, label_data])
+            models['temporal_model'] = (self.network, [unlabeled_input_data, label_data, distance_data])
 
         self.processor = Processor(crop_size=self.crop_size, image_size=self.image_size, cropping_network=cropping_network)
 
@@ -1997,10 +2001,15 @@ class SegFlowGaussian(nnUNetTrainer):
 
         if self.label_input:
             out = self.network(unlabeled, label=strain_mask_one_hot.float())
+        elif self.prediction:
+            out = self.network(unlabeled, distance=data_dict['distance'])
         else:
             out = self.network(unlabeled)
 
         self.optimizer.zero_grad()
+
+        if self.prediction:
+            self.writer.add_scalar('Iteration/pred_magnitude', torch.abs(out['pred']).mean(), self.iter_nb)
 
         #if not self.mamba and not self.raft and not self.use_context_encoder and self.memory_read:
         #    self.writer.add_scalars('Iteration/attn_weights', {'frame_' + str(i):torch.abs(out['weights'][i].mean()) for i in range(len(out['weights']))}, self.iter_nb)
@@ -2123,6 +2132,8 @@ class SegFlowGaussian(nnUNetTrainer):
         with torch.no_grad():
             if self.label_input:
                 out = self.network(unlabeled, label=strain_mask_one_hot.float())
+            elif self.prediction:
+                out = self.network(unlabeled, distance=data_dict['distance'])
             else:
                 out = self.network(unlabeled)
 
@@ -2202,6 +2213,8 @@ class SegFlowGaussian(nnUNetTrainer):
         with torch.no_grad():
             if self.label_input:
                 out = self.network(unlabeled, label=strain_mask_one_hot.float())
+            elif self.prediction:
+                out = self.network(unlabeled, distance=data_dict['distance'])
             else:
                 out = self.network(unlabeled)
 

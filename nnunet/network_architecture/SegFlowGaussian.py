@@ -114,7 +114,7 @@ class SegFlowGaussian(SegmentationNetwork):
                 downsample_conv,
                 conv_bottleneck,
                 mamba,
-                transformer,
+                prediction,
                 remove_GRU,
                 use_context_encoder,
                 cat_correlation,
@@ -198,6 +198,7 @@ class SegFlowGaussian(SegmentationNetwork):
         self.label_pretrained = label_pretrained
         self.dim_feedforward = dim_feedforward
         self.motion_appearance = motion_appearance
+        self.prediction = prediction
         
         self.num_classes = 4
         self.alpha = 0.5
@@ -225,6 +226,8 @@ class SegFlowGaussian(SegmentationNetwork):
         self.stride = stride
 
         in_dims_past[0] = 6
+        if self.prediction:
+            in_dims_past[0] = 7
         self.memory_encoder = Encoder2D(d_model=self.d_model, out_dims=out_encoder_dims, in_dims=in_dims_past, conv_depth=conv_depth, norm=norm, legacy=legacy, nb_conv=nb_conv, extra_block=extra_block, residual=residual, expand=False, nhead=bottleneck_heads, downsample_conv=self.downsample_conv)
         
         if self.label_pretrained:
@@ -290,6 +293,8 @@ class SegFlowGaussian(SegmentationNetwork):
         conv_depth_decoder = conv_depth[::-1]
 
         self.flow_decoder = decoder_alt.Decoder2D(d_model=self.d_model, dot_multiplier=dot_multiplier, deep_supervision=deep_supervision, conv_depth=conv_depth_decoder, in_encoder_dims=decoder_in_dims[::-1], out_encoder_dims=out_encoder_dims[::-1], num_classes=2, img_size=image_size, norm=norm, last_activation='identity', legacy=legacy, nb_conv=nb_conv, residual=residual)
+        if self.prediction:
+            self.pred_decoder = decoder_alt.Decoder2D(d_model=self.d_model, dot_multiplier=dot_multiplier, deep_supervision=deep_supervision, conv_depth=conv_depth_decoder, in_encoder_dims=decoder_in_dims[::-1], out_encoder_dims=out_encoder_dims[::-1], num_classes=2, img_size=image_size, norm=norm, last_activation='identity', legacy=legacy, nb_conv=nb_conv, residual=residual)
 
         self.H, self.W = (int(image_size / 2**(self.num_stages)), int(image_size / 2**(self.num_stages)))
 
@@ -367,12 +372,14 @@ class SegFlowGaussian(SegmentationNetwork):
             all_scale_list.append(one_scale_list)
         return all_scale_list
     
-    def forward(self, x, label=None, step=1):
+    def forward(self, x, label=None, distance=None, step=1):
         if self.label_pretrained:
             return self.forward_multi_task_flow_deformable_cost_volume_transformer_cat_label(x, label=label, step=step)
         else:
             if self.motion_appearance:
                 return self.forward_motion_appearance(x, step=step)
+            elif self.prediction:
+                return self.forward_multi_task_flow_deformable_cost_volume_transformer_cat_prediction(x, distance=distance, step=step)
             else:
                 #return self.forward_multi_task_flow_deformable_cost_volume_transformer_swin(x, step=step)
                 return self.forward_multi_task_flow_deformable_cost_volume_transformer_cat(x, step=step)
@@ -1427,6 +1434,111 @@ class SegFlowGaussian(SegmentationNetwork):
                 previous_skip_co = skip_co_current
         
         out['backward_flow'] = torch.stack(out['backward_flow'], dim=0)
+        out['weights'] = weights
+
+
+        return out
+    
+
+
+
+
+    def forward_multi_task_flow_deformable_cost_volume_transformer_cat_prediction(self, x, distance, step=1):
+        out = {'backward_flow': [], 
+               'pred': []}
+        weights = None
+        T, B, C, H, W = x.shape
+        flow = torch.zeros(size=(B, 2, H, W), device=x.device)
+        cumulated_backward = torch.zeros(size=(B, 2, H, W), device=x.device)
+        init = torch.zeros(size=(B, self.d_model, self.H, self.W), device=x.device)
+        hidden_state = init
+
+        coords0, coords1 = self.initialize_flow(x[0])
+        first_feature, first_skip_co = self.query_encoder(x[0]) # B, C, H, W
+
+        previous_feature = first_feature
+        previous_skip_co = first_skip_co
+
+        for t in range(1, T):
+
+            registered_backward = self.motion_estimation(flow=cumulated_backward.detach(), original=x[t])
+            error_backward = x[0] - registered_backward
+
+            current_distance = distance[t]
+            current_distance = current_distance[:, None, None, None].repeat(1, 1, H, W)
+
+            past_input = torch.cat([x[0], x[t], cumulated_backward, error_backward, registered_backward, current_distance], dim=1)
+
+            past_motion, past_skip_co = self.memory_encoder(past_input)
+
+            if self.warp:
+                registered_error = self.motion_estimation(flow=cumulated_backward.detach(), original=x[t])
+                current_feature, skip_co_current = self.query_encoder(registered_error) # B, C, H, W
+            else:
+                current_feature, skip_co_current = self.query_encoder(x[t]) # B, C, H, W
+            
+            #error_registered = x[0] - registered_error
+
+
+            new_skip_co = []
+            for s in range(self.num_stages):
+                if self.skip_co_type == 'both' or self.skip_co_type == 'no_conv':
+                    corr = self.cost_volume_computation_list[s](skip_co_current[s], previous_skip_co[s])
+                    corr = self.cost_volume_encoder_list[s](corr)
+                    concatenated = torch.cat([corr, past_skip_co[s]], dim=1)
+                elif self.skip_co_type == 'past':
+                    concatenated = past_skip_co[s]
+                elif self.skip_co_type == 'current':
+                    corr = self.cost_volume_computation_list[s](skip_co_current[s], previous_skip_co[s])
+                    corr = self.cost_volume_encoder_list[s](corr)
+                    concatenated = corr
+                concatenated = self.skip_co_reduction_list[s](concatenated)
+                new_skip_co.append(concatenated)
+
+
+            if self.correlation_value:
+                corr_fn = CorrBlock(previous_feature, current_feature, radius=4)
+                coords1 = coords1.detach()
+                corr = corr_fn(coords1) # index correlation volume
+                corr = self.cost_volume_encoder_list[-1](corr)
+
+                current_feature_1 = self.bottleneck1(query=current_feature, 
+                                            key=previous_feature,
+                                            value=corr)
+                current_feature_1 = self.reduce_transformer_1(current_feature_1)
+            else:
+                current_feature_1 = self.bottleneck1(query=current_feature, 
+                                                key=previous_feature,
+                                                value=previous_feature)
+                #current_feature_1 = self.reduce_transformer_1(current_feature_1)
+                
+            current_feature_2 = self.bottleneck2(query=current_feature, 
+                                                key=first_feature,
+                                                value=past_motion)
+            #current_feature_2 = self.reduce_transformer_2(current_feature_2)
+
+            gru_input = torch.cat([current_feature_1, current_feature_2], dim=1)
+            gru_input = self.reduce_transformer(gru_input)
+            if self.remove_GRU:
+                hidden_state = gru_input
+            else:
+                hidden_state = self.gru_cell(gru_input, hidden_state)
+
+
+            flow, intermediary = self.flow_decoder(hidden_state, new_skip_co)
+            cumulated_backward = cumulated_backward + flow
+            out['backward_flow'].append(cumulated_backward)
+
+            pred, _ = self.pred_decoder(hidden_state, new_skip_co)
+            cumulated_backward = cumulated_backward + pred
+            out['pred'].append(pred.detach())
+
+            if not self.warp:
+                previous_feature = current_feature
+                previous_skip_co = skip_co_current
+        
+        out['backward_flow'] = torch.stack(out['backward_flow'], dim=0)
+        out['pred'] = torch.stack(out['pred'], dim=0)
         out['weights'] = weights
 
 
