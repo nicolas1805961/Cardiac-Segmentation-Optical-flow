@@ -198,18 +198,11 @@ class SegFlowGaussian(nnUNetTrainer):
         self.cycle_consistency = self.config['cycle_consistency']
         self.raft = self.config['raft']
 
-
-        self.raft_iters = self.config['raft_iters']
-        exponents = torch.arange(self.raft_iters - 1, -1, -1, device='cuda:0')
-        self.raft_gamma = (0.8 ** exponents) / len(exponents)
         #self.attention_gradient_loss_weight = self.config['attention_gradient_loss_weight']
 
         self.discriminator_lr = self.config['discriminator_lr']
         self.discriminator_decay = self.config['discriminator_decay']
         self.supervise_iterations = self.config['supervise_iterations']
-
-        loss_weights = torch.tensor([0.8**(self.video_length - 1 - i) for i in range(self.video_length - 1)]).to('cuda:0')
-        self.iteration_loss_weights = loss_weights / loss_weights.sum()
 
         weights = np.array([1 / (2 ** i) for i in range(len(self.config['conv_depth']))])
         self.ds_weights = weights / weights.sum()
@@ -233,7 +226,7 @@ class SegFlowGaussian(nnUNetTrainer):
 
         if self.supervised:
             exponents = torch.arange(self.video_length - 2, -1, -1, device='cuda:0')
-            self.iter_gamma = (0.8 ** exponents) / len(exponents)
+            self.iter_gamma = (self.config['gamma_value'] ** exponents)
 
         if self.video_length == 2:
             assert not self.supervised
@@ -1523,7 +1516,7 @@ class SegFlowGaussian(nnUNetTrainer):
             registered = self.motion_estimation(flow=flow, original=initial_target, mode='bilinear')
 
             global_motion_loss = self.segmentation_loss(registered, target_fixed)
-            self.loss_data['seg_registered_memory'][1].append(global_motion_loss)
+            self.loss_data['seg_registered_memory'][1].append(global_motion_loss.mean())
 
 
         registered = self.motion_estimation(flow=flow, original=unlabeled_moving)
@@ -1532,9 +1525,9 @@ class SegFlowGaussian(nnUNetTrainer):
 
         #matplotlib.use('QtAgg')
         #fig, ax = plt.subplots(1, 3)
-        #ax[0].imshow(intermediate_loss[0, 0, 0].detach().cpu(), cmap='hot')
-        #ax[1].imshow(label_list[0, 0, 0].detach().cpu(), cmap='hot', vmin=0.0, vmax=1.0)
-        #ax[2].imshow((intermediate_loss * label_list[0][None].repeat(len(registered), 1, 1, 1, 1))[0, 0, 0].detach().cpu(), cmap='hot')
+        #ax[0].imshow(intermediate_loss[0, 0].detach().cpu(), cmap='hot')
+        #ax[1].imshow(distance_map[0, 0].detach().cpu(), cmap='hot', vmin=0.0, vmax=1.0)
+        #ax[2].imshow(intermediate_loss[0, 0].detach().cpu() * distance_map[0, 0].detach().cpu(), cmap='hot')
         #plt.show()
 
         intermediate_loss_inside = intermediate_loss * distance_map
@@ -2524,7 +2517,7 @@ class SegFlowGaussian(nnUNetTrainer):
         loss = 0.0
         for key, value in loss_data.items():
             value[1] = torch.stack(value[1], dim=0)
-            value[1] = (value[1] * self.iter_gamma).sum()
+            value[1] = (value[1] * self.iter_gamma).mean()
             #value[1] = torch.tensor([torch.nan], requires_grad=True)
             #if not torch.isfinite(value[1]):
             #    self.print_to_log_file(key, also_print_to_console=False)

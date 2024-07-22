@@ -68,7 +68,7 @@ if __name__ == "__main__":
 
     # Raw here
     #dir_path = r"C:\Users\Portal\Documents\voxelmorph\results\VM-NCC\Lib\test\Raw\Flow"
-    dir_path = r"C:\Users\Portal\Documents\voxelmorph\exposant\2024-07-10_18H07_32s_654193\Task032_Lib\fold_0\Lib\val\Raw\Backward_flow"
+    dir_path = r"C:\Users\Portal\Documents\voxelmorph\exposant\new\exposant_infini\Task032_Lib\fold_0\Lib\test\Raw\Backward_flow"
 
     if dir_path.split(os.sep)[-3] == 'val':
         gt_dirname = 'Lib_resampling_training_mask'

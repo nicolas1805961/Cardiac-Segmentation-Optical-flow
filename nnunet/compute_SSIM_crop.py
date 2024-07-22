@@ -17,7 +17,7 @@ def save_json(obj, file: str, indent: int = 4, sort_keys: bool = True) -> None:
 motion_estimation = SpatialTransformer(size=(192, 192))
 
 # flow raw directory
-path = r"C:\Users\Portal\Documents\voxelmorph\icpr_models\2024-07-09_17H24_52s_461126\Task032_Lib\fold_0\Lib\test\Raw\Backward_flow"
+path = r"C:\Users\Portal\Documents\voxelmorph\exposant\new\exposant_2\Task032_Lib\fold_0\Lib\test\Raw\Backward_flow"
 
 patient_path_list = glob(os.path.join(path, 'patient*'))
 

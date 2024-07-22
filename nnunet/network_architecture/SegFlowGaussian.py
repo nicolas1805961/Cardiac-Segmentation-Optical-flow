@@ -226,16 +226,16 @@ class SegFlowGaussian(SegmentationNetwork):
         self.stride = stride
 
         in_dims_past[0] = 6
-        if self.prediction:
-            in_dims_past[0] = 7
+        if self.prediction or self.label_pretrained:
+            in_dims_past[0] = 9
         self.memory_encoder = Encoder2D(d_model=self.d_model, out_dims=out_encoder_dims, in_dims=in_dims_past, conv_depth=conv_depth, norm=norm, legacy=legacy, nb_conv=nb_conv, extra_block=extra_block, residual=residual, expand=False, nhead=bottleneck_heads, downsample_conv=self.downsample_conv)
         
-        if self.label_pretrained:
-            in_dims_context = copy(in_dims_encoder)
-            in_dims_context[0] = 4
-            self.reduce_after_gru = nn.Conv2d(in_channels=384, out_channels=self.d_model, kernel_size=1)
-            self.context_encoder = Encoder2D(d_model=self.d_model, out_dims=out_encoder_dims, in_dims=in_dims_context, conv_depth=conv_depth, norm=norm, legacy=legacy, nb_conv=nb_conv, extra_block=extra_block, residual=residual, expand=False, nhead=bottleneck_heads, downsample_conv=self.downsample_conv)
-            self.bottleneck3 = CrossAttentionLayer(dim=self.d_model, nhead=self.bottleneck_heads, num_layers=self.nb_layers, dim_feedforward=dim_feedforward, expand_value=False)
+        #if self.label_pretrained:
+        #    in_dims_context = copy(in_dims_encoder)
+        #    in_dims_context[0] = 4
+        #    self.reduce_after_gru = nn.Conv2d(in_channels=384, out_channels=self.d_model, kernel_size=1)
+        #    self.context_encoder = Encoder2D(d_model=self.d_model, out_dims=out_encoder_dims, in_dims=in_dims_context, conv_depth=conv_depth, norm=norm, legacy=legacy, nb_conv=nb_conv, extra_block=extra_block, residual=residual, expand=False, nhead=bottleneck_heads, downsample_conv=self.downsample_conv)
+        #    self.bottleneck3 = CrossAttentionLayer(dim=self.d_model, nhead=self.bottleneck_heads, num_layers=self.nb_layers, dim_feedforward=dim_feedforward, expand_value=False)
         
         if not self.motion_appearance:
             in_dims_encoder[0] = 1
@@ -272,7 +272,8 @@ class SegFlowGaussian(SegmentationNetwork):
                     if self.skip_co_type == 'no_conv':
                         reduction_1 = nn.Identity()
                     elif self.skip_co_type == 'both':
-                        input_dim = 3*dim if self.label_pretrained else 2*dim
+                        #input_dim = 3*dim if self.label_pretrained else 2*dim
+                        input_dim = 2*dim
                         reduction_1 = ConvBlocks2DGroupLegacy(in_dim=input_dim, out_dim=dim, nb_blocks=nb_blocks, residual=residual)
                     else:
                         reduction_1 = ConvBlocks2DGroupLegacy(in_dim=dim, out_dim=dim, nb_blocks=nb_blocks, residual=residual)
@@ -340,15 +341,18 @@ class SegFlowGaussian(SegmentationNetwork):
             
         if not self.remove_GRU:
             self.gru_cell = ConvGRUCell(input_size=(self.H, self.W),
-                                            input_dim=self.d_model if not self.label_pretrained else 384,
-                                            hidden_dim=self.d_model if not self.label_pretrained else 384,
+                                            #input_dim=self.d_model if not self.label_pretrained else 384,
+                                            #hidden_dim=self.d_model if not self.label_pretrained else 384,
+                                            input_dim=self.d_model,
+                                            hidden_dim=self.d_model,
                                             kernel_size=(3, 3),
                                             bias=True,
                                             dtype=torch.cuda.FloatTensor)
         
         #self.reduce_transformer_1 = nn.Conv2d(in_channels=self.d_model, out_channels=self.d_model//2, kernel_size=1)
         #self.reduce_transformer_2 = nn.Conv2d(in_channels=self.d_model, out_channels=self.d_model//2, kernel_size=1)
-        self.reduce_transformer = ConvBlocks2DGroupLegacy(in_dim=self.d_model*2 if not self.label_pretrained else self.d_model*3, out_dim=self.d_model if not self.label_pretrained else 384, nb_blocks=1, residual=residual)
+        #self.reduce_transformer = ConvBlocks2DGroupLegacy(in_dim=self.d_model*2 if not self.label_pretrained else self.d_model*3, out_dim=self.d_model if not self.label_pretrained else 384, nb_blocks=1, residual=residual)
+        self.reduce_transformer = ConvBlocks2DGroupLegacy(in_dim=self.d_model*2, out_dim=self.d_model, nb_blocks=1, residual=residual)
         self.bottleneck1 = CrossAttentionLayer(dim=self.d_model, nhead=self.bottleneck_heads, num_layers=self.nb_layers, dim_feedforward=dim_feedforward, expand_value=False)
         self.bottleneck2 = CrossAttentionLayer(dim=self.d_model, nhead=self.bottleneck_heads, num_layers=self.nb_layers, dim_feedforward=dim_feedforward, expand_value=False)
 
@@ -374,7 +378,8 @@ class SegFlowGaussian(SegmentationNetwork):
     
     def forward(self, x, label=None, distance=None, step=1):
         if self.label_pretrained:
-            return self.forward_multi_task_flow_deformable_cost_volume_transformer_cat_label(x, label=label, step=step)
+            #return self.forward_multi_task_flow_deformable_cost_volume_transformer_cat_label(x, label=label, step=step)
+            return self.forward_label_input_no_context(x, label=label, step=step)
         else:
             if self.motion_appearance:
                 return self.forward_motion_appearance(x, step=step)
@@ -1442,6 +1447,126 @@ class SegFlowGaussian(SegmentationNetwork):
 
 
 
+    def forward_label_input_no_context(self, x, label, step=1):
+        out = {'backward_flow': [], 
+               'weights': []}
+        weights = None
+        T, B, C, H, W = x.shape
+        flow = torch.zeros(size=(B, 2, H, W), device=x.device)
+        cumulated_backward = torch.zeros(size=(B, 2, H, W), device=x.device)
+        init = torch.zeros(size=(B, self.d_model, self.H, self.W), device=x.device)
+        hidden_state = init
+
+        registered_backward = self.motion_estimation(flow=cumulated_backward.detach(), original=x[0])
+        error_backward = x[0] - registered_backward
+
+        past_input = torch.cat([x[0], x[0], cumulated_backward, error_backward, registered_backward, label[0]], dim=1)
+
+        past_motion, past_skip_co = self.memory_encoder(past_input)
+
+        coords0, coords1 = self.initialize_flow(x[0])
+        first_feature, first_skip_co = self.query_encoder(x[0]) # B, C, H, W
+
+        previous_feature = first_feature
+        previous_skip_co = first_skip_co
+
+        for t in range(1, T):
+
+            #print(self.is_softmaxed(softmaxed_label))
+            #print(self.is_softmaxed(registered_seg))
+#
+            #matplotlib.use('QtAgg')
+            #fig, ax = plt.subplots(1, 4)
+            #for o in range(4):
+            #    ax[o].imshow(registered_seg[0, o].detach().cpu(), cmap='gray')
+            #plt.show()
+
+            if self.warp:
+                registered_error = self.motion_estimation(flow=cumulated_backward.detach(), original=x[t])
+                current_feature, skip_co_current = self.query_encoder(registered_error) # B, C, H, W
+            else:
+                current_feature, skip_co_current = self.query_encoder(x[t]) # B, C, H, W
+            
+            #error_registered = x[0] - registered_error
+
+
+            new_skip_co = []
+            for s in range(self.num_stages):
+                if self.skip_co_type == 'both' or self.skip_co_type == 'no_conv':
+                    corr = self.cost_volume_computation_list[s](skip_co_current[s], previous_skip_co[s])
+                    corr = self.cost_volume_encoder_list[s](corr)
+                    concatenated = torch.cat([corr, past_skip_co[s]], dim=1)
+                elif self.skip_co_type == 'past':
+                    concatenated = past_skip_co[s]
+                elif self.skip_co_type == 'current':
+                    corr = self.cost_volume_computation_list[s](skip_co_current[s], previous_skip_co[s])
+                    corr = self.cost_volume_encoder_list[s](corr)
+                    concatenated = corr
+                concatenated = self.skip_co_reduction_list[s](concatenated)
+                new_skip_co.append(concatenated)
+
+
+            if self.correlation_value:
+                corr_fn = CorrBlock(previous_feature, current_feature, radius=4)
+                coords1 = coords1.detach()
+                corr = corr_fn(coords1) # index correlation volume
+                corr = self.cost_volume_encoder_list[-1](corr)
+
+                current_feature_1 = self.bottleneck1(query=current_feature, 
+                                            key=previous_feature,
+                                            value=corr)
+                current_feature_1 = self.reduce_transformer_1(current_feature_1)
+            else:
+                current_feature_1 = self.bottleneck1(query=current_feature, 
+                                                key=previous_feature,
+                                                value=previous_feature)
+                #current_feature_1 = self.reduce_transformer_1(current_feature_1)
+                
+            current_feature_2 = self.bottleneck2(query=current_feature, 
+                                                key=first_feature,
+                                                value=past_motion)
+            #current_feature_2 = self.reduce_transformer_2(current_feature_2)
+
+            gru_input = torch.cat([current_feature_1, current_feature_2], dim=1)
+            gru_input = self.reduce_transformer(gru_input)
+            if self.remove_GRU:
+                hidden_state = gru_input
+            else:
+                hidden_state = self.gru_cell(gru_input, hidden_state)
+
+
+            flow, intermediary = self.flow_decoder(hidden_state, new_skip_co)
+            cumulated_backward = cumulated_backward + flow
+            out['backward_flow'].append(cumulated_backward)
+
+            #fig, ax = plt.subplots(1, 1)
+            #temp = torch.abs(torch.stack(out['backward_flow'], dim=0))
+            #ax.imshow(temp.mean(0)[0, 0].cpu(), cmap='hot')
+            #plt.show()
+
+            registered_backward = self.motion_estimation(flow=cumulated_backward.detach(), original=x[t])
+            error_backward = x[0] - registered_backward
+
+            #if self.training:
+            #    assert torch.all(registered_seg == softmaxed_label)
+
+            past_input = torch.cat([x[0], x[t], cumulated_backward, error_backward, registered_backward, label[0]], dim=1)
+
+            past_motion, past_skip_co = self.memory_encoder(past_input)
+
+            if not self.warp:
+                previous_feature = current_feature
+                previous_skip_co = skip_co_current
+        
+        out['backward_flow'] = torch.stack(out['backward_flow'], dim=0)
+        out['weights'] = weights
+
+
+        return out
+    
+
+
+
 
     def forward_multi_task_flow_deformable_cost_volume_transformer_cat_prediction(self, x, distance, step=1):
         out = {'backward_flow': [], 
@@ -1466,6 +1591,11 @@ class SegFlowGaussian(SegmentationNetwork):
 
             current_distance = distance[t]
             current_distance = current_distance[:, None, None, None].repeat(1, 1, H, W)
+
+            #matplotlib.use('QtAgg')
+            #fig, ax = plt.subplots(1, 1)
+            #ax.imshow(current_distance[0, 0].detach().cpu(), cmap='gray')
+            #plt.show()
 
             past_input = torch.cat([x[0], x[t], cumulated_backward, error_backward, registered_backward, current_distance], dim=1)
 

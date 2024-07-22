@@ -1478,7 +1478,7 @@ def build_seg_flow_gaussian_model(config, image_size, log_function):
              raft_iters=config['raft_iters'],
              cat_correlation=config['cat_correlation'],
              stride=config['stride'],
-             transformer=config['transformer'],
+             prediction=config['prediction'],
              radius=config['radius'],
              remove_GRU=config['remove_GRU'],
              warp=config['warp'],
