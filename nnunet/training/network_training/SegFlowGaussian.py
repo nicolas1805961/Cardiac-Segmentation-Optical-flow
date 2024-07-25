@@ -1448,8 +1448,6 @@ class SegFlowGaussian(nnUNetTrainer):
         self.loss_data['memory_flow_regularization'][1] = global_flow_regularization_loss_inside
 
         return out
-    
-
 
 
     def compute_losses_label(self, unlabeled, out, target, label_list):

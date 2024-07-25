@@ -6542,7 +6542,7 @@ class DataLoaderPreprocessed(SlimDataLoaderBase):
 
 
 class DataLoaderPreprocessedAdjacent(SlimDataLoaderBase):
-    def __init__(self, data, patch_size, final_patch_size, batch_size, video_length, processor, crop_size, is_val, do_data_aug, data_path, distance_map_power, binary_distance, oversample_foreground_percent=0.0,
+    def __init__(self, data, patch_size, final_patch_size, batch_size, video_length, processor, crop_size, is_val, do_data_aug, data_path, distance_map_power, binary_distance_input, binary_distance_loss, start_es, oversample_foreground_percent=0.0,
                  memmap_mode="r", pseudo_3d_slices=1, pad_mode="edge",
                  pad_kwargs_data=None, pad_sides=None):
         """
@@ -6599,6 +6599,9 @@ class DataLoaderPreprocessedAdjacent(SlimDataLoaderBase):
 
         self.processor = processor
         self.data_path = data_path
+        self.start_es = start_es
+        self.binary_distance_input = binary_distance_input
+        self.binary_distance_loss = binary_distance_loss
         
 
     def determine_shapes(self):
@@ -6821,7 +6824,8 @@ class DataLoaderPreprocessedAdjacent(SlimDataLoaderBase):
                     pkl_data = pickle.load(f)
                     padding_need = pkl_data['padding_need']
                     assert padding_need.shape[-1] == mask.shape[-1] == depth
-                    padding_need_list.append(torch.from_numpy(padding_need[:, depth_idx]).to('cuda:0'))
+                    if frame_idx == 0:
+                        padding_need_list.append(torch.from_numpy(padding_need[:, depth_idx]).to('cuda:0'))
                 
                 assert img.shape[-1] == depth
 
@@ -6899,9 +6903,19 @@ class DataLoaderPreprocessedAdjacent(SlimDataLoaderBase):
         target_mask = torch.stack(target_mask_list, dim=1) # T, B
         padding_need = torch.stack(padding_need_list, dim=0) # B, 4
 
-        strain_mask = torch.pow(strain_mask, self.distance_map_power)
+        if self.distance_map_power == 0:
+            strain_mask = torch.ones_like(strain_mask)
+        else:
+            strain_mask = torch.pow(4 * torch.exp(-strain_mask) / ((1 + torch.exp(-strain_mask))**2), self.distance_map_power)
+            #strain_mask = 1 / (1 + torch.pow(strain_mask, self.distance_map_power))
+
         strain_mask_not_one_hot = strain_mask[:, :, -1, :, :][:, :, None, :, :]
         strain_mask_one_hot = strain_mask[:, :, :-1, :, :]
+
+        if self.binary_distance_loss:
+            strain_mask_not_one_hot = strain_mask_not_one_hot.long().float()
+        if self.binary_distance_input:
+            strain_mask_one_hot = strain_mask_one_hot.long().float()
 
         #print(seg.shape)
         #print(np.unique(seg))
