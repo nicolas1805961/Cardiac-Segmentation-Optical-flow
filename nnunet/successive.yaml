@@ -3,7 +3,7 @@ use_sfb: false
 strain_loss_weight: 0.0 # 100.0
 forward_flow_loss_weight: 0.0 #1.0
 
-global_motion_forward_loss_weight: 1.0 # 0.1
+global_motion_forward_loss_weight: 0.1 # 0.1
 semi_supervised_seg_loss_weight: 0.0 # 0.1
 
 seg_curvature_loss_weight: 0.0
@@ -11,8 +11,11 @@ flow_curvature_loss_weight: 0.0 # 100
 
 interpolation_loss_weight: 0.0
 
-also_start_es: False
-distance_map_power: 0
+binary_distance_loss: True
+binary_distance_input: false
+supervised: True
+start_es: false
+distance_map_power: 1.0
 downsample_conv: 1
 conv_bottleneck: false
 nb_conv: 2

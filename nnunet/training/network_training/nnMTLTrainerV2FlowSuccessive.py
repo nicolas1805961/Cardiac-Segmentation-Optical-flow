@@ -84,7 +84,7 @@ from monai.losses import DiceFocalLoss, DiceLoss
 from torch.utils.tensorboard import SummaryWriter
 from nnunet.training.loss_functions.dice_loss import DC_and_CE_loss, DC_and_focal_loss, DC_and_topk_loss, DC_and_CE_loss_Weighted, SoftDiceLoss
 from nnunet.training.loss_functions.crossentropy import RobustCrossEntropyLoss, WeightedRobustCrossEntropyLoss
-from nnunet.training.dataloading.dataset_loading import DataLoaderPreprocessedValidation, DataLoaderPreprocessed, DataLoaderFlowACDCProgressiveAllDataFirst, DataLoaderFlowTrain5LibRegular, DataLoaderFlowACDCProgressiveAllDataAdjacent, DataLoaderFlowLibProgressiveAllDataFirst, DataLoaderFlowLibProgressiveAllDataAdjacent, DataLoaderFlowTrainPredictionVal, DataLoaderFlowTrain5Progressive, DataLoaderFlowTrain5, DataLoaderFlowTrain5Lib, DataLoaderFlowTrainRecursiveVideo, DataLoaderFlowValidationOneStep
+from nnunet.training.dataloading.dataset_loading import DataLoaderPreprocessedValidation, DataLoaderPreprocessed, DataLoaderFlowACDCProgressiveAllDataFirst, DataLoaderFlowTrain5LibRegular, DataLoaderFlowACDCProgressiveAllDataAdjacent, DataLoaderFlowLibProgressiveAllDataFirst, DataLoaderFlowLibProgressiveAllDataAdjacent, DataLoaderFlowTrainPredictionVal, DataLoaderFlowTrain5Progressive, DataLoaderPreprocessedSupervised, DataLoaderFlowTrain5Lib, DataLoaderFlowTrainRecursiveVideo, DataLoaderFlowValidationOneStep
 from nnunet.training.dataloading.dataset_loading import load_dataset, load_unlabeled_dataset
 from nnunet.network_architecture.Optical_flow_model_successive import ModelWrap
 from nnunet.lib.utils import RFR, ConvBlocks2DGroup, Resblock, LayerNorm, RFR_1d, Resblock1D, ConvBlocks1D
@@ -153,6 +153,8 @@ class nnMTLTrainerV2FlowSuccessive(nnUNetTrainer):
         self.backward = self.config['backward']
         self.segmentation = self.config['segmentation']
         self.no_error = self.config['no_error']
+        self.binary_distance_loss = self.config['binary_distance_loss']
+        self.binary_distance_input = self.config['binary_distance_input']
         #self.logits_input = self.config['logits_input']
         #self.pretrained_2d_folder_path = self.config['pretrained_2d_folder_path']
         #self.pretrained_config = read_config(os.path.join(Path.cwd(), self.config['pretrained_2d_folder_path'], 'config.yaml'), False, False)
@@ -171,7 +173,11 @@ class nnMTLTrainerV2FlowSuccessive(nnUNetTrainer):
         self.adversarial_weight = self.config['adversarial_weight']
         self.do_adv = self.config['do_adv']
         self.distance_map_power = self.config['distance_map_power']
-        self.also_start_es = self.config['also_start_es']
+        self.start_es = self.config['start_es']
+        self.supervised = self.config['supervised']
+
+        if self.video_length == 2:
+            assert not self.supervised
 
         self.discriminator_lr = self.config['discriminator_lr']
         self.discriminator_decay = self.config['discriminator_decay']
@@ -237,6 +243,8 @@ class nnMTLTrainerV2FlowSuccessive(nnUNetTrainer):
         
         if self.dataloader_modality == 'other':
             loss_data['global_motion_forward'] = [self.global_motion_forward_loss_weight, float('nan')]
+            if self.supervised:
+                loss_data['local_motion_forward'] = [self.global_motion_forward_loss_weight, float('nan')] 
         #loss_data['global_motion_forward_semi_supervised'] = [self.semi_supervised_forward_loss_weight, float('nan')]
         if self.do_adv:
             loss_data['adversarial'] = [self.adversarial_weight, float('nan')]
@@ -354,7 +362,10 @@ class nnMTLTrainerV2FlowSuccessive(nnUNetTrainer):
         self.was_initialized = True
 
     def choose_loss(self):
-        return self.compute_losses_recursive_2
+        if self.supervised:
+            return self.compute_losses_recursive_2_supervised
+        else:
+            return self.compute_losses_recursive_2
     
     def count_parameters(self, config, models):
         if not self.inference:
@@ -1297,14 +1308,9 @@ class nnMTLTrainerV2FlowSuccessive(nnUNetTrainer):
 
 
 
-    def compute_losses_recursive_2(self, target_mask, unlabeled, out1, out2, target, label_list):
+    def compute_losses_recursive_2(self, unlabeled, out1, out2, target, label_list):
         out2['global_registered_input'] = []
         out1['local_registered_input'] = []
-
-        t_indices, b_indices = torch.nonzero(target_mask, as_tuple=True)
-        mask = t_indices != self.video_length - 1
-        t_indices = t_indices[mask]
-        b_indices = b_indices[mask]
 
         #seg_loss_l = self.segmentation_loss(out['seg'][t_indices - 1, b_indices], target[t_indices, b_indices])
         #self.loss_data['segmentation'][1] = seg_loss_l
@@ -1342,6 +1348,75 @@ class nnMTLTrainerV2FlowSuccessive(nnUNetTrainer):
                 registered = self.motion_estimation(flow=out2['cumulated'][i], original=unlabeled[i + 1])
                 intermediate_register_list.append(registered)
             intermediate_registered = torch.stack(intermediate_register_list, dim=0)
+            intermediate_loss = self.registration_loss(intermediate_registered, unlabeled[0][None].repeat(len(intermediate_registered), 1, 1, 1, 1))
+            intermediate_loss_inside = intermediate_loss * label_list[0][None].repeat(len(intermediate_registered), 1, 1, 1, 1)
+            self.loss_data['intermediate'][1] = intermediate_loss_inside
+
+            cumulated_flow_regularization_loss = self.spatial_smoothing_loss(flow=out2['cumulated'])
+            cumulated_flow_regularization_loss = cumulated_flow_regularization_loss * label_list[0][None].repeat(len(intermediate_registered), 1, 1, 1, 1)
+            self.loss_data['cumulated_flow_regularization'][1] = cumulated_flow_regularization_loss
+        
+        else:
+            registered = self.motion_estimation(flow=out2['flow'], original=unlabeled[-1])
+            global_flow_loss = self.registration_loss(registered[None], unlabeled[0][None])
+            global_flow_loss_inside = global_flow_loss * label_list[0][None]
+            global_flow_regularization_loss = self.spatial_smoothing_loss(flow=out2['flow'][None])
+            global_flow_regularization_loss_inside = global_flow_regularization_loss * label_list[0][None]
+            self.loss_data['global_image_flow'][1] = global_flow_loss_inside
+            self.loss_data['global_flow_regularization'][1] = global_flow_regularization_loss_inside
+
+        return out1, out2
+    
+
+
+
+    def compute_losses_recursive_2_supervised(self, unlabeled, out1, out2, target, label_list):
+        out2['global_registered_input'] = []
+        out1['local_registered_input'] = []
+
+        if self.video_length > 2:
+            local_label_list = []
+            for i in range(len(out1['flow'])):
+                initial_target = target[i + 1]
+                initial_target = torch.nn.functional.one_hot(initial_target[:, 0].long(), num_classes=4).permute(0, 3, 1, 2).contiguous().float()
+                registered_label = self.motion_estimation(flow=out1['flow'][i], original=initial_target, mode='bilinear')
+                local_label_list.append(registered_label)
+
+                registered = self.motion_estimation(flow=out1['flow'][i], original=unlabeled[i + 1])
+                out1['local_registered_input'].append(registered)
+
+            out1['local_registered_input'] = torch.stack(out1['local_registered_input'], dim=0)
+            local_label_list = torch.stack(local_label_list, dim=0)
+
+            local_motion_loss = self.segmentation_loss(local_label_list.permute(1, 2, 3, 4, 0), target[:-1].permute(1, 2, 3, 4, 0))
+            self.loss_data['local_motion_forward'][1] = local_motion_loss
+
+            local_flow_loss = self.registration_loss(out1['local_registered_input'], unlabeled[:-1])
+            local_flow_loss = local_flow_loss * label_list[:-1]
+
+            local_flow_regularization_loss = self.spatial_smoothing_loss(flow=out1['flow'])
+            local_flow_regularization_loss = local_flow_regularization_loss * label_list[:-1]
+
+            self.loss_data['local_image_flow'][1] = local_flow_loss
+            self.loss_data['local_flow_regularization'][1] = local_flow_regularization_loss
+
+            intermediate_register_list = []
+            global_label_list = []
+            for i in range(len(out2['cumulated'])):
+                initial_target = target[i + 1]
+                initial_target = torch.nn.functional.one_hot(initial_target[:, 0].long(), num_classes=4).permute(0, 3, 1, 2).contiguous().float()
+                registered_label = self.motion_estimation(flow=out2['cumulated'][i], original=initial_target, mode='bilinear')
+                global_label_list.append(registered_label)
+
+                registered = self.motion_estimation(flow=out2['cumulated'][i], original=unlabeled[i + 1])
+                intermediate_register_list.append(registered)
+
+            intermediate_registered = torch.stack(intermediate_register_list, dim=0)
+            global_label_list = torch.stack(global_label_list, dim=0)
+
+            global_motion_loss = self.segmentation_loss(global_label_list.permute(1, 2, 3, 4, 0), target[0][None].repeat(len(global_label_list), 1, 1, 1, 1).permute(1, 2, 3, 4, 0))
+            self.loss_data['global_motion_forward'][1] = global_motion_loss
+
             intermediate_loss = self.registration_loss(intermediate_registered, unlabeled[0][None].repeat(len(intermediate_registered), 1, 1, 1, 1))
             intermediate_loss_inside = intermediate_loss * label_list[0][None].repeat(len(intermediate_registered), 1, 1, 1, 1)
             self.loss_data['intermediate'][1] = intermediate_loss_inside
@@ -1534,14 +1609,18 @@ class nnMTLTrainerV2FlowSuccessive(nnUNetTrainer):
         data_dict = next(data_generator)
         unlabeled = data_dict['unlabeled']
         target = data_dict['target']
-        target_mask = data_dict['target_mask'] # T, B
-        strain_mask = data_dict['strain_mask']
+        strain_mask = data_dict['strain_mask'].float()
         strain_mask_one_hot = data_dict['strain_mask_one_hot']
 
         #matplotlib.use('QtAgg')
-        #fig, ax = plt.subplots(1, len(unlabeled))
+        #fig, ax = plt.subplots(6, len(unlabeled))
         #for k in range(len(unlabeled)):
-        #    ax[k].imshow(unlabeled[k, 0, 0].cpu(), cmap='gray')
+        #    ax[0, k].imshow(unlabeled[k, 0, 0].cpu(), cmap='gray')
+        #    ax[1, k].imshow(target[k, 0, 0].cpu(), cmap='gray')
+        #    ax[2, k].imshow(strain_mask_one_hot[k, 0, 0].cpu(), cmap='hot', vmin=0.0, vmax=1.0)
+        #    ax[3, k].imshow(strain_mask_one_hot[k, 0, 1].cpu(), cmap='hot', vmin=0.0, vmax=1.0)
+        #    ax[4, k].imshow(strain_mask_one_hot[k, 0, 2].cpu(), cmap='hot', vmin=0.0, vmax=1.0)
+        #    ax[5, k].imshow(strain_mask[k, 0, 0].cpu(), cmap='hot', vmin=0.0, vmax=1.0)
         #plt.show()
 
         #matplotlib.use('QtAgg')
@@ -1588,7 +1667,7 @@ class nnMTLTrainerV2FlowSuccessive(nnUNetTrainer):
         #unlabeled = unlabeled.cuda()
         #unlabeled.retain_grad()
 #
-        out1, out2 = self.loss_function(target_mask=target_mask, unlabeled=unlabeled, out1=out1, out2=out2, target=target, label_list=strain_mask)
+        out1, out2 = self.loss_function(unlabeled=unlabeled, out1=out1, out2=out2, target=target, label_list=strain_mask)
         l = self.consolidate_only_one_loss_data(self.loss_data, log=True)
 
         #if self.iter_nb > 500:
@@ -1612,9 +1691,6 @@ class nnMTLTrainerV2FlowSuccessive(nnUNetTrainer):
                                 print(param_name)
                                 print(param.is_leaf)
                                 print(param.requires_grad)
-        
-        if self.do_adv:
-            self.train_discriminator(target, out, data_dict['target_mask'])
         
             #decoder_nb = 0
             #spatio_temporal_nb = 0
@@ -1648,6 +1724,7 @@ class nnMTLTrainerV2FlowSuccessive(nnUNetTrainer):
         unlabeled = data_dict['unlabeled'] # T, B, 1, H, W
         target = data_dict['target'] # T, B, 1, H, W
         target_mask = data_dict['target_mask'] # T, B
+        strain_mask_one_hot = data_dict['strain_mask_one_hot']
 
         with torch.no_grad():
             out1, out2 = self.network(unlabeled)
@@ -1689,14 +1766,14 @@ class nnMTLTrainerV2FlowSuccessive(nnUNetTrainer):
         unlabeled = data_dict['unlabeled'] # T, B, 1, H, W
         target = data_dict['target'] # T, B, 1, H, W
         target_mask = data_dict['target_mask'] # T, B
-        strain_mask = data_dict['strain_mask']
+        strain_mask = data_dict['strain_mask'].float()
         strain_mask_one_hot = data_dict['strain_mask_one_hot']
 
         with torch.no_grad():
             out1, out2 = self.network(unlabeled)
 
         #unlabeled = unlabeled.permute(2, 0, 1, 3, 4).contiguous()
-        out1, out2 = self.loss_function(target_mask=target_mask, unlabeled=unlabeled, out1=out1, out2=out2, target=target, label_list=strain_mask)
+        out1, out2 = self.loss_function(unlabeled=unlabeled, out1=out1, out2=out2, target=target, label_list=strain_mask)
         l = self.consolidate_only_one_loss_data(self.loss_data, log=False)
         self.val_loss.append(l.mean().detach().cpu())
 
@@ -2535,21 +2612,22 @@ class nnMTLTrainerV2FlowSuccessive(nnUNetTrainer):
             elif self.dataloader_modality == 'regular':
                 dataloader_class = DataLoaderFlowTrain5LibRegular
             elif self.dataloader_modality == 'other':
-                dataloader_class = DataLoaderPreprocessed
+                dataloader_class = DataLoaderPreprocessed if not self.supervised else DataLoaderPreprocessedSupervised
                 #dataloader_class = DataLoaderAugment
                 #dataloader_class = DataLoaderFlowTrain5LibProgressive
                 #dataloader_class = DataLoaderFlowTrain5LibProgressiveNoSorting
 
             dl_val = DataLoaderPreprocessedValidation(self.dataset_val, self.patch_size, self.patch_size, 1, do_data_aug=False, video_length=self.video_length,
-                                    crop_size=self.crop_size, processor=self.processor, is_val=True, distance_map_power=self.distance_map_power, oversample_foreground_percent=self.oversample_foreground_percent,
+                                    crop_size=self.crop_size, processor=self.processor, is_val=True, distance_map_power=self.distance_map_power, 
+                                    binary_distance_input=self.binary_distance_input, binary_distance_loss=self.binary_distance_loss, start_es=self.start_es, oversample_foreground_percent=self.oversample_foreground_percent,
                                     pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
             
             dl_tr = dataloader_class(self.dataset_tr, self.basic_generator_patch_size, self.patch_size, self.batch_size, do_data_aug=self.do_data_aug, video_length=self.video_length,
-                                            crop_size=self.crop_size, processor=self.processor, is_val=False, data_path=r'Lib_resampling_training_mask', distance_map_power=self.distance_map_power, also_start_es=self.also_start_es, oversample_foreground_percent=self.oversample_foreground_percent,
+                                            crop_size=self.crop_size, processor=self.processor, is_val=False, data_path=r'Lib_resampling_training_mask', distance_map_power=self.distance_map_power, binary_distance_input=self.binary_distance_input, binary_distance_loss=self.binary_distance_loss, start_es=self.start_es, oversample_foreground_percent=self.oversample_foreground_percent,
                                             pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
                 
             dl_overfitting = dataloader_class(self.dataset_val, self.basic_generator_patch_size, self.patch_size, self.batch_size, do_data_aug=False, video_length=self.video_length,
-                                            crop_size=self.crop_size, processor=self.processor, is_val=True, data_path=r'Lib_resampling_training_mask', distance_map_power=self.distance_map_power, also_start_es=self.also_start_es, oversample_foreground_percent=self.oversample_foreground_percent,
+                                            crop_size=self.crop_size, processor=self.processor, is_val=True, data_path=r'Lib_resampling_training_mask', distance_map_power=self.distance_map_power, binary_distance_input=self.binary_distance_input, binary_distance_loss=self.binary_distance_loss, start_es=self.start_es,  oversample_foreground_percent=self.oversample_foreground_percent,
                                             pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
         else:
 
