@@ -95,7 +95,7 @@ import shutil
 from nnunet.visualization.visualization import Visualizer
 from nnunet.training.network_training.processor import Processor
 from nnunet.network_architecture.integration import SpatialTransformer
-import kornia
+from nnunet.network_architecture.integration import SpatialTransformerContour
 
 
 class SegFlowGaussian(nnUNetTrainer):
@@ -176,6 +176,10 @@ class SegFlowGaussian(nnUNetTrainer):
         if self.video_length > 2:
             assert self.dataloader_modality == 'other'
         
+        self.point_loss = self.config['point_loss']
+        if self.point_loss:
+            self.spatial_transformer = SpatialTransformerContour(size=(192, 192))
+        
         #self.attention_gradient = self.config['attention_gradient']
 
         #if self.dataloader_modality == 'regular':
@@ -187,6 +191,7 @@ class SegFlowGaussian(nnUNetTrainer):
         self.regularization_weight_xy_small = self.config['regularization_weight_xy_small']
         self.regularization_weight_z_small = self.config['regularization_weight_z_small']
         self.image_flow_loss_weight_global_small = self.config['image_flow_loss_weight_global_small']
+        self.point_loss_weight = self.config['point_loss_weight']
 
 
         self.deep_supervision = self.config['deep_supervision']
@@ -282,6 +287,8 @@ class SegFlowGaussian(nnUNetTrainer):
         else:
             if self.dataloader_modality == 'other':
                 loss_data['seg_registered_memory'] = [self.global_motion_forward_loss_weight, float('nan')]
+                if self.point_loss:
+                    loss_data['point'] = [self.point_loss_weight, float('nan')]
             loss_data['memory_flow_regularization'] = [self.regularization_weight_xy, float('nan')]
             loss_data['memory_flow'] = [self.image_flow_loss_weight_global, float('nan')]
             if self.prediction:
@@ -1458,7 +1465,7 @@ class SegFlowGaussian(nnUNetTrainer):
         return out
 
 
-    def compute_losses_label(self, unlabeled, out, target, label_list):
+    def compute_losses_label(self, unlabeled, out, target, label_list, lv_points=None, rv_points=None):
 
         if self.dataloader_modality == 'other':
 
@@ -1469,6 +1476,31 @@ class SegFlowGaussian(nnUNetTrainer):
             global_motion_loss2 = self.segmentation_loss(registered_backward, target[0])
 
             self.loss_data['seg_registered_memory'][1] = global_motion_loss2
+
+            if self.point_loss:
+                current_lv_points = torch.stack(torch.split(lv_points, split_size_or_sections=2, dim=1), dim=1)[:, :, :, None, :] # T, 2, 2, 1, P
+                current_rv_points = rv_points[:, None, :, None, :] # T, 1, 2, 1, P
+
+                first_contours_lv = current_lv_points[0] # 2, 2, 1, P
+                first_contours_rv = current_rv_points[0] # 1, 2, 1, P
+
+                delta_pred_lv = self.spatial_transformer(torch.clone(first_contours_lv), backward_flow.repeat(2, 1, 1, 1))
+                delta_pred_rv = self.spatial_transformer(torch.clone(first_contours_rv), backward_flow.repeat(1, 1, 1, 1))
+                new_predicted_points_lv = (first_contours_lv + delta_pred_lv) # structure, C, 1, P
+                new_predicted_points_rv = (first_contours_rv + delta_pred_rv) # structure, C, 1, P
+
+                lv_point_loss = self.mse_loss(new_predicted_points_lv, current_lv_points[-1])
+                rv_point_loss = self.mse_loss(new_predicted_points_rv, current_rv_points[-1])
+
+                #matplotlib.use('QtAgg')
+                #fig, ax = plt.subplots(1, 1)
+                #ax.imshow(unlabeled[-1, 0, 0].cpu(), cmap='gray')
+                #ax.scatter(first_contours_lv[0, 1, 0, :].detach().cpu(), first_contours_lv[0, 0, 0, :].detach().cpu(), c='b')
+                #ax.scatter(current_lv_points[-1, 0, 1, 0, :].detach().cpu(), current_lv_points[-1, 0, 0, 0, :].detach().cpu(), c='g')
+                #ax.scatter(new_predicted_points_lv[0, 1, 0, :].detach().cpu(), new_predicted_points_lv[0, 0, 0, :].detach().cpu(), c='r')
+                #plt.show()
+
+                self.loss_data['point'][1] = (lv_point_loss + rv_point_loss) / 2
 
             #if self.cycle_consistency:
             #    registered_cycle1 = self.motion_estimation(flow=backward_flow, original=registered_forward, mode='bilinear')
@@ -2028,6 +2060,19 @@ class SegFlowGaussian(nnUNetTrainer):
         target = data_dict['target']
         strain_mask = data_dict['strain_mask'].float()
         strain_mask_one_hot = data_dict['strain_mask_one_hot']
+        rv_points = data_dict['rv_points']
+        lv_points = data_dict['lv_points']
+
+        #print(rv_points.shape)
+        #print(lv_points.shape)
+
+        #matplotlib.use('QtAgg')
+        #fig, ax = plt.subplots(1, 1)
+        #ax.imshow(unlabeled[0, 0, 0].cpu(), cmap='gray')
+        #ax.scatter(rv_points[0, 1, :].cpu(), rv_points[0, 0, :].cpu())
+        #ax.scatter(lv_points[0, 1, :].cpu(), lv_points[0, 0, :].cpu())
+        #ax.scatter(lv_points[0, 3, :].cpu(), lv_points[0, 2, :].cpu())
+        #plt.show()
 
         #matplotlib.use('QtAgg')
         #fig, ax = plt.subplots(6, len(unlabeled))
@@ -2121,7 +2166,10 @@ class SegFlowGaussian(nnUNetTrainer):
 
             l = self.consolidate_only_one_loss_data_supervised(self.loss_data, log=True)
         else:
-            out = self.loss_function(unlabeled=unlabeled, out=out, target=target, label_list=strain_mask)
+            if self.point_loss:
+                out = self.loss_function(unlabeled=unlabeled, out=out, target=target, label_list=strain_mask, lv_points=lv_points, rv_points=rv_points)
+            else:
+                out = self.loss_function(unlabeled=unlabeled, out=out, target=target, label_list=strain_mask)
             l = self.consolidate_only_one_loss_data(self.loss_data, log=True)
 
         #if self.iter_nb > 500:
@@ -2265,6 +2313,8 @@ class SegFlowGaussian(nnUNetTrainer):
         target_mask = data_dict['target_mask'] # T, B
         strain_mask = data_dict['strain_mask'].float()
         strain_mask_one_hot = data_dict['strain_mask_one_hot']
+        rv_points = data_dict['rv_points']
+        lv_points = data_dict['lv_points']
 
         with torch.no_grad():
             if self.label_input:
@@ -2301,8 +2351,11 @@ class SegFlowGaussian(nnUNetTrainer):
             
             l = self.consolidate_only_one_loss_data_supervised(self.loss_data, log=False)
         else:
-            out = self.loss_function(unlabeled=unlabeled, out=out, target=target, label_list=strain_mask)
-            l = self.consolidate_only_one_loss_data(self.loss_data, log=False)
+            if self.point_loss:
+                out = self.loss_function(unlabeled=unlabeled, out=out, target=target, label_list=strain_mask, lv_points=lv_points, rv_points=rv_points)
+            else:
+                out = self.loss_function(unlabeled=unlabeled, out=out, target=target, label_list=strain_mask)
+            l = self.consolidate_only_one_loss_data(self.loss_data, log=True)
         self.val_loss.append(l.mean().detach().cpu())
 
         return l.mean().detach().cpu().numpy()
@@ -3286,15 +3339,15 @@ class SegFlowGaussian(nnUNetTrainer):
                 #dataloader_class = DataLoaderFlowTrain5LibProgressive
 
             dl_val = DataLoaderPreprocessedValidation(self.dataset_val, self.patch_size, self.patch_size, 1, do_data_aug=False, video_length=self.video_length,
-                                    crop_size=self.crop_size, processor=self.processor, is_val=True, distance_map_power=self.distance_map_power, binary_distance_input=self.binary_distance_input, binary_distance_loss=self.binary_distance_loss, start_es=self.start_es, oversample_foreground_percent=self.oversample_foreground_percent,
+                                    crop_size=self.crop_size, processor=self.processor, is_val=True, distance_map_power=self.distance_map_power, binary_distance_input=self.binary_distance_input, binary_distance_loss=self.binary_distance_loss, start_es=self.start_es, oversample_foreground_percent=self.oversample_foreground_percent, point_loss=self.point_loss,
                                     pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
             
             dl_tr = dataloader_class(self.dataset_tr, self.basic_generator_patch_size, self.patch_size, self.batch_size, do_data_aug=self.do_data_aug, video_length=self.video_length,
-                                            crop_size=self.crop_size, processor=self.processor, is_val=False, data_path=r'Lib_resampling_training_mask', distance_map_power=self.distance_map_power, binary_distance_input=self.binary_distance_input, binary_distance_loss=self.binary_distance_loss, start_es=self.start_es, oversample_foreground_percent=self.oversample_foreground_percent,
+                                            crop_size=self.crop_size, processor=self.processor, is_val=False, data_path=r'Lib_resampling_training_mask', distance_map_power=self.distance_map_power, binary_distance_input=self.binary_distance_input, binary_distance_loss=self.binary_distance_loss, start_es=self.start_es, oversample_foreground_percent=self.oversample_foreground_percent, point_loss=self.point_loss,
                                             pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
                 
             dl_overfitting = dataloader_class(self.dataset_val, self.basic_generator_patch_size, self.patch_size, self.batch_size, do_data_aug=False, video_length=self.video_length,
-                                            crop_size=self.crop_size, processor=self.processor, is_val=True, data_path=r'Lib_resampling_training_mask', distance_map_power=self.distance_map_power, binary_distance_input=self.binary_distance_input, binary_distance_loss=self.binary_distance_loss, start_es=self.start_es, oversample_foreground_percent=self.oversample_foreground_percent,
+                                            crop_size=self.crop_size, processor=self.processor, is_val=True, data_path=r'Lib_resampling_training_mask', distance_map_power=self.distance_map_power, binary_distance_input=self.binary_distance_input, binary_distance_loss=self.binary_distance_loss, start_es=self.start_es, oversample_foreground_percent=self.oversample_foreground_percent, point_loss=self.point_loss,
                                             pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
         else:
 

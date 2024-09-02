@@ -6116,7 +6116,7 @@ class DataLoaderAugment(SlimDataLoaderBase):
 
 
 class DataLoaderPreprocessed(SlimDataLoaderBase):
-    def __init__(self, data, patch_size, final_patch_size, batch_size, video_length, processor, crop_size, is_val, do_data_aug, data_path, distance_map_power, binary_distance_input, binary_distance_loss, start_es, oversample_foreground_percent=0.0,
+    def __init__(self, data, patch_size, final_patch_size, batch_size, video_length, processor, crop_size, is_val, do_data_aug, data_path, distance_map_power, point_loss, binary_distance_input, binary_distance_loss, start_es, oversample_foreground_percent=0.0,
                  memmap_mode="r", pseudo_3d_slices=1, pad_mode="edge",
                  pad_kwargs_data=None, pad_sides=None):
         """
@@ -6176,6 +6176,7 @@ class DataLoaderPreprocessed(SlimDataLoaderBase):
         self.start_es = start_es
         self.binary_distance_input = binary_distance_input
         self.binary_distance_loss = binary_distance_loss
+        self.point_loss = point_loss
         
 
     def determine_shapes(self):
@@ -6252,9 +6253,10 @@ class DataLoaderPreprocessed(SlimDataLoaderBase):
             mask = pixel_transformed['mask']
             image[padding_mask] = 0
             data = {'image': image, 'mask': mask}
-            spatial_transformed = spatial_transform(data)
-            image = spatial_transformed['image']
-            mask = spatial_transformed['mask']
+            if not self.point_loss:
+                spatial_transformed = spatial_transform(data)
+                image = spatial_transformed['image']
+                mask = spatial_transformed['mask']
 
             #matplotlib.use('QtAgg')
             #fig, ax = plt.subplots(1, 3)
@@ -6268,8 +6270,9 @@ class DataLoaderPreprocessed(SlimDataLoaderBase):
             image = pixel_transformed['image']
             image[padding_mask] = 0
             data = {'image': image}
-            spatial_transformed = spatial_transform(data)
-            image = spatial_transformed['image']
+            if not self.point_loss:
+                spatial_transformed = spatial_transform(data)
+                image = spatial_transformed['image']
 
             #matplotlib.use('QtAgg')
             #fig, ax = plt.subplots(1, 2)
@@ -6324,10 +6327,13 @@ class DataLoaderPreprocessed(SlimDataLoaderBase):
         strain_mask_list = []
         database_list = []
         distance_list = []
+        lv_point_list = []
+        rv_point_list = []
 
         case_properties = []
         for j, frames in enumerate(list_of_frames):
             labeled_frame = frames[0]
+            #print(labeled_frame)
             if 'properties' in self._data[labeled_frame].keys():
                 properties = self._data[labeled_frame]['properties']
             else:
@@ -6403,6 +6409,17 @@ class DataLoaderPreprocessed(SlimDataLoaderBase):
 
             assert len(frame_indices) == self.video_length
             video = frames[frame_indices]
+
+            if self.point_loss:
+                filename_points = os.path.basename(video[0]).split('_')[0] + '_slice' + str(depth_idx + 1).zfill(2) + '.npy'
+                lv_points = np.load(os.path.join(self.data_path + '_points', 'LV', filename_points))
+                rv_points = np.load(os.path.join(self.data_path + '_points', 'RV', filename_points))
+                lv_points = torch.from_numpy(lv_points[:, :, frame_indices]).to('cuda:0').float() # 4, P, T
+                rv_points = torch.from_numpy(rv_points[:, :, frame_indices]).to('cuda:0').float() # 2, P, T
+                lv_points = lv_points.permute(2, 0, 1).contiguous() #T, 4, P
+                rv_points = rv_points.permute(2, 0, 1).contiguous() #T, 2, P
+                lv_point_list.append(lv_points)
+                rv_point_list.append(rv_points)
 
             labeled_idx = np.where(np.isin(frame_indices, global_labeled_idx))[0]
 
@@ -6492,7 +6509,6 @@ class DataLoaderPreprocessed(SlimDataLoaderBase):
             #ax[3].imshow(cropped_seg[3, 0].cpu(), cmap='gray')
             #plt.show()
 
-
             unlabeled_list.append(cropped_unlabeled)
             target_list.append(cropped_seg[:, 0][:, None])
             target_mask_list.append(target_mask)
@@ -6504,6 +6520,13 @@ class DataLoaderPreprocessed(SlimDataLoaderBase):
         target_mask = torch.stack(target_mask_list, dim=1) # T, B
         padding_need = torch.stack(padding_need_list, dim=0) # B, 4
         distance = torch.stack(distance_list, dim=1) # T+1, B
+
+        if self.point_loss:
+            rv_points = rv_point_list[0]
+            lv_points = lv_point_list[0]
+        else:
+            rv_points = None
+            lv_points = None
 
         if self.distance_map_power == 0:
             strain_mask = torch.ones_like(strain_mask)
@@ -6529,6 +6552,8 @@ class DataLoaderPreprocessed(SlimDataLoaderBase):
 
         return {'unlabeled':unlabeled, 
                 'target': target,
+                'rv_points': rv_points,
+                'lv_points': lv_points,
                 'distance': distance,
                 'database': database_list,
                 'padding_need': padding_need,
@@ -7358,7 +7383,7 @@ class DataLoaderPreprocessedSupervised(SlimDataLoaderBase):
 
 
 class DataLoaderPreprocessedValidation(SlimDataLoaderBase):
-    def __init__(self, data, patch_size, final_patch_size, batch_size, video_length, processor, crop_size, is_val, do_data_aug, distance_map_power, binary_distance_input, binary_distance_loss, start_es, oversample_foreground_percent=0.0,
+    def __init__(self, data, patch_size, final_patch_size, batch_size, video_length, processor, crop_size, is_val, do_data_aug, distance_map_power, binary_distance_input, point_loss, binary_distance_loss, start_es, oversample_foreground_percent=0.0,
                  memmap_mode="r", pseudo_3d_slices=1, pad_mode="edge",
                  pad_kwargs_data=None, pad_sides=None):
         """
