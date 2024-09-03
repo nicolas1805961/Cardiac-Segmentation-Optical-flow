@@ -2067,11 +2067,15 @@ class SegFlowGaussian(nnUNetTrainer):
         #print(lv_points.shape)
 
         #matplotlib.use('QtAgg')
-        #fig, ax = plt.subplots(1, 1)
-        #ax.imshow(unlabeled[0, 0, 0].cpu(), cmap='gray')
-        #ax.scatter(rv_points[0, 1, :].cpu(), rv_points[0, 0, :].cpu())
-        #ax.scatter(lv_points[0, 1, :].cpu(), lv_points[0, 0, :].cpu())
-        #ax.scatter(lv_points[0, 3, :].cpu(), lv_points[0, 2, :].cpu())
+        #fig, ax = plt.subplots(1, 2)
+        #ax[0].imshow(unlabeled[0, 0, 0].cpu(), cmap='gray')
+        #ax[0].scatter(rv_points[0, 0, :].cpu(), rv_points[0, 1, :].cpu())
+        #ax[0].scatter(lv_points[0, 0, :].cpu(), lv_points[0, 1, :].cpu())
+        #ax[0].scatter(lv_points[0, 2, :].cpu(), lv_points[0, 3, :].cpu())
+        #ax[1].imshow(unlabeled[-1, 0, 0].cpu(), cmap='gray')
+        #ax[1].scatter(rv_points[-1, 0, :].cpu(), rv_points[-1, 1, :].cpu())
+        #ax[1].scatter(lv_points[-1, 0, :].cpu(), lv_points[-1, 1, :].cpu())
+        #ax[1].scatter(lv_points[-1, 2, :].cpu(), lv_points[-1, 3, :].cpu())
         #plt.show()
 
         #matplotlib.use('QtAgg')
@@ -3339,7 +3343,7 @@ class SegFlowGaussian(nnUNetTrainer):
                 #dataloader_class = DataLoaderFlowTrain5LibProgressive
 
             dl_val = DataLoaderPreprocessedValidation(self.dataset_val, self.patch_size, self.patch_size, 1, do_data_aug=False, video_length=self.video_length,
-                                    crop_size=self.crop_size, processor=self.processor, is_val=True, distance_map_power=self.distance_map_power, binary_distance_input=self.binary_distance_input, binary_distance_loss=self.binary_distance_loss, start_es=self.start_es, oversample_foreground_percent=self.oversample_foreground_percent, point_loss=self.point_loss,
+                                    crop_size=self.crop_size, processor=self.processor, is_val=True, distance_map_power=self.distance_map_power, binary_distance_input=self.binary_distance_input, binary_distance_loss=self.binary_distance_loss, start_es=self.start_es, oversample_foreground_percent=self.oversample_foreground_percent,
                                     pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
             
             dl_tr = dataloader_class(self.dataset_tr, self.basic_generator_patch_size, self.patch_size, self.batch_size, do_data_aug=self.do_data_aug, video_length=self.video_length,

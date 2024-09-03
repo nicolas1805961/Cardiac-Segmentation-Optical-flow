@@ -4,7 +4,7 @@ use_sfb: false
 strain_loss_weight: 0.0 # 100.0
 forward_flow_loss_weight: 0.0 #1.0
 
-global_motion_forward_loss_weight: 0.1 # 0.1
+global_motion_forward_loss_weight: 0.01 # 0.1
 cycle_registered_loss_weight: 0.0
 cycle_flow_loss_weight: 0.0
 
@@ -107,14 +107,14 @@ padding: false
 all_to_all: true
 one_to_all: false
 inference_mode: one_step   # sliding_window, one_step, overlap
-regularization_weight_xy: 0.1 #1.0
+regularization_weight_xy: 1.0 #1.0
 regularization_weight_z: 0.0 #0.01
 nb_tokens: 1
 image_flow_loss_weight_global: 0.5 # 0.5
 image_flow_loss_weight_local: 0.0 # 0.0
 force_one_label: true
 feature_extractor: false
-video_length: 4
+video_length: 6
 crop: true
 nb_layers: 1
 
@@ -122,8 +122,8 @@ log_images: false
 device: cuda:0
 deep_supervision: false
 log_stats: true
-overfit_log: 550 #10
-epoch_log: 550 #10
+overfit_log: 1 #10
+epoch_log: 1 #10
 scheduler: cosine
 optimizer: adam
 initial_lr: 0.0001 #0.0001

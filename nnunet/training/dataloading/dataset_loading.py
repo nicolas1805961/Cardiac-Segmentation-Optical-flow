@@ -6406,7 +6406,6 @@ class DataLoaderPreprocessed(SlimDataLoaderBase):
 
             frame_indices = possible_indices[random_indices]
 
-
             assert len(frame_indices) == self.video_length
             video = frames[frame_indices]
 
@@ -6414,12 +6413,13 @@ class DataLoaderPreprocessed(SlimDataLoaderBase):
                 filename_points = os.path.basename(video[0]).split('_')[0] + '_slice' + str(depth_idx + 1).zfill(2) + '.npy'
                 lv_points = np.load(os.path.join(self.data_path + '_points', 'LV', filename_points))
                 rv_points = np.load(os.path.join(self.data_path + '_points', 'RV', filename_points))
+
                 lv_points = torch.from_numpy(lv_points[:, :, frame_indices]).to('cuda:0').float() # 4, P, T
                 rv_points = torch.from_numpy(rv_points[:, :, frame_indices]).to('cuda:0').float() # 2, P, T
                 lv_points = lv_points.permute(2, 0, 1).contiguous() #T, 4, P
                 rv_points = rv_points.permute(2, 0, 1).contiguous() #T, 2, P
-                lv_point_list.append(lv_points)
-                rv_point_list.append(rv_points)
+                lv_points = torch.flip(lv_points, dims=[1])
+                rv_points = torch.flip(rv_points, dims=[1])
 
             labeled_idx = np.where(np.isin(frame_indices, global_labeled_idx))[0]
 
@@ -6521,10 +6521,7 @@ class DataLoaderPreprocessed(SlimDataLoaderBase):
         padding_need = torch.stack(padding_need_list, dim=0) # B, 4
         distance = torch.stack(distance_list, dim=1) # T+1, B
 
-        if self.point_loss:
-            rv_points = rv_point_list[0]
-            lv_points = lv_point_list[0]
-        else:
+        if not self.point_loss:
             rv_points = None
             lv_points = None
 
@@ -7383,7 +7380,7 @@ class DataLoaderPreprocessedSupervised(SlimDataLoaderBase):
 
 
 class DataLoaderPreprocessedValidation(SlimDataLoaderBase):
-    def __init__(self, data, patch_size, final_patch_size, batch_size, video_length, processor, crop_size, is_val, do_data_aug, distance_map_power, binary_distance_input, point_loss, binary_distance_loss, start_es, oversample_foreground_percent=0.0,
+    def __init__(self, data, patch_size, final_patch_size, batch_size, video_length, processor, crop_size, is_val, do_data_aug, distance_map_power, binary_distance_input, binary_distance_loss, start_es, oversample_foreground_percent=0.0,
                  memmap_mode="r", pseudo_3d_slices=1, pad_mode="edge",
                  pad_kwargs_data=None, pad_sides=None):
         """
