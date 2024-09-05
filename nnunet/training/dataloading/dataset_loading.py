@@ -6418,8 +6418,8 @@ class DataLoaderPreprocessed(SlimDataLoaderBase):
                 rv_points = torch.from_numpy(rv_points[:, :, frame_indices]).to('cuda:0').float() # 2, P, T
                 lv_points = lv_points.permute(2, 0, 1).contiguous() #T, 4, P
                 rv_points = rv_points.permute(2, 0, 1).contiguous() #T, 2, P
-                #lv_points = torch.flip(lv_points, dims=[1])
-                #rv_points = torch.flip(rv_points, dims=[1])
+                lv_points = torch.flip(lv_points, dims=[1])
+                rv_points = torch.flip(rv_points, dims=[1])
 
             labeled_idx = np.where(np.isin(frame_indices, global_labeled_idx))[0]
 
