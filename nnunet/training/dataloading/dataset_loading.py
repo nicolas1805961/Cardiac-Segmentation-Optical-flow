@@ -41,6 +41,7 @@ import matplotlib
 import matplotlib.pyplot as plt
 from copy import copy
 from monai.transforms import Lambda
+from monai.data import MetaTensor
 
 class SinusoidalPositionEmbeddings(nn.Module):
     """Positional embeddings"""
@@ -6241,7 +6242,7 @@ class DataLoaderPreprocessed(SlimDataLoaderBase):
         return image, mask
     
     
-    def augment(self, image, mask, pixel_transform, spatial_transform):
+    def augment(self, image, mask, pixel_transform, spatial_transform, point_list=None):
         
         temp = torch.clone(image)
         padding_mask = image == 0
@@ -6253,10 +6254,17 @@ class DataLoaderPreprocessed(SlimDataLoaderBase):
             mask = pixel_transformed['mask']
             image[padding_mask] = 0
             data = {'image': image, 'mask': mask}
-            if not self.point_loss:
-                spatial_transformed = spatial_transform(data)
-                image = spatial_transformed['image']
-                mask = spatial_transformed['mask']
+
+            spatial_transformed = spatial_transform(data)
+            image = spatial_transformed['image']
+            mask = spatial_transformed['mask']
+            
+            #if not self.point_loss:
+            #    spatial_transformed = spatial_transform(data)
+            #    image = spatial_transformed['image']
+            #    mask = spatial_transformed['mask']
+
+            #affine_matrix = spatial_transformed['image_meta_dict']['affine']
 
             #matplotlib.use('QtAgg')
             #fig, ax = plt.subplots(1, 3)
@@ -6270,9 +6278,8 @@ class DataLoaderPreprocessed(SlimDataLoaderBase):
             image = pixel_transformed['image']
             image[padding_mask] = 0
             data = {'image': image}
-            if not self.point_loss:
-                spatial_transformed = spatial_transform(data)
-                image = spatial_transformed['image']
+            spatial_transformed = spatial_transform(data)
+            image = spatial_transformed['image']
 
             #matplotlib.use('QtAgg')
             #fig, ax = plt.subplots(1, 2)
@@ -6280,7 +6287,54 @@ class DataLoaderPreprocessed(SlimDataLoaderBase):
             #ax[1].imshow(image[0].cpu(), cmap='gray')
             #plt.show()
 
-        return image, mask
+        if self.point_loss:
+            affine_matrix_4x4 = image.affine
+            # Extract the 2x2 rotation/scaling part
+            rotation_scaling_matrix = affine_matrix_4x4[:2, :2]
+
+            # Extract the 2x1 translation part
+            translation_vector = affine_matrix_4x4[:2, 3]
+
+            # Construct a 3x3 combined affine matrix for 2D transformation
+            combined_affine_matrix_3x3 = torch.eye(3, device='cuda:0')
+
+            combined_affine_matrix_3x3[:2, :2] = rotation_scaling_matrix
+            combined_affine_matrix_3x3[:2, 2] = translation_vector
+
+            if image.applied_operations[0]['class'] == 'RandAffined':
+                combined_affine_matrix_3x3[:2, 2] = -torch.flip(translation_vector, dims=[0])
+            else:
+                combined_affine_matrix_3x3[:2, 2] = translation_vector
+
+            if image.applied_operations[0]['class'] == 'RandZoomd' and image.applied_operations[0]['do_transforms'] is True:
+                #print(image.applied_operations)
+                padded_amount = image.applied_operations[0]['extra_info']['extra_info']['extra_info']['padcrop']['extra_info']['pad_info']['extra_info']['padded']
+                combined_affine_matrix_3x3[0, 0] = 1 / combined_affine_matrix_3x3[0, 0]
+                combined_affine_matrix_3x3[1, 1] = 1 / combined_affine_matrix_3x3[1, 1]
+                combined_affine_matrix_3x3[0, 2] =  padded_amount[1][0]
+                combined_affine_matrix_3x3[1, 2] =  padded_amount[2][0]
+            
+            if image.applied_operations[0]['class'] == 'RandFlipd' and image.applied_operations[0]['do_transforms'] is True:
+                combined_affine_matrix_3x3[0, 0] = -combined_affine_matrix_3x3[0, 0]
+                combined_affine_matrix_3x3[1, 1] = -combined_affine_matrix_3x3[0, 0]
+                combined_affine_matrix_3x3[:2, 2] = torch.flip(combined_affine_matrix_3x3[:2, 2], dims=[0])
+
+            out_point_list = []
+            for points in point_list:
+                points_homogeneous = torch.cat([points, torch.ones(size=(1, points.shape[-1]), device='cuda:0')], dim=0)
+
+                # Apply the combined affine transformation
+                transformed_points_homogeneous = torch.matmul(combined_affine_matrix_3x3, points_homogeneous)
+
+                #transformed_points_homogeneous = points_homogeneous
+
+                # Extract the transformed (x, y) coordinates, ignoring the homogeneous coordinate
+                points = transformed_points_homogeneous[:2, :]
+                out_point_list.append(points)
+        else:
+            out_point_list = None
+
+        return image, mask, out_point_list
     
     def set_up_preprocessing_pipeline(self):
         preprocess = Compose([
@@ -6418,7 +6472,9 @@ class DataLoaderPreprocessed(SlimDataLoaderBase):
                 rv_points = torch.from_numpy(rv_points[:, :, frame_indices]).to('cuda:0').float() # 2, P, T
                 lv_points = lv_points.permute(2, 0, 1).contiguous() #T, 4, P
                 rv_points = rv_points.permute(2, 0, 1).contiguous() #T, 2, P
-                lv_points = torch.flip(lv_points, dims=[1])
+                endo_points, epi_points = torch.split(lv_points, split_size_or_sections=2, dim=1)
+                endo_points = torch.flip(endo_points, dims=[1])
+                epi_points = torch.flip(epi_points, dims=[1])
                 rv_points = torch.flip(rv_points, dims=[1])
 
             labeled_idx = np.where(np.isin(frame_indices, global_labeled_idx))[0]
@@ -6483,12 +6539,40 @@ class DataLoaderPreprocessed(SlimDataLoaderBase):
                 
                 seed = random.randint(0, 2**32-1)
 
-                for t in range(len(cropped_unlabeled)):
+                if self.point_loss:
+                    rv_points_list = []
+                    endo_points_list = []
+                    epi_points_list = []
+                    for t in range(len(cropped_unlabeled)):
 
-                    current_pixel_transform = current_pixel_transform.set_random_state(seed=seed)
-                    current_spatial_transform = current_spatial_transform.set_random_state(seed=seed)
+                        current_pixel_transform = current_pixel_transform.set_random_state(seed=seed)
+                        current_spatial_transform = current_spatial_transform.set_random_state(seed=seed)
 
-                    cropped_unlabeled[t], cropped_seg[t] = self.augment(image=cropped_unlabeled[t], mask=cropped_seg[t], pixel_transform=current_pixel_transform, spatial_transform=current_spatial_transform)
+                        to_augment_img = MetaTensor(cropped_unlabeled[t])
+                        to_augment_seg = MetaTensor(cropped_seg[t])
+
+                        cropped_unlabeled[t], cropped_seg[t], point_list = self.augment(image=to_augment_img, mask=to_augment_seg, pixel_transform=current_pixel_transform, spatial_transform=current_spatial_transform, point_list=[endo_points[t], epi_points[t], rv_points[t]])
+
+                        if self.point_loss:
+                            endo_points_list.append(point_list[0])
+                            epi_points_list.append(point_list[1])
+                            rv_points_list.append(point_list[2])
+
+                    endo_points = torch.stack(endo_points_list, dim=0)
+                    epi_points = torch.stack(epi_points_list, dim=0)
+                    rv_points = torch.stack(rv_points_list, dim=0)
+                else:
+                    for t in range(len(cropped_unlabeled)):
+
+                        current_pixel_transform = current_pixel_transform.set_random_state(seed=seed)
+                        current_spatial_transform = current_spatial_transform.set_random_state(seed=seed)
+
+                        to_augment_img = MetaTensor(cropped_unlabeled[t])
+                        to_augment_seg = MetaTensor(cropped_seg[t])
+
+                        cropped_unlabeled[t], cropped_seg[t], point_list = self.augment(image=to_augment_img, mask=to_augment_seg, pixel_transform=current_pixel_transform, spatial_transform=current_spatial_transform)
+
+                        #cropped_unlabeled[t], cropped_seg[t] = self.augment(image=cropped_unlabeled[t], mask=cropped_seg[t], pixel_transform=current_pixel_transform, spatial_transform=current_spatial_transform)
 
             #matplotlib.use('QtAgg')
             #fig, ax = plt.subplots(3, len(cropped_unlabeled))
@@ -6497,6 +6581,9 @@ class DataLoaderPreprocessed(SlimDataLoaderBase):
             #    ax[1, t].imshow(cropped_unlabeled[t, 0].cpu(), cmap='gray')
             #    ax[2, t].imshow(cropped_seg[t, 0].cpu(), cmap='gray')
             #plt.show()
+            lv_points = torch.stack([endo_points, epi_points], dim=1)
+            rv_points = rv_points[:, None, :, None, :]
+            lv_points = lv_points[:, :, :, None, :]
                     
             cropped_unlabeled = NormalizeIntensity()(cropped_unlabeled)
 

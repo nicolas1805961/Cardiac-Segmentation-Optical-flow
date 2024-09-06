@@ -1478,19 +1478,19 @@ class SegFlowGaussian(nnUNetTrainer):
             self.loss_data['seg_registered_memory'][1] = global_motion_loss2
 
             if self.point_loss:
-                current_lv_points = torch.stack(torch.split(lv_points, split_size_or_sections=2, dim=1), dim=1)[:, :, :, None, :] # T, 2, 2, 1, P
-                current_rv_points = rv_points[:, None, :, None, :] # T, 1, 2, 1, P
+                #current_lv_points = torch.stack(torch.split(lv_points, split_size_or_sections=2, dim=1), dim=1)[:, :, :, None, :] # T, 2, 2, 1, P
+                #current_rv_points = rv_points[:, None, :, None, :] # T, 1, 2, 1, P
 
-                first_contours_lv = current_lv_points[0] # 2, 2, 1, P
-                first_contours_rv = current_rv_points[0] # 1, 2, 1, P
+                first_contours_lv = lv_points[0] # 2, 2, 1, P
+                first_contours_rv = rv_points[0] # 1, 2, 1, P
 
                 delta_pred_lv = self.spatial_transformer(torch.clone(first_contours_lv), backward_flow.repeat(2, 1, 1, 1))
                 delta_pred_rv = self.spatial_transformer(torch.clone(first_contours_rv), backward_flow.repeat(1, 1, 1, 1))
                 new_predicted_points_lv = (first_contours_lv + torch.flip(delta_pred_lv, dims=[1])) # structure, C, 1, P
                 new_predicted_points_rv = (first_contours_rv + torch.flip(delta_pred_rv, dims=[1])) # structure, C, 1, P
 
-                lv_point_loss = self.mse_loss(new_predicted_points_lv, current_lv_points[-1])
-                rv_point_loss = self.mse_loss(new_predicted_points_rv, current_rv_points[-1])
+                lv_point_loss = self.mse_loss(new_predicted_points_lv, lv_points[-1])
+                rv_point_loss = self.mse_loss(new_predicted_points_rv, rv_points[-1])
 
                 ## Define the range for x and y
                 #x = torch.arange(192)  # Example: x = [0, 1, 2]
@@ -2093,13 +2093,13 @@ class SegFlowGaussian(nnUNetTrainer):
         #matplotlib.use('QtAgg')
         #fig, ax = plt.subplots(1, 2)
         #ax[0].imshow(unlabeled[0, 0, 0].cpu(), cmap='gray')
-        #ax[0].scatter(rv_points[0, 0, :].cpu(), rv_points[0, 1, :].cpu())
-        #ax[0].scatter(lv_points[0, 0, :].cpu(), lv_points[0, 1, :].cpu())
-        #ax[0].scatter(lv_points[0, 2, :].cpu(), lv_points[0, 3, :].cpu())
+        #ax[0].scatter(rv_points[0, 0, 0, 0, :].cpu(), rv_points[0, 0, 1, 0, :].cpu())
+        #ax[0].scatter(lv_points[0, 0, 0, 0, :].cpu(), lv_points[0, 0, 1, 0, :].cpu())
+        #ax[0].scatter(lv_points[0, 1, 0, 0, :].cpu(), lv_points[0, 1, 1, 0, :].cpu())
         #ax[1].imshow(unlabeled[-1, 0, 0].cpu(), cmap='gray')
-        #ax[1].scatter(rv_points[-1, 0, :].cpu(), rv_points[-1, 1, :].cpu())
-        #ax[1].scatter(lv_points[-1, 0, :].cpu(), lv_points[-1, 1, :].cpu())
-        #ax[1].scatter(lv_points[-1, 2, :].cpu(), lv_points[-1, 3, :].cpu())
+        #ax[1].scatter(rv_points[-1, 0, 0, 0, :].cpu(), rv_points[-1, 0, 1, 0, :].cpu())
+        #ax[1].scatter(lv_points[-1, 0, 0, 0, :].cpu(), lv_points[-1, 0, 1, 0, :].cpu())
+        #ax[1].scatter(lv_points[-1, 1, 0, 0, :].cpu(), lv_points[-1, 1, 1, 0, :].cpu())
         #plt.show()
         
         #matplotlib.use('QtAgg')
