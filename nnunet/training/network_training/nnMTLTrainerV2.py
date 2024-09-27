@@ -154,7 +154,7 @@ class nnMTLTrainerV2(nnUNetTrainer):
         self.val_loss = []
         self.train_loss = []
 
-        timestr = strftime("%Y-%m-%d_%HH%M")
+        timestr = datetime.now().strftime("%Y-%m-%d_%HH%M_%Ss_%f")
         self.log_dir = os.path.join(copy(self.output_folder), timestr)
         self.writer = SummaryWriter(log_dir=self.log_dir)
 
@@ -1300,7 +1300,8 @@ class nnMTLTrainerV2(nnUNetTrainer):
         if '27' not in self.task:
             temp_list = []
             for b in range(len(x_in)):
-                temp_list.append(self.normalizer(x_in[b]))
+                current = self.normalizer(x_in[b]).as_tensor()
+                temp_list.append(current)
             x_in = torch.stack(temp_list, dim=0)
         
         #matplotlib.use('QtAgg')

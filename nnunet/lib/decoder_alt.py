@@ -614,6 +614,8 @@ class SegmentationDecoder(nn.Module):
                 filter_skip_co_segmentation,
                 img_size,
                 norm,
+                init_weights,
+                add_absolute_pos,
                 last_activation='identity', 
                 rpe_mode=None, 
                 rpe_contextual_tensor='qkv',
@@ -656,7 +658,9 @@ class SegmentationDecoder(nn.Module):
                                                                 rpe_contextual_tensor=rpe_contextual_tensor,
                                                                 window_size=window_size,
                                                                 norm=norm,
-                                                                depth=2)
+                                                                depth=2,
+                                                                add_absolute_pos=add_absolute_pos,
+                                                                init_weights=init_weights)
 
                 #encoder_skip_connection_handler = swin_cross_attention_old.SwinFilterBlock(in_dim=out_encoder_dims[i_layer], 
                 #                                                out_dim=out_encoder_dims[i_layer],
@@ -698,7 +702,7 @@ class SegmentationDecoder(nn.Module):
         elif last_activation == 'identity':
             self.last_activation = nn.Identity()
 
-        self.apply(self._init_weights)
+        #self.apply(self._init_weights)
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):

@@ -227,7 +227,7 @@ class SegFlowGaussian(SegmentationNetwork):
 
         in_dims_past[0] = 6
         if self.prediction or self.label_pretrained:
-            in_dims_past[0] = 9
+            in_dims_past[0] = 7
         self.memory_encoder = Encoder2D(d_model=self.d_model, out_dims=out_encoder_dims, in_dims=in_dims_past, conv_depth=conv_depth, norm=norm, legacy=legacy, nb_conv=nb_conv, extra_block=extra_block, residual=residual, expand=False, nhead=bottleneck_heads, downsample_conv=self.downsample_conv)
         
         #if self.label_pretrained:
@@ -1661,7 +1661,7 @@ class SegFlowGaussian(SegmentationNetwork):
 
             pred, _ = self.pred_decoder(hidden_state, new_skip_co)
             cumulated_backward = cumulated_backward + pred
-            out['pred'].append(pred.detach())
+            out['pred'].append(cumulated_backward)
 
             if not self.warp:
                 previous_feature = current_feature

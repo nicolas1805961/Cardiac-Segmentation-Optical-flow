@@ -109,6 +109,8 @@ class MTLmodel(SegmentationNetwork):
                 image_size,
                 num_bottleneck_layers, 
                 directional_field,
+                add_absolute_pos,
+                init_weights,
                 conv_layer,
                 conv_depth,
                 num_heads,
@@ -188,7 +190,7 @@ class MTLmodel(SegmentationNetwork):
             decoder_output_dims[-1] = self.num_classes
             H, W = (int(image_size / 2**(self.num_stages)), int(image_size / 2**(self.num_stages)))
 
-            self.decoder = decoder_alt.SegmentationDecoder(conv_layer=conv_layer, norm=norm, similarity_down_scale=similarity_down_scale, filter_skip_co_segmentation=filter_skip_co_segmentation, directional_field=directional_field, reconstruction=reconstruction, reconstruction_skip=reconstruction_skip, concat_spatial_cross_attention=concat_spatial_cross_attention, attention_type=encoder_attention_type, spatial_cross_attention_num_heads=spatial_cross_attention_num_heads[::-1], shortcut=shortcut, proj_qkv=proj, out_encoder_dims=out_encoder_dims[::-1], use_conv_mlp=use_conv_mlp, last_activation='identity', img_size=image_size, num_classes=self.num_classes, device=device, swin_abs_pos=swin_abs_pos, in_encoder_dims=decoder_output_dims, merge=merge, conv_depth=conv_depth_decoder, transformer_depth=transformer_depth[::-1], dpr=dpr_decoder, rpe_mode=rpe_mode, rpe_contextual_tensor=rpe_contextual_tensor, num_heads=num_heads, window_size=window_size, drop_path_rate=drop_path_rate, deep_supervision=self.do_ds)
+            self.decoder = decoder_alt.SegmentationDecoder(conv_layer=conv_layer, norm=norm, similarity_down_scale=similarity_down_scale, filter_skip_co_segmentation=filter_skip_co_segmentation, directional_field=directional_field, reconstruction=reconstruction, reconstruction_skip=reconstruction_skip, concat_spatial_cross_attention=concat_spatial_cross_attention, attention_type=encoder_attention_type, spatial_cross_attention_num_heads=spatial_cross_attention_num_heads[::-1], shortcut=shortcut, proj_qkv=proj, out_encoder_dims=out_encoder_dims[::-1], use_conv_mlp=use_conv_mlp, last_activation='identity', img_size=image_size, num_classes=self.num_classes, device=device, swin_abs_pos=swin_abs_pos, in_encoder_dims=decoder_output_dims, merge=merge, conv_depth=conv_depth_decoder, transformer_depth=transformer_depth[::-1], dpr=dpr_decoder, rpe_mode=rpe_mode, rpe_contextual_tensor=rpe_contextual_tensor, num_heads=num_heads, window_size=window_size, drop_path_rate=drop_path_rate, deep_supervision=self.do_ds, add_absolute_pos=add_absolute_pos, init_weights=init_weights)
             
             self.pos = PositionEmbeddingSine2d(num_pos_feats=self.d_model // 2, normalize=True)
             #self.spatial_pos = nn.Parameter(torch.randn(size=(self.bottleneck_size[0]**2, self.d_model)))
@@ -880,6 +882,8 @@ class MTLmodel(SegmentationNetwork):
             for b in range(len(x)):
                 if normalize:
                     current_x = NormalizeIntensity()(x[b])[None]
+                else:
+                    current_x = x[b][None]
                 data_list.append(current_x)
             x = torch.cat(data_list, dim=0)
 

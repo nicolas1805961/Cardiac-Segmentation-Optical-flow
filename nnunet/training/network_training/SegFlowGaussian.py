@@ -79,7 +79,7 @@ from torch import nn
 from torch.cuda.amp import autocast
 from nnunet.training.learning_rate.poly_lr import poly_lr
 from batchgenerators.utilities.file_and_folder_operations import *
-from nnunet.lib.training_utils import build_seg_flow_gaussian_model, build_final_flow_model, build_2d_model, build_flow_model_video, build_discriminator, read_config_video, read_config, build_discriminator, build_discriminator, build_video_model
+from nnunet.lib.training_utils import build_point_init_model, build_seg_flow_gaussian_model, build_final_flow_model, build_2d_model, build_flow_model_video, build_discriminator, read_config_video, read_config, build_discriminator, build_discriminator, build_video_model
 from nnunet.lib.loss import SpatialSmoothingLoss, TemporalSmoothingLoss, AverageDistanceLoss
 from pathlib import Path
 from monai.losses import DiceFocalLoss, DiceLoss
@@ -171,10 +171,10 @@ class SegFlowGaussian(nnUNetTrainer):
         self.distance_map_power = self.config['distance_map_power']
         self.binary_distance_loss = self.config['binary_distance_loss']
         self.binary_distance_input = self.config['binary_distance_input']
-        if self.video_length == 2:
-            assert self.dataloader_modality == 'all_adjacent'
-        if self.video_length > 2:
-            assert self.dataloader_modality == 'other'
+        #if self.video_length == 2:
+        #    assert self.dataloader_modality == 'all_adjacent'
+        #if self.video_length > 2:
+        #    assert self.dataloader_modality == 'other'
         
         self.point_loss = self.config['point_loss']
         if self.point_loss:
@@ -247,6 +247,10 @@ class SegFlowGaussian(nnUNetTrainer):
         self.one_to_all = self.config['one_to_all']
         self.all_to_all = self.config['all_to_all']
         self.prediction = self.config['prediction']
+        self.point_init = self.config['point_init']
+
+        if self.point_init:
+            assert self.point_loss
 
         if self.log_images:
             self.vis = Visualizer(unlabeled=False,
@@ -296,7 +300,7 @@ class SegFlowGaussian(nnUNetTrainer):
                 loss_data['seg_registered_memory_pred'] = [self.prediction_loss_scaling_factor * self.global_motion_forward_loss_weight, float('nan')]
                 loss_data['memory_flow_regularization_pred'] = [self.prediction_loss_scaling_factor * self.regularization_weight_xy, float('nan')]
                 loss_data['memory_flow_pred'] = [self.prediction_loss_scaling_factor * self.image_flow_loss_weight_global, float('nan')]
-            if self.video_length > 2:
+            if self.dataloader_modality != 'all_adjacent':
                 loss_data['temporal_regularization'] = [self.regularization_weight_z, float('nan')]
                 if self.prediction:
                     loss_data['temporal_regularization_pred'] = [self.prediction_loss_scaling_factor * self.regularization_weight_z, float('nan')]
@@ -423,7 +427,7 @@ class SegFlowGaussian(nnUNetTrainer):
     def choose_loss(self):
         if self.supervised:
             return self.compute_losses_label_supervised
-        elif self.video_length == 2:
+        elif self.dataloader_modality == 'all_adjacent':
             return self.compute_losses_pair
         elif self.prediction:
             return self.compute_losses_label_prediction
@@ -540,12 +544,12 @@ class SegFlowGaussian(nnUNetTrainer):
             models['discriminator'] = (self.discriminator, discriminator_input)
 
         in_shape_crop = torch.randn(self.config['batch_size'], 1, self.image_size, self.image_size)
-        cropping_conv_layer, _ = self.get_conv_layer(self.cropper_config)
-        cropping_network = build_2d_model(self.cropper_config, conv_layer=cropping_conv_layer, norm=getattr(torch.nn, self.cropper_config['norm']), log_function=self.print_to_log_file, image_size=self.image_size, window_size=self.window_size, middle=False, num_classes=4, processor=None)
-        cropping_network.load_state_dict(torch.load(os.path.join(self.cropper_weights_folder_path, 'model_final_checkpoint.model'))['state_dict'], strict=True)
-        cropping_network.eval()
-        cropping_network.do_ds = False
-        models['cropping_model'] = (cropping_network, in_shape_crop)
+        #cropping_conv_layer, _ = self.get_conv_layer(self.cropper_config)
+        #cropping_network = build_2d_model(self.cropper_config, conv_layer=cropping_conv_layer, norm=getattr(torch.nn, self.cropper_config['norm']), log_function=self.print_to_log_file, image_size=self.image_size, window_size=self.window_size, middle=False, num_classes=4, processor=None)
+        #cropping_network.load_state_dict(torch.load(os.path.join(self.cropper_weights_folder_path, 'model_final_checkpoint.model'))['state_dict'], strict=True)
+        #cropping_network.eval()
+        #cropping_network.do_ds = False
+        #models['cropping_model'] = (cropping_network, in_shape_crop)
         
         distance_data = torch.zeros(size=(self.video_length, self.config['batch_size'])).float()
         if self.label_input:
@@ -562,7 +566,10 @@ class SegFlowGaussian(nnUNetTrainer):
         else:
             label_data = torch.zeros(size=(self.config['batch_size'], 4, self.crop_size, self.crop_size)).float()
             
-        self.network = build_seg_flow_gaussian_model(self.config, image_size=self.crop_size, log_function=self.print_to_log_file)
+        if self.point_init:
+            self.network = build_point_init_model(self.config, image_size=self.crop_size, log_function=self.print_to_log_file)
+        else:
+            self.network = build_seg_flow_gaussian_model(self.config, image_size=self.crop_size, log_function=self.print_to_log_file)
 
         if self.fine_tuning:
             self.print_to_log_file("Loading ACDC pretrained weights")
@@ -572,10 +579,13 @@ class SegFlowGaussian(nnUNetTrainer):
         unlabeled_input_data = torch.randn(self.video_length, self.config['batch_size'], 1, self.crop_size, self.crop_size)
         if self.config['no_label']:
             models['temporal_model'] = (self.network, unlabeled_input_data)
+        elif self.point_init:
+            point_data = torch.zeros(size=(self.config['batch_size'], 84, 2)).float()
+            models['temporal_model'] = (self.network, [unlabeled_input_data, point_data])
         else:
             models['temporal_model'] = (self.network, [unlabeled_input_data, label_data, distance_data])
 
-        self.processor = Processor(crop_size=self.crop_size, image_size=self.image_size, cropping_network=cropping_network)
+        self.processor = Processor(crop_size=self.crop_size, image_size=self.image_size, cropping_network=None)
 
         self.count_parameters(self.config, models)
 
@@ -2127,6 +2137,10 @@ class SegFlowGaussian(nnUNetTrainer):
             out = self.network(unlabeled, label=strain_mask_one_hot.float())
         elif self.prediction:
             out = self.network(unlabeled, distance=data_dict['distance'])
+        elif self.point_init:
+            points = torch.cat([lv_points[0, 0], lv_points[0, 1], rv_points[0, 0]], dim=-1)
+            points = points.permute(1, 2, 0).contiguous()
+            out = self.network(unlabeled, points=points)
         else:
             out = self.network(unlabeled)
 
@@ -3367,15 +3381,15 @@ class SegFlowGaussian(nnUNetTrainer):
                 #dataloader_class = DataLoaderFlowTrain5LibProgressive
 
             dl_val = DataLoaderPreprocessedValidation(self.dataset_val, self.patch_size, self.patch_size, 1, do_data_aug=False, video_length=self.video_length,
-                                    crop_size=self.crop_size, processor=self.processor, is_val=True, distance_map_power=self.distance_map_power, binary_distance_input=self.binary_distance_input, binary_distance_loss=self.binary_distance_loss, start_es=self.start_es, oversample_foreground_percent=self.oversample_foreground_percent,
+                                    crop_size=self.crop_size, processor=None, is_val=True, distance_map_power=self.distance_map_power, binary_distance_input=self.binary_distance_input, binary_distance_loss=self.binary_distance_loss, start_es=self.start_es, oversample_foreground_percent=self.oversample_foreground_percent,
                                     pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
             
             dl_tr = dataloader_class(self.dataset_tr, self.basic_generator_patch_size, self.patch_size, self.batch_size, do_data_aug=self.do_data_aug, video_length=self.video_length,
-                                            crop_size=self.crop_size, processor=self.processor, is_val=False, data_path=r'Lib_resampling_training_mask', distance_map_power=self.distance_map_power, binary_distance_input=self.binary_distance_input, binary_distance_loss=self.binary_distance_loss, start_es=self.start_es, oversample_foreground_percent=self.oversample_foreground_percent, point_loss=self.point_loss,
+                                            crop_size=self.crop_size, processor=None, is_val=False, data_path=r'Lib_resampling_training_mask', distance_map_power=self.distance_map_power, binary_distance_input=self.binary_distance_input, binary_distance_loss=self.binary_distance_loss, start_es=self.start_es, oversample_foreground_percent=self.oversample_foreground_percent, point_loss=self.point_loss,
                                             pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
                 
             dl_overfitting = dataloader_class(self.dataset_val, self.basic_generator_patch_size, self.patch_size, self.batch_size, do_data_aug=False, video_length=self.video_length,
-                                            crop_size=self.crop_size, processor=self.processor, is_val=True, data_path=r'Lib_resampling_training_mask', distance_map_power=self.distance_map_power, binary_distance_input=self.binary_distance_input, binary_distance_loss=self.binary_distance_loss, start_es=self.start_es, oversample_foreground_percent=self.oversample_foreground_percent, point_loss=self.point_loss,
+                                            crop_size=self.crop_size, processor=None, is_val=True, data_path=r'Lib_resampling_training_mask', distance_map_power=self.distance_map_power, binary_distance_input=self.binary_distance_input, binary_distance_loss=self.binary_distance_loss, start_es=self.start_es, oversample_foreground_percent=self.oversample_foreground_percent, point_loss=self.point_loss,
                                             pad_mode="constant", pad_sides=self.pad_all_sides, memmap_mode='r')
         else:
 

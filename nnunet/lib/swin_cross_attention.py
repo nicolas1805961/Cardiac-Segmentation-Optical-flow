@@ -112,7 +112,7 @@ class SwinCrossAttention(nn.Module):
 
 
 class SwinFilterBlock(nn.Module):
-    def __init__(self, in_dim, out_dim, input_resolution, num_heads, norm, device, rpe_mode, rpe_contextual_tensor, window_size, depth):
+    def __init__(self, in_dim, out_dim, input_resolution, num_heads, norm, device, rpe_mode, rpe_contextual_tensor, window_size, depth, add_absolute_pos, init_weights):
         super(SwinFilterBlock,self).__init__()
         self.W_g = nn.Sequential(
             nn.Conv2d(in_dim, out_dim, kernel_size=1,stride=1,padding=0,bias=True),
@@ -141,14 +141,30 @@ class SwinFilterBlock(nn.Module):
             norm(out_dim),
             nn.Sigmoid()
         )
+        self.add_absolute_pos = add_absolute_pos
         self.abs_pos_encoding = PositionEmbeddingSine2d(in_dim//2, normalize=True)
+
+        if init_weights == 'trunc':
+            self.apply(self._init_weights_trunc)
+        elif init_weights == 'xavier_normal':
+            self.apply(self._init_weights_xavier_normal)
+        elif init_weights == 'xavier_uniform':
+            self.apply(self._init_weights_xavier_uniform)
+        elif init_weights == 'kaiming_normal':
+            self.apply(self._init_weights_kaiming_normal)
+        elif init_weights == 'kaiming_uniform':
+            self.apply(self._init_weights_kaiming_uniform)
         
     def forward(self, x, skip_co):
-        vis = None
+        #skip_co_before = skip_co[0].mean(0).detach().cpu()
+        #x_before = x[0].mean(0).detach().cpu()
+        #vis = None
+        
         B, C, H, W = x.shape
-        #pos = self.abs_pos_encoding(shape_util=(B, H, W), device=x.device)
-        #x = x + pos
-        #skip_co = skip_co + pos
+        if self.add_absolute_pos:
+            pos = self.abs_pos_encoding(shape_util=(B, H, W), device=x.device)
+            x = x + pos
+            skip_co = skip_co + pos
         g1 = self.W_g(skip_co)
         x1 = self.W_x(x)
         for blk in self.blocks:
@@ -157,13 +173,88 @@ class SwinFilterBlock(nn.Module):
 
         filtered = skip_co * psi
 
-        #if H == 224:
-        #    before = skip_co[0].mean(0).detach().cpu()
+        #if H == 192:
+        #    
         #    after = filtered[0].mean(0).detach().cpu()
-        #    vis = (before, after)
+        #    #vis = (before, after)
+#
+        #    matplotlib.use('QtAgg')
+        #    fig, ax = plt.subplots(1, 3)
+        #    ax[0].imshow(skip_co_before, cmap='plasma')
+        #    ax[1].imshow(after, cmap='plasma')
+        #    ax[2].imshow(x_before, cmap='plasma')
+        #    ax[0].axis('off')
+        #    ax[1].axis('off')
+        #    ax[2].axis('off')
+        #    plt.show()
 
         return filtered
         #return filtered, vis
+
+    def _init_weights_trunc(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        if isinstance(m, nn.Conv2d):
+            trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Conv2d) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+    
+    def _init_weights_xavier_uniform(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_uniform_(m.weight)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        if isinstance(m, nn.Conv2d):
+            nn.init.xavier_uniform_(m.weight)
+            if isinstance(m, nn.Conv2d) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+    
+    def _init_weights_xavier_normal(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_normal_(m.weight)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        if isinstance(m, nn.Conv2d):
+            nn.init.xavier_normal_(m.weight)
+            if isinstance(m, nn.Conv2d) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+    
+    def _init_weights_kaiming_normal(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        if isinstance(m, nn.Conv2d):
+            nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+            if isinstance(m, nn.Conv2d) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def _init_weights_kaiming_uniform(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.kaiming_uniform_(m.weight, mode='fan_in', nonlinearity='relu')
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        if isinstance(m, nn.Conv2d):
+            nn.init.kaiming_uniform_(m.weight, mode='fan_in', nonlinearity='relu')
+            if isinstance(m, nn.Conv2d) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
 
 
 class SwinFilterBlockIdentity(nn.Module):
