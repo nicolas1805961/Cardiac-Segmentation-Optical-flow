@@ -1,1 +1,1 @@
-![alt text](https://github.com/nicolas1805961/Cardiac-Segmentation-Optical-flow/blob/master/nnunet/patient183_slice01_global.mp4)
+<video src='https://github.com/nicolas1805961/Cardiac-Segmentation-Optical-flow/blob/master/nnunet/patient183_slice01_global.mp4' width=180/>
