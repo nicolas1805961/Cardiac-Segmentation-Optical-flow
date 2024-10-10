@@ -1,1 +1,1 @@
-<video src='https://github.com/nicolas1805961/Cardiac-Segmentation-Optical-flow/blob/master/nnunet/patient183_slice01_global.mp4' width=180/>
+https://github.com/user-attachments/assets/0e307c0d-0590-4bd6-a936-7ec94cd18403
